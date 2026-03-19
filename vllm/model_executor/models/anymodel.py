@@ -47,6 +47,7 @@ _SAFE_ATTR_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 def _validate_layers_path(layers_path: str) -> None:
     """Reject dunder or non-identifier segments in a config-supplied layers_path."""
+    logger.debug("→ _validate_layers_path: layers_path=%r", layers_path)
     for part in layers_path.split("."):
         if not _SAFE_ATTR_RE.match(part):
             raise ValueError(
@@ -60,6 +61,10 @@ def _validate_layers_path(layers_path: str) -> None:
 
 def _validate_config_arch_info(arch_info: ArchInfo) -> None:
     """Ensure config-supplied module paths resolve inside vllm.model_executor.models."""
+    logger.debug(
+        "→ _validate_config_arch_info: decoder_layer_class=%r",
+        arch_info.decoder_layer_class,
+    )
     for field_name in ("decoder_layer_module", "base_model_module"):
         val = getattr(arch_info, field_name, None)
         if val is None:
@@ -267,6 +272,7 @@ def _resolve_layer_class(
     layer_idx: int,
 ) -> type[nn.Module]:
     """Return the decoder layer class for this position (hybrid-aware)."""
+    logger.debug("→ _resolve_layer_class: layer_idx=%d", layer_idx)
     class_name = info.decoder_layer_class
     if info.decoder_layer_class_map and info.hybrid_pattern_field:
         pattern = getattr(global_config, info.hybrid_pattern_field, "") or ""
@@ -274,6 +280,9 @@ def _resolve_layer_class(
             class_name = info.decoder_layer_class_map.get(
                 pattern[layer_idx], class_name
             )
+    logger.debug(
+        "← _resolve_layer_class: layer_idx=%d → %s", layer_idx, class_name
+    )
     try:
         mod = importlib.import_module(info.decoder_layer_module, package=__package__)
         return getattr(mod, class_name)
@@ -286,6 +295,7 @@ def _resolve_layer_class(
 
 def _create_layer_config(global_config, block_config, info: ArchInfo):
     """Deep-copy global_config with per-layer overrides applied."""
+    logger.debug("→ _create_layer_config: applying per-layer overrides from block_config")
     config = copy.deepcopy(global_config)
 
     attn = _get_block_section(block_config, "attention")
@@ -336,6 +346,12 @@ def _apply_no_ops(layer: nn.Module, block_config, info: ArchInfo) -> None:
     """Replace sub-modules with no-ops per block_config."""
     attn_noop = _get_block_attr(block_config, "attention", "no_op", False)
     ffn_noop = _get_block_attr(block_config, "ffn", "no_op", False)
+    logger.debug(
+        "→ _apply_no_ops: attn_noop=%s ffn_noop=%s layer_type=%s",
+        attn_noop,
+        ffn_noop,
+        type(layer).__name__,
+    )
 
     shared_module = info.attn_module == info.ffn_module
     shared_norm = info.attn_norm_module == info.ffn_norm_module
@@ -357,6 +373,7 @@ def _apply_no_ops(layer: nn.Module, block_config, info: ArchInfo) -> None:
 
 def _collect_noop_prefixes(block_configs: list, info: ArchInfo) -> frozenset[str]:
     """Build weight-name prefixes (ending with '.') for no-op sub-modules."""
+    logger.debug("→ _collect_noop_prefixes: %d block_configs", len(block_configs))
     prefixes: set[str] = set()
     shared_module = info.attn_module == info.ffn_module
     shared_norm = info.attn_norm_module == info.ffn_norm_module
@@ -378,7 +395,9 @@ def _collect_noop_prefixes(block_configs: list, info: ArchInfo) -> frozenset[str
                 prefixes.add(f"{lp}.{info.ffn_module}.")
                 if not shared_norm or attn_noop:
                     prefixes.add(f"{lp}.{info.ffn_norm_module}.")
-    return frozenset(prefixes)
+    result = frozenset(prefixes)
+    logger.debug("← _collect_noop_prefixes: %d noop prefixes collected", len(result))
+    return result
 
 
 @functools.cache
@@ -394,6 +413,12 @@ def _instantiate_layer(
     layer_idx: int,
 ) -> nn.Module:
     """Instantiate a decoder layer, patching vllm_config with per-layer config."""
+    logger.debug(
+        "→ _instantiate_layer: layer_idx=%d cls=%s prefix=%r",
+        layer_idx,
+        layer_cls.__name__,
+        prefix,
+    )
     mock_mc = copy.copy(vllm_config.model_config)
     mock_mc.hf_config = per_layer_config
     mock_vc = copy.copy(vllm_config)
@@ -416,6 +441,7 @@ def _instantiate_layer(
 def _has_overrides(block_config, info: ArchInfo | None = None) -> bool:
     """True if block_config has config overrides requiring a layer rebuild.
     No-ops alone don't trigger a rebuild."""
+    logger.debug("→ _has_overrides")
     attn = _get_block_section(block_config, "attention")
     ffn = _get_block_section(block_config, "ffn")
     if (
@@ -447,6 +473,7 @@ def _overrides_differ(block_config, global_config, info: ArchInfo) -> bool:
     Skipping rebuilds for identical values avoids unnecessary GPU allocation
     churn during ``_patch_anymodel_layers``.
     """
+    logger.debug("→ _overrides_differ")
     attn = _get_block_section(block_config, "attention")
     ffn = _get_block_section(block_config, "ffn")
 
@@ -500,6 +527,7 @@ def _overrides_differ(block_config, global_config, info: ArchInfo) -> bool:
 def _unregister_layer(layer_prefix: str, vllm_config: VllmConfig) -> None:
     """Remove a layer's entries from static_forward_context and
     static_all_moe_layers to avoid stale references after replacement."""
+    logger.debug("→ _unregister_layer: prefix=%r", layer_prefix)
     cc = vllm_config.compilation_config
     prefix_dot = layer_prefix + "."
 
@@ -519,6 +547,11 @@ def _patch_anymodel_layers(
     base_init_prefix: str,
 ) -> None:
     """Post-init: rebuild layers with overrides and apply no-ops."""
+    logger.debug(
+        "→ _patch_anymodel_layers: prefix=%r layers_path=%r",
+        base_init_prefix,
+        arch_info.layers_path,
+    )
     config = vllm_config.model_config.hf_config
     layer_base_config = (
         getattr(config, arch_info.layer_hf_config)
@@ -532,6 +565,12 @@ def _patch_anymodel_layers(
         obj = getattr(obj, part)
     layers: nn.ModuleList = obj
     layers_prefix = maybe_prefix(base_init_prefix, arch_info.layers_path)
+
+    logger.debug(
+        "  _patch_anymodel_layers: %d block_configs, %d layers",
+        len(block_configs),
+        len(layers),
+    )
 
     if len(block_configs) != len(layers):
         logger.warning(
@@ -548,9 +587,15 @@ def _patch_anymodel_layers(
         if isinstance(layer, PPMissingLayer):
             continue
 
-        if _has_overrides(block_config, arch_info) and _overrides_differ(
-            block_config, layer_base_config, arch_info
-        ):
+        has_ov = _has_overrides(block_config, arch_info)
+        differs = has_ov and _overrides_differ(block_config, layer_base_config, arch_info)
+        logger.debug(
+            "  layer %d: has_overrides=%s overrides_differ=%s",
+            layer_idx,
+            has_ov,
+            differs,
+        )
+        if differs:
             per_layer_config = _create_layer_config(
                 layer_base_config, block_config, arch_info
             )
@@ -591,30 +636,44 @@ def _patch_anymodel_layers(
             if ffn_noop:
                 _unregister_layer(f"{layer_prefix}.{arch_info.ffn_module}", vllm_config)
 
+    logger.debug("← _patch_anymodel_layers: done")
+
 
 def _arch_info_from_config(hf_config) -> ArchInfo | None:
     """Load ArchInfo from hf_config.anymodel_arch_info if present."""
+    logger.debug("→ _arch_info_from_config")
     data = getattr(hf_config, "anymodel_arch_info", None)
     if not data:
+        logger.debug("← _arch_info_from_config: no anymodel_arch_info in hf_config")
         return None
     if not isinstance(data, dict):
         data = vars(data)
     known = {f.name for f in dataclass_fields(ArchInfo)}
     arch_info = ArchInfo(**{k: v for k, v in data.items() if k in known})
     _validate_config_arch_info(arch_info)
+    logger.debug(
+        "← _arch_info_from_config: loaded ArchInfo for %s", arch_info.decoder_layer_class
+    )
     return arch_info
 
 
 def _make_wrapper_cls(arch_name: str, arch_info: ArchInfo) -> type:
     """Create ``AnyModel{arch_name}(AnyModel, BaseModelCls)`` wrapper."""
+    logger.debug("→ _make_wrapper_cls: arch_name=%r", arch_name)
     base_mod_path = arch_info.base_model_module or arch_info.decoder_layer_module
     mod = importlib.import_module(base_mod_path, package=__package__)
     base_cls = getattr(mod, arch_name)
-    return type(
+    wrapper = type(
         f"AnyModel{arch_name}",
         (AnyModel, base_cls),
         {"_anymodel_arch_info": arch_info, "has_noops": True},
     )
+    logger.debug(
+        "← _make_wrapper_cls: created AnyModel%s(AnyModel, %s)",
+        arch_name,
+        base_cls.__name__,
+    )
+    return wrapper
 
 
 def _expand_noop_prefixes_for_mapper(
@@ -627,8 +686,14 @@ def _expand_noop_prefixes_for_mapper(
     names) won't match HF-style checkpoint names.  This reverse-maps the
     prefixes so both naming conventions are covered.
     """
+    logger.debug(
+        "→ _expand_noop_prefixes_for_mapper: %d prefixes, model_cls=%s",
+        len(prefixes),
+        model_cls.__name__,
+    )
     mapper = getattr(model_cls, "hf_to_vllm_mapper", None)
     if mapper is None:
+        logger.debug("← _expand_noop_prefixes_for_mapper: no mapper, returning as-is")
         return prefixes
 
     expanded: set[str] = set(prefixes)
@@ -644,7 +709,13 @@ def _expand_noop_prefixes_for_mapper(
         for p in list(expanded):
             if new in p:
                 expanded.add(p.replace(new, orig, 1))
-    return frozenset(expanded)
+    result = frozenset(expanded)
+    logger.debug(
+        "← _expand_noop_prefixes_for_mapper: %d → %d prefixes after expansion",
+        len(prefixes),
+        len(result),
+    )
+    return result
 
 
 class AnyModel(nn.Module, HasNoOps):
@@ -661,6 +732,10 @@ class AnyModel(nn.Module, HasNoOps):
     @staticmethod
     def _resolve_arch(config) -> tuple[str, ArchInfo, bool]:
         """Return (arch_name, arch_info, from_config) for the given hf_config."""
+        logger.debug(
+            "→ _resolve_arch: base_architecture=%r",
+            getattr(config, "base_architecture", None),
+        )
         arch_name = getattr(config, "base_architecture", None)
         if not arch_name:
             raise ValueError(
@@ -679,6 +754,9 @@ class AnyModel(nn.Module, HasNoOps):
                 f"Supported: {sorted(_ARCH_REGISTRY)}"
             )
 
+        logger.debug(
+            "← _resolve_arch: arch_name=%r from_config=%s", arch_name, from_config
+        )
         return arch_name, arch_info, from_config
 
     @staticmethod
@@ -689,6 +767,12 @@ class AnyModel(nn.Module, HasNoOps):
         from_config: bool = False,
     ) -> type[AnyModel]:
         cache_key = f"config:{repr(arch_info)}" if from_config else arch_name
+        logger.debug(
+            "→ _get_or_create_wrapper: arch_name=%r cache_key=%r cache_hit=%s",
+            arch_name,
+            cache_key,
+            cache_key in AnyModel._wrapper_cache,
+        )
         if cache_key not in AnyModel._wrapper_cache:
             AnyModel._wrapper_cache[cache_key] = _make_wrapper_cls(arch_name, arch_info)
         return AnyModel._wrapper_cache[cache_key]
@@ -696,11 +780,15 @@ class AnyModel(nn.Module, HasNoOps):
     @classmethod
     def resolve_wrapper_cls(cls, model_config) -> type[AnyModel]:
         """Return the concrete wrapper class for model_config."""
+        logger.debug("→ resolve_wrapper_cls")
         config = model_config.hf_config
         arch_name, arch_info, from_config = cls._resolve_arch(config)
-        return cls._get_or_create_wrapper(arch_name, arch_info, from_config=from_config)
+        wrapper = cls._get_or_create_wrapper(arch_name, arch_info, from_config=from_config)
+        logger.debug("← resolve_wrapper_cls: wrapper=%s", wrapper.__name__)
+        return wrapper
 
     def __new__(cls, *, vllm_config: VllmConfig, prefix: str = ""):
+        logger.debug("→ AnyModel.__new__: cls=%s prefix=%r", cls.__name__, prefix)
         if cls is not AnyModel:
             return super().__new__(cls)
 
@@ -709,18 +797,29 @@ class AnyModel(nn.Module, HasNoOps):
         wrapper_cls = AnyModel._get_or_create_wrapper(
             arch_name, arch_info, from_config=from_config
         )
+        logger.debug("← AnyModel.__new__: wrapper_cls=%s", wrapper_cls.__name__)
         return object.__new__(wrapper_cls)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        logger.debug(
+            "→ AnyModel.__init__: cls=%s prefix=%r", type(self).__name__, prefix
+        )
         arch_info = type(self)._anymodel_arch_info
         base_init_prefix = (
             arch_info.init_prefix if arch_info.init_prefix is not None else prefix
         )
+        logger.debug(
+            "  AnyModel.__init__: calling super().__init__ with prefix=%r",
+            base_init_prefix,
+        )
         super().__init__(vllm_config=vllm_config, prefix=base_init_prefix)
+        logger.debug("  AnyModel.__init__: base model init done, patching layers")
         _patch_anymodel_layers(self, vllm_config, arch_info, base_init_prefix)
+        logger.debug("← AnyModel.__init__: done")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Filter out no-op module weights, then delegate to base class."""
+        logger.debug("→ AnyModel.load_weights: cls=%s", type(self).__name__)
         arch_info = type(self)._anymodel_arch_info
         if arch_info is not None:
             config = self.config
@@ -736,9 +835,14 @@ class AnyModel(nn.Module, HasNoOps):
                     noop_prefixes = _expand_noop_prefixes_for_mapper(
                         noop_prefixes, type(self)
                     )
+                    logger.debug(
+                        "  AnyModel.load_weights: filtering weights with %d noop prefixes",
+                        len(noop_prefixes),
+                    )
                     weights = (
                         (name, tensor)
                         for name, tensor in weights
                         if not any(name.startswith(p) for p in noop_prefixes)
                     )
+        logger.debug("  AnyModel.load_weights: delegating to base class load_weights")
         return super().load_weights(weights)
