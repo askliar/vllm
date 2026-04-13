@@ -1456,6 +1456,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "flashinfer-cudnn": use flashinfer cudnn GEMM backend
     # - "flashinfer-trtllm": use flashinfer trtllm GEMM backend
     # - "flashinfer-cutlass": use flashinfer cutlass GEMM backend
+    # - "b12x": use the external b12x SM12x GEMM backend
     # - "marlin": use marlin GEMM backend (for GPUs without native FP4 support)
     # - "emulation":
     #     use BF16/FP16 GEMM, dequantizing weights and running QDQ on activations.
@@ -1469,6 +1470,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "flashinfer-cudnn",
             "flashinfer-trtllm",
             "flashinfer-cutlass",
+            "b12x",
             "cutlass",
             "marlin",
             "emulation",
