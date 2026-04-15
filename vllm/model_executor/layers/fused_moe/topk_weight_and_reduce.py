@@ -61,6 +61,7 @@ class TopKWeightAndReduceNoOP(mk.TopKWeightAndReduce):
         # Weight application and reduction operations are already done.
         if output is None:
             return fused_expert_output
+        # Backend wrote directly into output — nothing to copy.
         if output is fused_expert_output:
             return output
 

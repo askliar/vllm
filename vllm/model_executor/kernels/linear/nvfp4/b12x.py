@@ -8,14 +8,14 @@ import importlib
 import torch
 
 from vllm._custom_ops import scaled_fp4_quant
+from vllm.model_executor.kernels.linear.nvfp4.base import (
+    NvFp4LinearKernel,
+    NvFp4LinearLayerConfig,
+)
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     pad_nvfp4_activation_for_cutlass,
     pad_nvfp4_weight_for_cutlass,
     slice_nvfp4_output,
-)
-from vllm.model_executor.kernels.linear.nvfp4.base import (
-    NvFp4LinearKernel,
-    NvFp4LinearLayerConfig,
 )
 from vllm.platforms import current_platform
 

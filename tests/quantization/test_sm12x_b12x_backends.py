@@ -10,8 +10,8 @@ import torch
 import vllm.model_executor.kernels.linear.nvfp4.b12x as linear_b12x_module
 import vllm.model_executor.layers.fused_moe.experts.b12x_nvfp4_moe as moe_b12x_module
 from vllm.model_executor.kernels.linear import _NVFP4_BACKEND_TO_KERNEL
-from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
 from vllm.model_executor.kernels.linear.nvfp4.b12x import B12xNvFp4LinearKernel
+from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.b12x_nvfp4_moe import (
     B12xExperts,
@@ -64,7 +64,9 @@ def test_b12x_linear_backend_imports_required_submodules(monkeypatch) -> None:
             return SimpleNamespace(dense_gemm=dense_gemm)
         raise ImportError(module_name)
 
-    monkeypatch.setattr(linear_b12x_module.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(
+        linear_b12x_module.importlib, "import_module", fake_import_module
+    )
     monkeypatch.setattr(linear_b12x_module.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
         linear_b12x_module.current_platform,

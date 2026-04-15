@@ -37,7 +37,9 @@ _B12X_MOE_WORKSPACE_POOLS: dict[int, Any] = {}
 
 def _get_b12x_workspace_pool(device: torch.device) -> Any:
     """Return a lazily created per-device workspace pool for the B12X MoE kernel."""
-    device_idx = device.index if device.index is not None else torch.cuda.current_device()
+    device_idx = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
     pool = _B12X_MOE_WORKSPACE_POOLS.get(device_idx)
     if pool is None:
         tp_moe = _import_b12x_tp_moe()
@@ -46,6 +48,14 @@ def _get_b12x_workspace_pool(device: torch.device) -> Any:
         pool = tp_moe.allocate_tp_moe_workspace_pool()
         _B12X_MOE_WORKSPACE_POOLS[device_idx] = pool
     return pool
+
+
+# Mapping from vllm MoEActivation to b12x activation string.
+# ReLU2 (non-gated) support is an addition over vllm-project/vllm#39634.
+_ACTIVATION_MAP: dict[MoEActivation, str] = {
+    MoEActivation.SILU: "silu",
+    MoEActivation.RELU2_NO_MUL: "relu2",
+}
 
 
 class B12xExperts(mk.FusedMoEExpertsModular):
@@ -87,7 +97,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
-        return False
+        # ReLU2 addition: non-gated layout supported.
+        return True
 
     @staticmethod
     def _supports_quant_scheme(
@@ -98,10 +109,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation in [MoEActivation.SILU, MoEActivation.SWIGLUOAI]
+        # ReLU2 addition: accepts RELU2_NO_MUL in addition to SILU/SWIGLUOAI.
+        return activation in _ACTIVATION_MAP
 
     @staticmethod
-    def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+    def _supports_parallel_config(
+        moe_parallel_config: FusedMoEParallelConfig,
+    ) -> bool:
         del moe_parallel_config
         return True
 
@@ -126,7 +140,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        del N, topk, global_num_experts, local_num_experts, expert_tokens_meta, activation
+        del (
+            N,
+            topk,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        )
         return ((0,), (0,), (M, K))
 
     def apply(
@@ -149,7 +170,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     ) -> None:
         del global_num_experts, a2_scale, workspace13, workspace2, expert_tokens_meta
         assert expert_map is None, "B12xExperts does not support expert_map"
-        assert activation.is_gated, "B12xExperts only supports gated activations"
+        # ReLU2 addition: activation check uses _ACTIVATION_MAP instead of is_gated.
+        assert activation in _ACTIVATION_MAP, (
+            f"B12xExperts: unsupported activation {activation}"
+        )
         assert not apply_router_weight_on_input, (
             "B12xExperts requires router weights to be applied inside the kernel"
         )
@@ -175,6 +199,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             topk_ids,
             workspace=_get_b12x_workspace_pool(hidden_states.device),
             output=output,
+            # ReLU2 addition: pass activation string so b12x selects the right kernel.
+            activation=_ACTIVATION_MAP[activation],
             input_scales_are_reciprocal=True,
             input_scales_static=True,
         )

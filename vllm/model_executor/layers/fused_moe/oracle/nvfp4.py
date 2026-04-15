@@ -73,7 +73,14 @@ def is_global_sf_supported_for_nvfp4_backend(backend: NvFp4MoeBackend) -> bool:
 def backend_to_kernel_cls(
     backend: NvFp4MoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
-    if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+    if backend == NvFp4MoeBackend.B12X:
+        from vllm.model_executor.layers.fused_moe.experts.b12x_nvfp4_moe import (
+            B12xExperts,
+        )
+
+        return [B12xExperts]
+
+    elif backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
         from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
             TrtLlmNvFp4ExpertsModular,
             TrtLlmNvFp4ExpertsMonolithic,

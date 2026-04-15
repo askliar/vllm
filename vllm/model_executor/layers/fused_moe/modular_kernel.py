@@ -1038,7 +1038,9 @@ class FusedMoEKernelModularImpl:
             and moe_parallel_config.dp_size > 1
             and moe_parallel_config.use_ep
         )
-        self._empty_tensor_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+        self._empty_tensor_cache: dict[
+            tuple[torch.device, torch.dtype], torch.Tensor
+        ] = {}
 
     def _get_empty_tensor(
         self, device: torch.device, dtype: torch.dtype
