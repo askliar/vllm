@@ -1029,6 +1029,12 @@ def unify_kv_cache_spec_page_size(
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
+        elif isinstance(layer_spec, MambaSpec):
+            # Mamba page size is determined by state tensor shapes, not by
+            # block_size. Pad it to the shared page size instead.
+            new_spec = replace(layer_spec, page_size_padded=max_page_size)
+            assert new_spec.page_size_bytes == max_page_size
+            new_kv_cache_spec[layer_name] = new_spec
         else:
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size != 0:

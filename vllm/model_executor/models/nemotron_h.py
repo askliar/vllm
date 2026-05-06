@@ -64,9 +64,11 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMambaPrefixCaching,
     SupportsPP,
@@ -539,7 +541,7 @@ ALL_DECODER_LAYER_TYPES = {
 
 
 @support_torch_compile
-class NemotronHModel(nn.Module):
+class NemotronHModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -593,7 +595,9 @@ class NemotronHModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[
+        torch.Tensor, list[torch.Tensor]
+    ]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -605,11 +609,20 @@ class NemotronHModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states = self._maybe_add_hidden_state(
+            [], 0, hidden_states, residual
+        )
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
 
         if not get_pp_group().is_last_rank:
@@ -617,6 +630,8 @@ class NemotronHModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def is_spec_layer(self, config: NemotronHConfig, weight_name: str) -> bool:
@@ -768,6 +783,7 @@ class NemotronHForCausalLM(
     SupportsLoRA,
     SupportsPP,
     IsHybrid,
+    SupportsEagle3,
     SupportsQuant,
     MixtureOfExperts,
     SupportsMambaPrefixCaching,

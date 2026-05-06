@@ -4107,7 +4107,7 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
+                # True when EAGLE3/DFlash-style auxiliary hidden states are used.
                 hidden_states, aux_hidden_states = model_output
             else:
                 # Common case.
@@ -4879,8 +4879,9 @@ class GPUModelRunner(
                 if self.use_aux_hidden_state_outputs:
                     if not supports_eagle3(self.get_model()):
                         raise RuntimeError(
-                            "Model does not support EAGLE3 interface but "
-                            "aux_hidden_state_outputs was requested"
+                            "Model does not support the auxiliary hidden-state "
+                            "interface required by EAGLE3/DFlash, but "
+                            "aux_hidden_state_outputs was requested."
                         )
 
                     # Try to get auxiliary layers from speculative config,

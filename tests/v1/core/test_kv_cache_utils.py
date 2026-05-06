@@ -2189,6 +2189,34 @@ def test_unify_hybrid_kv_cache_specs():
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
 
 
+def test_unify_kv_cache_spec_page_size_pads_mamba_spec():
+    mamba_spec = new_mamba_spec(
+        block_size=16,
+        shapes=((2, 64),),
+        dtypes=(torch.float32,),
+        page_size_padded=None,
+    )
+    attn_spec = new_kv_cache_spec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=64,
+        dtype=torch.float32,
+    )
+
+    assert mamba_spec.page_size_bytes < attn_spec.page_size_bytes
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {
+            "mamba": mamba_spec,
+            "attn": attn_spec,
+        }
+    )
+
+    assert unified["mamba"].block_size == mamba_spec.block_size
+    assert unified["mamba"].page_size_padded == attn_spec.page_size_bytes
+    assert unified["mamba"].page_size_bytes == unified["attn"].page_size_bytes
+
+
 def test_hma_not_disabled_when_kv_events_enabled():
     """
     Test enabling KV events must not force disable_hybrid_kv_cache_manager to True.
