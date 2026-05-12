@@ -14,7 +14,7 @@ from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.flashinfer import (
     flashinfer_bf16_mm,
-    get_flashinfer_bf16_supported_backends
+    get_flashinfer_bf16_supported_backends,
 )
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -102,6 +102,7 @@ def default_unquantized_gemm(
 ):
     return torch.nn.functional.linear(x, weight, bias)
 
+
 _BF16_BIAS_CAPABLE_BACKENDS = frozenset({"auto", "tgv", "tinygemm"})
 
 
@@ -148,7 +149,7 @@ def cuda_flashinfer_bf16_gemm_impl(
         return torch.nn.functional.linear(x, weight, bias)
 
     # cuBLASLt/CUTLASS do not support fused bias in FlashInfer BF16 GEMM.
-    # When using auto with bias, we select between ("tgv", "tinygemm") 
+    # When using auto with bias, we select between ("tgv", "tinygemm")
     pdl = backend in ("tgv", "tinygemm") or (backend == "auto" and bias is not None)
 
     x_2d = x.reshape(M, K)
@@ -164,8 +165,10 @@ def cuda_flashinfer_bf16_gemm_fake(
     pdl: bool,
 ) -> torch.Tensor:
     return torch.empty(
-        x.shape[0], weight.shape[0],
-        dtype=torch.bfloat16, device=x.device,
+        x.shape[0],
+        weight.shape[0],
+        dtype=torch.bfloat16,
+        device=x.device,
     )
 
 
@@ -407,19 +410,27 @@ def _get_bf16_linear_backend() -> str:
 
     except (AssertionError, AttributeError, ImportError):
         return "torch"
-    
-    if vllm_config is None or vllm_config.kernel_config is None or not supported_backends :
+
+    if (
+        vllm_config is None
+        or vllm_config.kernel_config is None
+        or not supported_backends
+    ):
         return "torch"
-    elif supported_backends and vllm_config.kernel_config.bf16_linear_backend not in supported_backends:
+    elif (
+        supported_backends
+        and vllm_config.kernel_config.bf16_linear_backend not in supported_backends
+    ):
         logger.warning_once(
             "bf16_linear_backend=%r is not in the installed FlashInfer's "
             "mm_bf16 supported backends %s; falling back to torch.",
-            backend,
+            vllm_config.kernel_config.bf16_linear_backend,
             supported_backends,
         )
         return "torch"
-    
+
     return vllm_config.kernel_config.bf16_linear_backend
+
 
 def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
     if current_platform.is_rocm():
@@ -433,5 +444,5 @@ def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
     else:
         return functools.partial(
             cuda_flashinfer_bf16_gemm,
-            backend=backend,
+            backend=bf16_linear_backend,
         )
