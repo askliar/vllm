@@ -44,6 +44,8 @@ class MambaConfig:
     """Number of Philox PRNG rounds for stochastic rounding random number
     generation. 0 uses the Triton default. Higher values improve randomness
     quality at the cost of compute."""
+    mamba_ssm_checkpoint_interval: int = 1
+    """Interval at which to checkpoint SSM state to cache."""
 
     @field_validator("backend", mode="before")
     @classmethod
@@ -73,4 +75,9 @@ class MambaConfig:
                     "PTX instruction is not supported on your GPU. Please do not "
                     "specify `--enable-mamba-cache-stochastic-rounding`, "
                     "or set `--mamba-backend flashinfer`."
+                )
+        
+        if self.mamba_ssm_checkpoint_interval > 1 and self.backend != MambaBackendEnum.FLASHINFER:
+                raise ValueError(
+                    "Checkpointing is only supported with the flashinfer backend."
                 )

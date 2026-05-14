@@ -35,7 +35,7 @@ from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
-from vllm.model_executor.layers.mamba.ops.ssu_dispatch import selective_state_update
+from vllm.model_executor.layers.mamba.ops.ssu_dispatch import checkpointing_state_update, selective_state_update
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     LoaderFunction,
@@ -1001,23 +1001,51 @@ class MambaMixer2(MambaBase, PluggableLayer):
             # - mamba_cache_params.ssm_state's slots will be selected
             #   using state_indices_tensor_d
             # NOTE: final output is an in-place update of out tensor
-            selective_state_update(
-                ssm_state,
-                hidden_states_d,
-                dt_d,
-                A_d,
-                B_d,
-                C_d,
-                D_d,
-                dt_bias,
-                dt_softplus=True,
-                state_batch_indices=state_indices_tensor_d_input,
-                dst_state_batch_indices=state_indices_tensor_d_output,
-                out=preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
-                num_accepted_tokens=num_accepted_tokens,
-                cu_seqlens=query_start_loc_d,
-                is_blackwell=self.is_blackwell,
-            )
+            if self.cache_config.mamba_ssm_checkpoint_interval == 1:
+                selective_state_update(
+                    ssm_state,
+                    hidden_states_d,
+                    dt_d,
+                    A_d,
+                    B_d,
+                    C_d,
+                    D_d,
+                    dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_tensor_d_input,
+                    dst_state_batch_indices=state_indices_tensor_d_output,
+                    out=preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
+                    num_accepted_tokens=num_accepted_tokens,
+                    cu_seqlens=query_start_loc_d,
+                    is_blackwell=self.is_blackwell,
+                )
+            else:
+                checkpointing_state_update(
+                    state=ssm_state,
+                    x=hidden_states_d,
+                    dt=dt_d,
+                    A=A_d,
+                    B=B_d,
+                    C=C_d,
+                    out=preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
+                    old_x=old_x,
+                    old_B=old_B,
+                    old_dt_proc=old_dt_proc,
+                    old_cumAdt=old_cumAdt,
+                    cache_buf_idx=cache_buf_idx,
+                    prev_num_accepted_tokens=prev_num_accepted_tokens,
+                    D=D_d,
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_tensor_d_input,
+                    null_block_id=0,
+                    state_scale=state_scale if "state_scale" in locals() else None,
+                    rand_seed=None,
+                    d_split=None,
+                    cu_seqlens=query_start_loc_d,
+                    max_seqlen=state_indices_tensor_d.size(-1),
+                )
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None

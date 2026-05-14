@@ -125,6 +125,7 @@ class FlashInferSSUBackend(MambaSSUBackend):
                 "Please install flashinfer (>= 0.6.4): "
                 "pip install flashinfer-python"
             ) from e
+
         self._kernel = _fi_ssu
 
     @property
@@ -156,7 +157,6 @@ class FlashInferSSUBackend(MambaSSUBackend):
             if self._mamba_config.enable_stochastic_rounding
             else None
         )
-
         self._kernel(
             state,
             x,
@@ -182,12 +182,264 @@ class FlashInferSSUBackend(MambaSSUBackend):
         )
 
 
+class FlashInferCheckpointingSSUBackend:
+    """FlashInfer-based checkpointing SSU backend."""
+
+    def __init__(self, mamba_config: MambaConfig):
+        self._mamba_config = mamba_config
+        try:
+            from flashinfer.mamba import checkpointing_ssu as _fi_checkpointing_ssu
+        except ImportError as e:
+            raise ImportError(
+                "FlashInfer is required for the flashinfer Mamba "
+                "checkpointing SSU backend. Please install a FlashInfer "
+                "version that provides flashinfer.mamba.checkpointing_ssu."
+            ) from e
+
+        self._kernel = _fi_checkpointing_ssu
+
+    @property
+    def name(self) -> str:
+        return "flashinfer_checkpointing"
+
+    def __call__(
+        self,
+        state: torch.Tensor,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        out: torch.Tensor,
+        old_x: torch.Tensor,
+        old_B: torch.Tensor,
+        old_dt_proc: torch.Tensor,
+        old_cumAdt: torch.Tensor,
+        cache_buf_idx: torch.Tensor,
+        prev_num_accepted_tokens: torch.Tensor,
+        D: torch.Tensor | None = None,
+        z: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        dt_softplus: bool = False,
+        state_batch_indices: torch.Tensor | None = None,
+        null_block_id: int = NULL_BLOCK_ID,
+        state_scale: torch.Tensor | None = None,
+        rand_seed: torch.Tensor | None = None,
+        d_split: int | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
+    ) -> None:
+        _validate_checkpointing_ssu_inputs(
+            state=state,
+            out=out,
+            old_x=old_x,
+            old_B=old_B,
+            old_dt_proc=old_dt_proc,
+            old_cumAdt=old_cumAdt,
+            cache_buf_idx=cache_buf_idx,
+            prev_num_accepted_tokens=prev_num_accepted_tokens,
+            state_batch_indices=state_batch_indices,
+            state_scale=state_scale,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+
+        if rand_seed is None and self._mamba_config.enable_stochastic_rounding:
+            rand_seed = torch.randint(0, 2**32, (1,), device=state.device)
+
+        self._kernel(
+            state,
+            old_x,
+            old_B,
+            old_dt_proc,
+            old_cumAdt,
+            cache_buf_idx,
+            prev_num_accepted_tokens,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            out,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            state_batch_indices=state_batch_indices,
+            pad_slot_id=null_block_id,
+            state_scale=state_scale,
+            rand_seed=rand_seed,
+            philox_rounds=self._mamba_config.stochastic_rounding_philox_rounds or 10,
+            d_split=d_split,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+
+
 _BACKEND_REGISTRY: dict[MambaBackendEnum, type[MambaSSUBackend]] = {
     MambaBackendEnum.TRITON: TritonSSUBackend,
     MambaBackendEnum.FLASHINFER: FlashInferSSUBackend,
 }
 
 _mamba_ssu_backend: MambaSSUBackend | None = None
+_mamba_ssu_checkpointing_backend: FlashInferCheckpointingSSUBackend | None = None
+
+
+# TODO: Remove this function once the checkpointing SSU backend is fully tested.
+def _validate_checkpointing_ssu_inputs(
+    *,
+    state: torch.Tensor,
+    out: torch.Tensor,
+    old_x: torch.Tensor,
+    old_B: torch.Tensor,
+    old_dt_proc: torch.Tensor,
+    old_cumAdt: torch.Tensor,
+    cache_buf_idx: torch.Tensor,
+    prev_num_accepted_tokens: torch.Tensor,
+    state_batch_indices: torch.Tensor | None,
+    state_scale: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    max_seqlen: int | None,
+) -> None:
+    if out.device != state.device:
+        raise ValueError(
+            "out must be on the same device as state. "
+            f"Got {out.device=} and {state.device=}."
+        )
+    if state.dim() != 4:
+        raise ValueError(
+            "checkpointing_state_update expects state with shape "
+            "(cache, nheads, dim, dstate)."
+        )
+    cache_size, nheads, dim, dstate = state.shape
+
+    cache_tensors = {
+        "old_x": old_x,
+        "old_B": old_B,
+        "old_dt_proc": old_dt_proc,
+        "old_cumAdt": old_cumAdt,
+    }
+    for name, tensor in cache_tensors.items():
+        if tensor.device != state.device:
+            raise ValueError(
+                f"{name} must be on the same device as state. "
+                f"Got {tensor.device=} and {state.device=}."
+            )
+        if tensor.shape[0] != cache_size:
+            raise ValueError(
+                f"{name} must have cache dimension {cache_size}; "
+                f"got shape {tuple(tensor.shape)}."
+            )
+
+    if old_x.dim() != 4:
+        raise ValueError("old_x must have shape (cache, max_window, nheads, dim).")
+    max_window = old_x.shape[1]
+    if max_window < 1 or max_window > 16:
+        raise ValueError(
+            "checkpointing_state_update expects max_window in [1, 16]; "
+            f"got {max_window}."
+        )
+    if old_x.shape[2:] != (nheads, dim):
+        raise ValueError(
+            "old_x shape mismatch: expected trailing dims "
+            f"{(nheads, dim)}, got {tuple(old_x.shape[2:])}."
+        )
+
+    if old_B.dim() != 5 or old_B.shape[1] != 2 or old_B.shape[2] != max_window:
+        raise ValueError(
+            "old_B must have shape (cache, 2, max_window, ngroups, dstate)."
+        )
+    if old_B.shape[4] != dstate:
+        raise ValueError(
+            "old_B dstate dimension must match state. "
+            f"Expected {dstate}, got {old_B.shape[4]}."
+        )
+
+    expected_dt_shape = (cache_size, 2, nheads, max_window)
+    if old_dt_proc.shape != expected_dt_shape:
+        raise ValueError(
+            "old_dt_proc must have shape "
+            f"{expected_dt_shape}; got {tuple(old_dt_proc.shape)}."
+        )
+    if old_cumAdt.shape != expected_dt_shape:
+        raise ValueError(
+            "old_cumAdt must have shape "
+            f"{expected_dt_shape}; got {tuple(old_cumAdt.shape)}."
+        )
+    if old_dt_proc.dtype != torch.float32 or old_cumAdt.dtype != torch.float32:
+        raise ValueError("old_dt_proc and old_cumAdt must be torch.float32.")
+
+    expected_counter_shape = (cache_size,)
+    for name, tensor in (
+        ("cache_buf_idx", cache_buf_idx),
+        ("prev_num_accepted_tokens", prev_num_accepted_tokens),
+    ):
+        if tensor.shape != expected_counter_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_counter_shape}; "
+                f"got {tuple(tensor.shape)}."
+            )
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{name} must be torch.int32, got {tensor.dtype}.")
+        if tensor.device != state.device:
+            raise ValueError(
+                f"{name} must be on the same device as state. "
+                f"Got {tensor.device=} and {state.device=}."
+            )
+
+    if state_batch_indices is None:
+        raise ValueError(
+            "checkpointing_state_update requires a 1D state_batch_indices "
+            "tensor mapping each decode row to a persistent Mamba cache slot."
+        )
+    if state_batch_indices.dim() != 1:
+        raise ValueError(
+            "checkpointing_state_update requires 1D state_batch_indices. "
+            "Do not pass the speculative 2D state_indices_tensor_d directly."
+        )
+    if state_batch_indices.device != state.device:
+        raise ValueError(
+            "state_batch_indices must be on the same device as state. "
+            f"Got {state_batch_indices.device=} and {state.device=}."
+        )
+    if state_batch_indices.dtype != torch.int32:
+        raise ValueError(
+            f"state_batch_indices must be torch.int32, got {state_batch_indices.dtype}."
+        )
+
+    if cu_seqlens is None:
+        raise ValueError("checkpointing_state_update requires cu_seqlens.")
+    if cu_seqlens.dim() != 1:
+        raise ValueError("checkpointing_state_update requires 1D cu_seqlens.")
+    if cu_seqlens.device != state.device:
+        raise ValueError(
+            "cu_seqlens must be on the same device as state. "
+            f"Got {cu_seqlens.device=} and {state.device=}."
+        )
+    if cu_seqlens.dtype != torch.int32:
+        raise ValueError(f"cu_seqlens must be torch.int32, got {cu_seqlens.dtype}.")
+    if max_seqlen is None:
+        raise ValueError("checkpointing_state_update requires max_seqlen.")
+    if max_seqlen < 1:
+        raise ValueError(
+            "checkpointing_state_update requires positive max_seqlen; "
+            f"got {max_seqlen}."
+        )
+
+    if state_scale is not None:
+        expected_scale_shape = (cache_size, nheads, dim)
+        if state_scale.device != state.device:
+            raise ValueError(
+                "state_scale must be on the same device as state. "
+                f"Got {state_scale.device=} and {state.device=}."
+            )
+        if state_scale.shape != expected_scale_shape:
+            raise ValueError(
+                f"state_scale must have shape {expected_scale_shape}; "
+                f"got {tuple(state_scale.shape)}."
+            )
+        if state_scale.dtype != torch.float32:
+            raise ValueError("state_scale must be torch.float32.")
 
 
 def initialize_mamba_ssu_backend(
@@ -207,7 +459,7 @@ def initialize_mamba_ssu_backend(
     ):
         return
 
-    global _mamba_ssu_backend
+    global _mamba_ssu_backend, _mamba_ssu_checkpointing_backend
 
     backend = mamba_config.backend
     if backend not in _BACKEND_REGISTRY:
@@ -217,11 +469,30 @@ def initialize_mamba_ssu_backend(
         )
 
     backend_cls = _BACKEND_REGISTRY[backend]
-    if isinstance(_mamba_ssu_backend, backend_cls):
-        return
+    if not isinstance(_mamba_ssu_backend, backend_cls):
+        _mamba_ssu_backend = backend_cls(mamba_config)
+        logger.info("Using %s Mamba SSU backend.", _mamba_ssu_backend.name)
+    else:
+        _mamba_ssu_backend._mamba_config = mamba_config
 
-    _mamba_ssu_backend = backend_cls(mamba_config)
-    logger.info("Using %s Mamba SSU backend.", _mamba_ssu_backend.name)
+    if mamba_config.mamba_ssm_checkpoint_interval > 1:
+        if backend != MambaBackendEnum.FLASHINFER:
+            raise ValueError("Mamba SSU checkpointing requires the flashinfer backend.")
+        if not isinstance(
+            _mamba_ssu_checkpointing_backend,
+            FlashInferCheckpointingSSUBackend,
+        ):
+            _mamba_ssu_checkpointing_backend = FlashInferCheckpointingSSUBackend(
+                mamba_config
+            )
+            logger.info(
+                "Using %s Mamba SSU backend.",
+                _mamba_ssu_checkpointing_backend.name,
+            )
+        else:
+            _mamba_ssu_checkpointing_backend._mamba_config = mamba_config
+    else:
+        _mamba_ssu_checkpointing_backend = None
 
 
 def get_mamba_ssu_backend() -> MambaSSUBackend:
@@ -232,6 +503,16 @@ def get_mamba_ssu_backend() -> MambaSSUBackend:
             "Call initialize_mamba_ssu_backend() first."
         )
     return _mamba_ssu_backend
+
+
+def get_mamba_ssu_checkpointing_backend() -> FlashInferCheckpointingSSUBackend:
+    """Get the current Mamba SSU checkpointing backend."""
+    if _mamba_ssu_checkpointing_backend is None:
+        raise RuntimeError(
+            "Mamba SSU checkpointing backend has not been initialized. "
+            "Call initialize_mamba_ssu_backend() first."
+        )
+    return _mamba_ssu_checkpointing_backend
 
 
 def selective_state_update(
@@ -275,4 +556,64 @@ def selective_state_update(
         num_accepted_tokens=num_accepted_tokens,
         cu_seqlens=cu_seqlens,
         is_blackwell=is_blackwell,
+    )
+
+
+def checkpointing_state_update(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    out: torch.Tensor,
+    old_x: torch.Tensor,
+    old_B: torch.Tensor,
+    old_dt_proc: torch.Tensor,
+    old_cumAdt: torch.Tensor,
+    cache_buf_idx: torch.Tensor,
+    prev_num_accepted_tokens: torch.Tensor,
+    D: torch.Tensor | None = None,
+    z: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    dt_softplus: bool = False,
+    state_batch_indices: torch.Tensor | None = None,
+    null_block_id: int = NULL_BLOCK_ID,
+    state_scale: torch.Tensor | None = None,
+    rand_seed: torch.Tensor | None = None,
+    d_split: int | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
+) -> None:
+    """Dispatch FlashInfer Mamba checkpointing SSU.
+
+    This path is intentionally separate from `selective_state_update` because
+    FlashInfer's checkpointing kernel has a different ABI and requires replay
+    cache tensors plus per-cache-slot counters.
+    """
+    get_mamba_ssu_checkpointing_backend()(
+        state=state,
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        out=out,
+        old_x=old_x,
+        old_B=old_B,
+        old_dt_proc=old_dt_proc,
+        old_cumAdt=old_cumAdt,
+        cache_buf_idx=cache_buf_idx,
+        prev_num_accepted_tokens=prev_num_accepted_tokens,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        state_batch_indices=state_batch_indices,
+        null_block_id=null_block_id,
+        state_scale=state_scale,
+        rand_seed=rand_seed,
+        d_split=d_split,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
     )
