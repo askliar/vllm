@@ -35,7 +35,10 @@ from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
-from vllm.model_executor.layers.mamba.ops.ssu_dispatch import checkpointing_state_update, selective_state_update
+from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+    checkpointing_state_update,
+    selective_state_update,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     LoaderFunction,
@@ -54,6 +57,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 logger = init_logger(__name__)
 
@@ -494,8 +498,18 @@ class MambaMixer2(MambaBase, PluggableLayer):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-        # The tuple is (conv_state, ssm_state)
+        # The tuple for non-checkpoint mode is (conv_state, ssm_state)
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
+        # The tuple for checkpoint mode is (conv_state, ssm_state, old_x, old_B, old_dt, old_cumAdt)
+        if cache_config.mamba_ssm_checkpoint_interval > 1:
+            self.kv_cache = (
+                torch.tensor([]),  # conv_state
+                torch.tensor([]),  # ssm_state
+                torch.tensor([]),  # old_x
+                torch.tensor([]),  # old_B
+                torch.tensor([]),  # old_dt
+                torch.tensor([]),  # old_cumAdt
+            )
 
         self.model_config = model_config
         self.cache_config = cache_config
@@ -585,7 +599,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Triton's autotuner includes tensor dtypes in its cache key,
         # so state_dtype must match what real inference uses.
-        _, ssm_state_dtype = self.get_state_dtype()
+        _, ssm_state_dtype, *_ = self.get_state_dtype()
 
         # SSD kernel autotune keys depend on dtype and head dimensions,
         # not on sequence length or batch size, so a single shape suffices.
@@ -1014,12 +1028,25 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     dt_softplus=True,
                     state_batch_indices=state_indices_tensor_d_input,
                     dst_state_batch_indices=state_indices_tensor_d_output,
-                    out=preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
+                    out=preallocated_ssm_out_d.view(
+                        num_decode_tokens, -1, self.head_dim
+                    ),
                     num_accepted_tokens=num_accepted_tokens,
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
             else:
+                _, _, old_x, old_B, old_dt_proc, old_cumAdt = self.kv_cache
+                cache_buf_idx = attn_metadata.cache_buf_idx_d
+                prev_num_accepted_tokens = attn_metadata.prev_num_accepted_tokens_d
+                state_batch_indices = state_indices_tensor_d_input
+
+                if state_batch_indices.dim() == 2:
+                    # FlashInfer checkpointing uses one persistent cache slot per
+                    # decode row; speculative token slots are represented by
+                    # cu_seqlens and the replay buffers.
+                    state_batch_indices = state_batch_indices[:, 0]
+
                 checkpointing_state_update(
                     state=ssm_state,
                     x=hidden_states_d,
@@ -1027,7 +1054,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     A=A_d,
                     B=B_d,
                     C=C_d,
-                    out=preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
+                    out=preallocated_ssm_out_d.view(
+                        num_decode_tokens, -1, self.head_dim
+                    ),
                     old_x=old_x,
                     old_B=old_B,
                     old_dt_proc=old_dt_proc,
@@ -1038,25 +1067,45 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     z=None,
                     dt_bias=dt_bias,
                     dt_softplus=True,
-                    state_batch_indices=state_indices_tensor_d_input,
-                    null_block_id=0,
-                    state_scale=state_scale if "state_scale" in locals() else None,
+                    state_batch_indices=state_batch_indices,
+                    null_block_id=NULL_BLOCK_ID,
+                    state_scale=None,
                     rand_seed=None,
                     d_split=None,
                     cu_seqlens=query_start_loc_d,
                     max_seqlen=state_indices_tensor_d.size(-1),
                 )
 
-    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+    def get_state_dtype(
+        self,
+    ) -> (
+        tuple[torch.dtype, torch.dtype]
+        | tuple[
+            torch.dtype, torch.dtype, torch.dtype, torch.dtype, torch.dtype, torch.dtype
+        ]
+    ):
         assert self.model_config is not None
         assert self.cache_config is not None
         return MambaStateDtypeCalculator.mamba2_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
+            mamba_ssm_checkpoint_interval=self.cache_config.mamba_ssm_checkpoint_interval,
         )
 
-    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    def get_state_shape(
+        self,
+    ) -> (
+        tuple[tuple[int, ...], tuple[int, ...]]
+        | tuple[
+            tuple[int, ...],
+            tuple[int, ...],
+            tuple[int, ...],
+            tuple[int, ...],
+            tuple[int, ...],
+            tuple[int, ...],
+        ]
+    ):
         return MambaStateShapeCalculator.mamba2_state_shape(
             intermediate_size=self.intermediate_size,
             tp_world_size=get_tensor_model_parallel_world_size(),
@@ -1066,6 +1115,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             state_size=self.ssm_state_size,
             conv_kernel=self.conv_kernel_size,
             num_spec=self.num_spec,
+            mamba_ssm_checkpoint_interval=self.cache_config.mamba_ssm_checkpoint_interval,
         )
 
     @property

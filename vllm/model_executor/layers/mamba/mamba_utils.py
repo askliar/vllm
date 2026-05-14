@@ -75,9 +75,13 @@ class MambaStateDtypeCalculator:
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType,
+        mamba_ssm_checkpoint_interval: int = 1,
     ) -> tuple[torch.dtype, ...]:
         return cls._mamba_state_dtype(
-            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+            model_dtype,
+            mamba_cache_dtype,
+            mamba_ssm_cache_dtype,
+            mamba_ssm_checkpoint_interval,
         )
 
     @classmethod
@@ -86,6 +90,7 @@ class MambaStateDtypeCalculator:
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType,
+        mamba_ssm_checkpoint_interval: int = 1,
     ) -> tuple[torch.dtype, ...]:
         conv_state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         if mamba_ssm_cache_dtype == "auto":
@@ -93,7 +98,22 @@ class MambaStateDtypeCalculator:
         else:
             temporal_state_dtype = STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]
 
-        return (conv_state_dtype, temporal_state_dtype)
+        if mamba_ssm_checkpoint_interval == 1:
+            return (conv_state_dtype, temporal_state_dtype)
+        else:
+            # Check if it should be aligned with conv_state_dtype
+            old_x_dtype = conv_state_dtype
+            old_B_dtype = conv_state_dtype
+            old_dt_dtype = torch.float32  # Aligned with FlashInfer
+            old_cumAdt_dtype = torch.float32  # Aligned with FlashInfer
+            return (
+                conv_state_dtype,
+                temporal_state_dtype,
+                old_x_dtype,
+                old_B_dtype,
+                old_dt_dtype,
+                old_cumAdt_dtype,
+            )
 
     @classmethod
     def short_conv_state_dtype(
@@ -169,6 +189,7 @@ class MambaStateShapeCalculator:
         state_size: int,
         conv_kernel: int,
         num_spec: int = 0,
+        mamba_ssm_checkpoint_interval: int = 1,
     ) -> tuple[tuple[int, int], tuple[int, int, int]]:
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
@@ -183,8 +204,28 @@ class MambaStateShapeCalculator:
         # These are not TP-ed as they depend on A, dt_bias, D
         # - they are typically small
         #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
-        temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
-        return conv_state_shape, temporal_state_shape
+        num_heads_local = divide(num_heads, tp_world_size)
+
+        temporal_state_shape = (num_heads_local, head_dim, state_size)
+        if mamba_ssm_checkpoint_interval == 1:
+            return conv_state_shape, temporal_state_shape
+        else:
+            max_window = mamba_ssm_checkpoint_interval
+            num_groups_local = divide(n_groups, tp_world_size)
+
+            old_x_shape = (max_window, num_heads_local, head_dim)
+            old_B_shape = (2, max_window, num_groups_local, state_size)
+            old_dt_shape = (2, num_heads_local, max_window)
+            old_cumAdt_shape = (2, num_heads_local, max_window)
+
+            return (
+                conv_state_shape,
+                temporal_state_shape,
+                old_x_shape,
+                old_B_shape,
+                old_dt_shape,
+                old_cumAdt_shape,
+            )
 
     @classmethod
     def short_conv_state_shape(

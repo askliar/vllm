@@ -475,7 +475,13 @@ def initialize_mamba_ssu_backend(
     else:
         _mamba_ssu_backend._mamba_config = mamba_config
 
-    if mamba_config.mamba_ssm_checkpoint_interval > 1:
+    has_checkpointing_mamba = any(
+        isinstance(g.kv_cache_spec, MambaSpec)
+        and g.kv_cache_spec.ssm_checkpoint_interval > 1
+        for g in kv_cache_config.kv_cache_groups
+    )
+
+    if has_checkpointing_mamba:
         if backend != MambaBackendEnum.FLASHINFER:
             raise ValueError("Mamba SSU checkpointing requires the flashinfer backend.")
         if not isinstance(

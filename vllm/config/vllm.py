@@ -37,7 +37,7 @@ from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
 from .lora import LoRAConfig
-from .mamba import MambaConfig
+from .mamba import MambaBackendEnum, MambaConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
 from .offload import OffloadConfig
@@ -1349,6 +1349,14 @@ class VllmConfig:
                 # Hybrid KV cache manager is not yet supported with chunked
                 # local attention.
                 need_disable_hybrid_kv_cache_manager = True
+
+        if (
+            self.cache_config.mamba_ssm_checkpoint_interval > 1
+            and self.mamba_config.backend != MambaBackendEnum.FLASHINFER
+        ):
+            raise ValueError(
+                "Checkpointing is only supported with the flashinfer backend."
+            )
 
         if self.scheduler_config.disable_hybrid_kv_cache_manager is None:
             # Default to disable HMA, but only if the user didn't express a preference.

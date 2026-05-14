@@ -138,6 +138,9 @@ class CacheConfig:
     - "align": only cache the mamba state of the last token of each scheduler step and
            when the token is at position i * block_size.
     """
+    mamba_ssm_checkpoint_interval: int = 1
+    """The interval at which to checkpoint the SSM state to cache. This is only
+    used for Mamba2 layers when mamba_ssm_checkpoint_interval > 1."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
@@ -146,7 +149,7 @@ class CacheConfig:
     """The number of blocks to allocate for CPU memory."""
 
     kv_sharing_fast_prefill: bool = False
-    """This feature is work in progress and no prefill optimization takes place
+"""This feature is work in progress and no prefill optimization takes place
     with this flag enabled currently.
 
     In some KV sharing setups, e.g. YOCO (https://arxiv.org/abs/2405.05254),

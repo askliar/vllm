@@ -57,6 +57,9 @@ class MambaBase(AttentionLayerBase):
                 if vllm_config.speculative_config
                 else 0
             ),
+            ssm_checkpoint_interval=(
+                vllm_config.cache_config.mamba_ssm_checkpoint_interval
+            ),
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
