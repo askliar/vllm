@@ -18,6 +18,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kNvfp4Dynamic,
     kNvfp4Static,
+    kNvfp4StaticGroupScale,
+    kStaticTensorScale,
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
@@ -237,6 +239,12 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             envs.VLLM_FLASHINFER_B12X_CUTLASS_PREFILL_THRESHOLD
         )
 
+        # Intermediate activation precision: "fp4" (W4A4, default) or
+        # "bf16" (W4A16). Same FP4 weight bytes for both modes; the
+        # kernel internally chooses whether to re-quantize the
+        # post-SwiGLU/ReLU2 activations or keep them in BF16.
+        self.activation_precision = envs.VLLM_FLASHINFER_B12X_ACTIVATION_PRECISION
+
         # Lazily created on first apply() call.
         self._wrapper: object | None = None
         self._cutlass_registered: bool = False
@@ -275,12 +283,8 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             cutlass_w2_scale = layer.w2_weight_scale.clone()
             cutlass_a1_gscale = self.a1_gscale.clone()
             cutlass_a2_gscale = self.a2_gscale.clone()
-            cutlass_g1_alphas = (
-                self.g1_alphas.float() / self.a1_gscale
-            ).contiguous()
-            cutlass_g2_alphas = (
-                self.g2_alphas.float() / self.a2_gscale
-            ).contiguous()
+            cutlass_g1_alphas = (self.g1_alphas.float() / self.a1_gscale).contiguous()
+            cutlass_g2_alphas = (self.g2_alphas.float() / self.a2_gscale).contiguous()
 
             # Register on the layer so EPLB's get_expert_weights() picks them
             # up via named_parameters() and rearrange_expert_weights_inplace
@@ -382,7 +386,21 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        return (weight_key, activation_key) == (kNvfp4Static, kNvfp4Dynamic)
+        # Original W4A4 NVFP4 (modelopt format).
+        if (weight_key, activation_key) == (kNvfp4Static, kNvfp4Dynamic):
+            return True
+        # W4A16 NVFP4 compressed-tensors `nvfp4-pack-quantized`: weights
+        # are packed as uint8 (two FP4 elements per byte) with the same
+        # NVFP4 group + per-tensor scales; no activation quant. The b12x
+        # kernel reads the same FP4 byte payload, so this is supported.
+        return (
+            weight_key is not None
+            and weight_key.dtype == torch.uint8
+            and weight_key.scale == kNvfp4StaticGroupScale
+            and weight_key.scale2 == kStaticTensorScale
+            and weight_key.symmetric
+            and activation_key is None
+        )
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
@@ -434,7 +452,9 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             from flashinfer.fused_moe import B12xMoEWrapper
 
             # activation_precision="fp4" selects the W4A4 path (matching
-            # the NVFP4 weights vLLM loads here); "bf16" would be W4A16.
+            # the NVFP4 weights vLLM loads here); "bf16" selects W4A16.
+            # Same NVFP4 weight bytes for both; the kernel picks the
+            # intermediate-activation handling internally.
             self._wrapper = B12xMoEWrapper(
                 num_experts=self.global_num_experts,
                 top_k=self.topk,
@@ -444,14 +464,11 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 max_num_tokens=self.max_num_tokens,
                 num_local_experts=self.num_local_experts,
                 activation=self._activation_str,
-                activation_precision="fp4",
+                activation_precision=self.activation_precision,
                 cutlass_prefill_threshold=self.cutlass_prefill_threshold,
             )
 
-        if (
-            self.cutlass_prefill_threshold > 0
-            and not self._cutlass_registered
-        ):
+        if self.cutlass_prefill_threshold > 0 and not self._cutlass_registered:
             assert self._cutlass_w13_scale is not None, (
                 "cutlass_prefill_threshold > 0 but CUTLASS scales were "
                 "not saved in process_weights_after_loading"
