@@ -396,6 +396,7 @@ class NemotronHMTP(nn.Module, SupportsPP):
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
             self.config.hidden_size,
+            quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
 
