@@ -109,6 +109,10 @@ class Mamba2AttentionMetadata(BaseMambaAttentionMetadata):
     # Chunk-related metadata (only for prefill)
     seq_idx_p: torch.Tensor | None = None
 
+    # SSM checkpointing metadata
+    cache_buf_idx_d: torch.Tensor | None = None
+    prev_num_accepted_tokens_d: torch.Tensor | None = None
+
 
 class Mamba2AttentionMetadataBuilder(
     BaseMambaAttentionMetadataBuilder[Mamba2AttentionMetadata]
@@ -160,6 +164,17 @@ class Mamba2AttentionMetadataBuilder(
                     common_attn_metadata,
                 )
             )
+        
+        cache_buf_idx_d = None
+        prev_num_accepted_tokens_d = None
+
+        if self.vllm_config.cache_config.mamba_ssm_checkpoint_interval > 1:
+            cache_buf_idx_d = torch.zeros(
+                (common.num_reqs,), dtype=torch.int32, device=self.device
+            )
+            prev_num_accepted_tokens_d = torch.zeros(
+                (common.num_reqs,), dtype=torch.int32, device=self.device
+            )
 
         return replace(
             common,
@@ -168,4 +183,6 @@ class Mamba2AttentionMetadataBuilder(
             seq_idx_p=seq_idx_p,
             cu_chunk_seqlen_p=cu_chunk_seqlen_p,
             last_chunk_indices_p=last_chunk_indices_p,
+            cache_buf_idx_d=cache_buf_idx_d,
+            prev_num_accepted_tokens_d=prev_num_accepted_tokens_d,
         )

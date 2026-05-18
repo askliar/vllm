@@ -15,6 +15,8 @@ from vllm.utils.torch_utils import (
 
 logger = init_logger(__name__)
 
+_PHASE1_MAMBA_SSM_CHECKPOINT_INTERVALS = frozenset({1, 4, 8, 16})
+
 CacheDType = Literal[
     "auto",
     "float16",
@@ -139,8 +141,13 @@ class CacheConfig:
            when the token is at position i * block_size.
     """
     mamba_ssm_checkpoint_interval: int = 1
-    """The interval at which to checkpoint the SSM state to cache. This is only
-    used for Mamba2 layers when mamba_ssm_checkpoint_interval > 1."""
+    """Interval ``L`` for Mamba2 SSM checkpoint slots when using FlashInfer's
+    checkpointed path. Stable config field name; the CLI exposes this as the
+    experimental flag ``--experimental-mamba-ssm-checkpoint-interval``.
+
+    Phase 1 allows ``L`` in ``{1, 4, 8, 16}`` (FlashInfer caps ``max_window``
+    at 16). Each distinct ``L`` adds one JIT compile per
+    ``(state_dtype, dim, dstate, heads_per_group)`` tuple."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
@@ -149,7 +156,7 @@ class CacheConfig:
     """The number of blocks to allocate for CPU memory."""
 
     kv_sharing_fast_prefill: bool = False
-"""This feature is work in progress and no prefill optimization takes place
+    """This feature is work in progress and no prefill optimization takes place
     with this flag enabled currently.
 
     In some KV sharing setups, e.g. YOCO (https://arxiv.org/abs/2405.05254),
@@ -237,6 +244,21 @@ class CacheConfig:
         if self.mamba_block_size is not None:
             object.__setattr__(self, "user_specified_mamba_block_size", True)
         return self
+
+    @field_validator("mamba_ssm_checkpoint_interval", mode="after")
+    @classmethod
+    def _validate_mamba_ssm_checkpoint_interval(cls, v: int) -> int:
+        if not (1 <= v <= 16):
+            raise ValueError(
+                f"Mamba SSM checkpoint interval must satisfy 1 <= L <= 16 "
+                f"(FlashInfer hard cap on max_window); got L={v}."
+            )
+        if v not in _PHASE1_MAMBA_SSM_CHECKPOINT_INTERVALS:
+            raise ValueError(
+                "Phase 1 supports L ∈ {1,4,8,16} (FlashInfer hard cap L <= 16); "
+                "raise an issue if you need more."
+            )
+        return v
 
     @field_validator("calculate_kv_scales", mode="after")
     @classmethod

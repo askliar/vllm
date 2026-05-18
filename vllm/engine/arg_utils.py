@@ -659,6 +659,7 @@ class EngineArgs:
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
+    mamba_ssm_checkpoint_interval: int = CacheConfig.mamba_ssm_checkpoint_interval
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     enable_mamba_cache_stochastic_rounding: bool = (
@@ -1113,6 +1114,21 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--mamba-ssm-cache-dtype", **cache_kwargs["mamba_ssm_cache_dtype"]
+        )
+        ckpt_kw = dict(cache_kwargs["mamba_ssm_checkpoint_interval"])
+        ckpt_note = (
+            "EXPERIMENTAL: Mamba2 SSM checkpoint interval L ∈ {1,4,8,16} "
+            "(FlashInfer checkpointing kernels; Phase 1: no spec decode, no Mamba "
+            "prefix caching). Depends on FlashInfer PR #3324 "
+            "(module flashinfer.mamba.checkpointing_ssu)."
+        )
+        ckpt_help = ckpt_kw.get("help", "").strip()
+        ckpt_kw["help"] = f"{ckpt_note}\n\n{ckpt_help}" if ckpt_help else ckpt_note
+        cache_group.add_argument(
+            "--experimental-mamba-ssm-checkpoint-interval",
+            "--mamba-ssm-checkpoint-interval",
+            dest="mamba_ssm_checkpoint_interval",
+            **ckpt_kw,
         )
         cache_group.add_argument(
             "--mamba-block-size", **cache_kwargs["mamba_block_size"]
@@ -1707,6 +1723,7 @@ class EngineArgs:
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
             mamba_cache_mode=self.mamba_cache_mode,
+            mamba_ssm_checkpoint_interval=self.mamba_ssm_checkpoint_interval,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
         )

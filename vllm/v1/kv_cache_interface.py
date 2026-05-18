@@ -710,6 +710,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return all(
                 isinstance(spec, MambaSpec)
                 and spec.num_speculative_blocks == one_spec.num_speculative_blocks
+                and spec.ssm_checkpoint_interval == one_spec.ssm_checkpoint_interval
                 for spec in kv_cache_specs.values()
             )
         else:

@@ -1039,13 +1039,14 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 _, _, old_x, old_B, old_dt_proc, old_cumAdt = self.kv_cache
                 cache_buf_idx = attn_metadata.cache_buf_idx_d
                 prev_num_accepted_tokens = attn_metadata.prev_num_accepted_tokens_d
-                state_batch_indices = state_indices_tensor_d_input
+                checkpoint_state_indices_d = state_indices_tensor_d_input
 
-                if state_batch_indices.dim() == 2:
-                    # FlashInfer checkpointing uses one persistent cache slot per
-                    # decode row; speculative token slots are represented by
-                    # cu_seqlens and the replay buffers.
-                    state_batch_indices = state_batch_indices[:, 0]
+                if checkpoint_state_indices_d.dim() == 2:
+                    # In mamba_cache_mode="none", decode metadata is a compact
+                    # (current slot + speculative slots) table. Phase-1
+                    # checkpointing keys FlashInfer replay state and counters by
+                    # the current slot; later columns remain MTP scratch slots.
+                    checkpoint_state_indices_d = checkpoint_state_indices_d[:, 0]
 
                 checkpointing_state_update(
                     state=ssm_state,
@@ -1067,7 +1068,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     z=None,
                     dt_bias=dt_bias,
                     dt_softplus=True,
-                    state_batch_indices=state_batch_indices,
+                    state_batch_indices=checkpoint_state_indices_d,
                     null_block_id=NULL_BLOCK_ID,
                     state_scale=None,
                     rand_seed=None,
@@ -1090,7 +1091,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
-            mamba_ssm_checkpoint_interval=self.cache_config.mamba_ssm_checkpoint_interval,
+            self.cache_config.mamba_ssm_checkpoint_interval,
         )
 
     def get_state_shape(
