@@ -136,24 +136,6 @@ class Mamba2AttentionMetadataBuilder(
         self.cache_buf_idx_d: torch.Tensor | None = None
         self.prev_num_accepted_tokens_d: torch.Tensor | None = None
 
-        if self.vllm_config.cache_config.mamba_ssm_checkpoint_interval > 1:
-            num_blocks = self.vllm_config.cache_config.num_gpu_blocks
-            assert num_blocks is not None, (
-                "cache_config.num_gpu_blocks must be set before "
-                "Mamba2AttentionMetadataBuilder is constructed (profiling "
-                "should have run already)."
-            )
-            self.cache_buf_idx_d = torch.zeros(
-                (num_blocks,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            self.prev_num_accepted_tokens_d = torch.zeros(
-                (num_blocks,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-
         self._last_state_indices_tensor_d: torch.Tensor | None = None
         self._last_query_start_loc_d: torch.Tensor | None = None
         self._last_num_decodes: int = 0
@@ -195,6 +177,26 @@ class Mamba2AttentionMetadataBuilder(
                 )
             )
 
+        if (
+            self.cache_buf_idx_d is None
+            and self.vllm_config.cache_config.mamba_ssm_checkpoint_interval > 1
+        ):
+            num_blocks = self.vllm_config.cache_config.num_gpu_blocks
+            assert num_blocks is not None, (
+                "cache_config.num_gpu_blocks must be set before "
+                "Mamba2AttentionMetadataBuilder is constructed (profiling "
+                "should have run already)."
+            )
+            self.cache_buf_idx_d = torch.zeros(
+                (num_blocks,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.prev_num_accepted_tokens_d = torch.zeros(
+                (num_blocks,),
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         self._last_state_indices_tensor_d = common.state_indices_tensor_d
         self._last_query_start_loc_d = common.query_start_loc_d
@@ -220,13 +222,24 @@ class Mamba2AttentionMetadataBuilder(
     def apply_post_step(
         self,
     ) -> None:
+        if self.cache_buf_idx_d is None or self._last_state_indices_tensor_d is None or self._last_num_decodes == 0:
+            return
 
+        num_decodes = self._last_num_decodes
         state_indices_tensor_d = self._last_state_indices_tensor_d
         query_start_loc_d = self._last_query_start_loc_d
 
         L = self.vllm_config.cache_config.mamba_ssm_checkpoint_interval
-        seq_lens = query_start_loc_d[1:] - query_start_loc_d[:-1]
-        slots = state_indices_tensor_d[:, 0]
+
+        query_start_loc_d = self._last_query_start_loc_d[: num_decodes + 1]
+
+        slots = (
+            state_indices_tensor_d[:num_decodes, 0].contiguous().to(torch.int64)
+        )
+        seq_lens = (
+            query_start_loc_d[1 : num_decodes + 1]
+            - query_start_loc_d[:num_decodes]
+        )
 
         total_seq_lens = seq_lens + self.prev_num_accepted_tokens_d[slots]
 
@@ -234,4 +247,4 @@ class Mamba2AttentionMetadataBuilder(
         self.cache_buf_idx_d[slots[mask]] ^= 1
 
         new_prev = torch.where(mask, seq_lens, total_seq_lens)
-        self.prev_num_accepted_tokens_d.scatter_(0, slots.to(torch.int64), new_prev)
+        self.prev_num_accepted_tokens_d.scatter_(0, slots, new_prev)

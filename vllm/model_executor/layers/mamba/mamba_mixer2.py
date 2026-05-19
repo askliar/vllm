@@ -1045,7 +1045,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     # (current slot + speculative slots) table. Phase-1
                     # checkpointing keys FlashInfer replay state and counters by
                     # the current slot; later columns remain MTP scratch slots.
-                    checkpoint_state_indices_d = checkpoint_state_indices_d[:, 0]
+                    checkpoint_state_indices_d = checkpoint_state_indices_d[
+                        :, 0
+                    ].contiguous()
 
                 checkpointing_state_update(
                     state=ssm_state,

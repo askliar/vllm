@@ -157,6 +157,7 @@ class FlashInferSSUBackend(MambaSSUBackend):
             if self._mamba_config.enable_stochastic_rounding
             else None
         )
+
         self._kernel(
             state,
             x,
@@ -247,6 +248,15 @@ class FlashInferCheckpointingSSUBackend:
         if rand_seed is None and self._mamba_config.enable_stochastic_rounding:
             rand_seed = torch.randint(0, 2**32, (1,), device=state.device)
 
+        if cu_seqlens is not None:
+            x = x.unsqueeze(0)
+            dt = dt.unsqueeze(0)
+            B = B.unsqueeze(0)
+            C = C.unsqueeze(0)
+            out_arg = out.unsqueeze(0)
+        else:
+            out_arg = out
+
         self._kernel(
             state,
             old_x,
@@ -260,7 +270,7 @@ class FlashInferCheckpointingSSUBackend:
             A,
             B,
             C,
-            out,
+            out_arg,
             D=D,
             z=z,
             dt_bias=dt_bias,
