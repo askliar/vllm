@@ -1060,6 +1060,18 @@ class GPUModelRunner(
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
 
+    def _zero_mamba_ssm_checkpoint_counters(self, block_ids: list[int]) -> None:
+        if self.cache_config.mamba_ssm_checkpoint_interval == 1:
+            return
+        for kv_cache_group_id, attn_groups in enumerate(self.attn_groups):
+            spec = self.kv_cache_config.kv_cache_groups[kv_cache_group_id].kv_cache_spec
+            if not isinstance(spec, MambaSpec):
+                continue
+            for attn_group in attn_groups:
+                builder = attn_group.get_metadata_builder()
+                if isinstance(builder, Mamba2AttentionMetadataBuilder):
+                    builder.zero_blocks(block_ids)
+
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
         """Initialize attributes from torch.cuda.get_device_properties"""
@@ -1113,6 +1125,9 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            self._zero_mamba_ssm_checkpoint_counters(
+                scheduler_output.new_block_ids_to_zero
+            )
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:

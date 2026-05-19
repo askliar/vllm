@@ -956,7 +956,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Process decode requests
         if has_decode:
-            assert state_indices_tensor_d is not None
             if is_mamba_cache_all:
                 state_indices_tensor_d_input = state_indices_tensor_d.gather(
                     1, block_idx_last_computed_token_d.unsqueeze(1)

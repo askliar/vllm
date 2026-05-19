@@ -806,6 +806,7 @@ class NemotronHForCausalLM(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_checkpoint_interval,
         )
 
     @classmethod
@@ -836,6 +837,7 @@ class NemotronHForCausalLM(
             state_size=hf_config.ssm_state_size,
             conv_kernel=hf_config.conv_kernel,
             num_spec=vllm_config.num_speculative_tokens,
+            mamba_ssm_checkpoint_interval=vllm_config.cache_config.mamba_ssm_checkpoint_interval,
         )
 
     @classmethod
@@ -865,7 +867,7 @@ class NemotronHForCausalLM(
         )
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
-
+        print("I AM HEREEEEE 2")
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )

@@ -131,7 +131,23 @@ class Mamba2AttentionMetadataBuilder(
         assert chunk_size is not None, (
             "chunk_size needs to be set in the model config for Mamba2 models"
         )
+        print("I AM HEREEEEE")
         self.chunk_size: int = chunk_size
+
+        self.cache_buf_idx_d = None
+        self.prev_num_accepted_tokens_d = None
+
+        if self.vllm_config.cache_config.mamba_ssm_checkpoint_interval > 1:
+            self.cache_buf_idx_d = torch.zeros(
+                (self.vllm_config.cache_config.num_gpu_blocks,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.prev_num_accepted_tokens_d = torch.zeros(
+                (self.vllm_config.cache_config.num_gpu_blocks,),
+                dtype=torch.int32,
+                device=self.device,
+            )
 
     def build(
         self,
@@ -164,17 +180,6 @@ class Mamba2AttentionMetadataBuilder(
                     common_attn_metadata,
                 )
             )
-        
-        cache_buf_idx_d = None
-        prev_num_accepted_tokens_d = None
-
-        if self.vllm_config.cache_config.mamba_ssm_checkpoint_interval > 1:
-            cache_buf_idx_d = torch.zeros(
-                (common.num_reqs,), dtype=torch.int32, device=self.device
-            )
-            prev_num_accepted_tokens_d = torch.zeros(
-                (common.num_reqs,), dtype=torch.int32, device=self.device
-            )
 
         return replace(
             common,
@@ -183,6 +188,30 @@ class Mamba2AttentionMetadataBuilder(
             seq_idx_p=seq_idx_p,
             cu_chunk_seqlen_p=cu_chunk_seqlen_p,
             last_chunk_indices_p=last_chunk_indices_p,
-            cache_buf_idx_d=cache_buf_idx_d,
-            prev_num_accepted_tokens_d=prev_num_accepted_tokens_d,
+            cache_buf_idx_d=self.cache_buf_idx_d,
+            prev_num_accepted_tokens_d=self.prev_num_accepted_tokens_d,
         )
+
+    def zero_blocks(self, block_ids: list[int]) -> None:
+        valid = [b for b in block_ids]
+        idx = torch.tensor(valid, dtype=torch.int64, device=self.cache_buf_idx_d.device)
+        self.cache_buf_idx_d.index_fill_(0, idx, 0)
+        self.prev_num_accepted_tokens_d.index_fill_(0, idx, 0)
+
+    def apply_post_step(
+        self,
+        state_indices_tensor_d: torch.Tensor,  # (num_decodes,  1 + num_spec_tokens) int32, in [0, num_blocks)
+        query_start_loc_d: torch.Tensor,  # (num_decodes + 1,) int32, cumsum starting at 0
+        num_decodes: int,
+    ) -> None:
+        L = self.vllm_config.cache_config.mamba_ssm_checkpoint_interval
+        seq_lens = query_start_loc_d[1:] - query_start_loc_d[:-1]
+        slots = state_indices_tensor_d[:, 0]
+
+        total_seq_lens = seq_lens + self.prev_num_accepted_tokens_d[slots]
+
+        mask = total_seq_lens > L
+        self.cache_buf_idx_d[slots[mask]] ^= 1
+
+        new_prev = torch.where(mask, seq_lens, total_seq_lens)
+        self.prev_num_accepted_tokens_d.scatter_(0, slots.to(torch.int64), new_prev)
