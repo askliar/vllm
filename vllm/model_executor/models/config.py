@@ -30,7 +30,15 @@ class AnyModelConfig(VerifyAndUpdateConfig):
         """Validate per_layer_config length and patch _model_info from base arch."""
         from dataclasses import replace
 
+        from vllm.transformers_utils.configs.modelopt_adapter import (
+            convert_block_configs_to_per_layer_config,
+        )
+
         hf_config = model_config.hf_config
+        # Translate legacy ModelOpt block_configs into the new per_layer_config
+        # schema before any downstream consumer reads the config.
+        convert_block_configs_to_per_layer_config(hf_config)
+
         # For VL models per_layer_config lives on text_config, not hf_config.
         text_config = hf_config.get_text_config()
 
