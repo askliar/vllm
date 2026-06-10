@@ -31,7 +31,6 @@ FLASHINFER_BF16_GEMM_BACKENDS = (
     "cublaslt",
     "tinygemm",
 )
-FLASHINFER_BF16_GEMM_BACKENDS_WITHOUT_BIAS = ("cutlass", "cublaslt")
 FLASHINFER_BF16_GEMM_BACKENDS_REQUIRING_NINJA = ("cutlass", "tinygemm")
 
 # This is the storage path for the cubins, it can be replaced
@@ -295,16 +294,6 @@ def get_flashinfer_bf16_supported_backends(
             continue
 
     return tuple(supported_backends)
-
-
-def is_flashinfer_bf16_backend_supported(
-    backend: str,
-    compute_capability: int | None = None,
-) -> bool:
-    """Return whether a FlashInfer BF16 GEMM backend is supported."""
-    if backend == "auto":
-        return bool(get_flashinfer_bf16_supported_backends(compute_capability))
-    return backend in get_flashinfer_bf16_supported_backends(compute_capability)
 
 
 @functools.cache
@@ -896,6 +885,7 @@ def flashinfer_scaled_fp4_mm(
         use_nvfp4=use_nvfp4,
     )
 
+
 def flashinfer_scaled_fp4_mm_out(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1092,7 +1082,6 @@ def is_flashinfer_cudnn_fp8_prefill_attn_supported() -> bool:
 
 __all__ = [
     "FLASHINFER_BF16_GEMM_BACKENDS",
-    "FLASHINFER_BF16_GEMM_BACKENDS_WITHOUT_BIAS",
     "FLASHINFER_BF16_GEMM_BACKENDS_REQUIRING_NINJA",
     "has_flashinfer",
     "flashinfer_trtllm_fp8_block_scale_moe",
@@ -1123,7 +1112,6 @@ __all__ = [
     "use_trtllm_attention",
     "has_flashinfer_bf16_gemm",
     "get_flashinfer_bf16_supported_backends",
-    "is_flashinfer_bf16_backend_supported",
     "flashinfer_bf16_mm",
     "flashinfer_mxfp4_quantize",
     "flashinfer_scaled_fp4_mm",

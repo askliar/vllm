@@ -46,7 +46,7 @@ def test_cuda_flashinfer_bf16_gemm_fake_preserves_leading_dims(x_shape, n):
     k = x_shape[-1]
     x = torch.empty(x_shape, dtype=torch.bfloat16, device="meta")
     weight = torch.empty(n, k, dtype=torch.bfloat16, device="meta")
-    out = cuda_flashinfer_bf16_gemm_fake(x, weight, None, "auto")
+    out = cuda_flashinfer_bf16_gemm_fake(x, weight, None)
     assert out.shape == (*x_shape[:-1], n)
     assert out.dtype == torch.bfloat16
 

@@ -2156,10 +2156,10 @@ class EngineArgs:
             kernel_config.enable_flashinfer_autotune = self.enable_flashinfer_autotune
         if self.moe_backend != "auto":
             kernel_config.moe_backend = self.moe_backend
+        if self.bf16_linear_backend != "flashinfer":
+            kernel_config.bf16_linear_backend = self.bf16_linear_backend
         if self.linear_backend != "auto":
             kernel_config.linear_backend = self.linear_backend
-        if self.bf16_linear_backend != "torch":
-            kernel_config.bf16_linear_backend = self.bf16_linear_backend
 
         # Transfer top-level ir_op_priority into KernelConfig.ir_op_priority
         for op_name, op_priority in asdict(self.ir_op_priority).items():
