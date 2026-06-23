@@ -13,7 +13,7 @@ from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.flashinfer import (
     flashinfer_bf16_mm,
-    get_flashinfer_bf16_supported_backends,
+    is_flashinfer_bf16_gemm_supported,
 )
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -109,10 +109,9 @@ def cuda_flashinfer_bf16_gemm_impl(
 ) -> torch.Tensor:
     """Route an unquantized BF16 matmul through FlashInfer's ``mm_bf16``.
 
-    Dispatches with FlashInfer's ``backend="auto"`` and lets the FlashInfer
-    autotuner pick the kernel. Falls back to ``torch.nn.functional.linear``
-    when the inputs do not satisfy FlashInfer's contract (dtype, device,
-    last-dim contiguity, non-empty M, and a well-formed bias).
+    Falls back to ``torch.nn.functional.linear`` when the inputs do not
+    satisfy FlashInfer's contract (dtype, device, last-dim contiguity,
+    non-empty M, and valid bias metadata when bias is supplied).
     """
     if x.dim() == 0 or weight.dim() != 2:
         return torch.nn.functional.linear(x, weight, bias)
@@ -393,18 +392,15 @@ def cpu_unquantized_gemm(
 
 
 def _get_bf16_linear_backend() -> str:
-    """Resolve the unquantized BF16 linear backend from the active VllmConfig.
+    """Read ``bf16_linear_backend`` from the active VllmConfig.
 
-    Returns ``"flashinfer"`` only when the configured backend is ``"flashinfer"``,
-    FlashInfer autotuning is enabled, and the device has at least one supported
-    FlashInfer BF16 GEMM backend. Otherwise returns ``"torch"`` (also the default
-    when there is no active VllmConfig, e.g. during unit tests).
+    Returns ``"torch"`` (the default) when there is no active VllmConfig,
+    e.g. during unit tests that don't set up an engine.
     """
     try:
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
-        supported_backends = get_flashinfer_bf16_supported_backends()
 
     except (AssertionError, AttributeError, ImportError):
         return "torch"
@@ -412,28 +408,17 @@ def _get_bf16_linear_backend() -> str:
     if vllm_config is None or vllm_config.kernel_config is None:
         return "torch"
 
-    kernel_config = vllm_config.kernel_config
-    if kernel_config.bf16_linear_backend == "torch":
+    backend = vllm_config.kernel_config.bf16_linear_backend
+    if backend == "torch":
         return "torch"
 
-    # "flashinfer" dispatches to FlashInfer mm_bf16 with backend="auto" and relies
-    # on the FlashInfer autotuner to select a kernel, so it only makes sense when
-    # FlashInfer autotuning is enabled. Fall back to torch otherwise (e.g. at -O0).
-    if not kernel_config.enable_flashinfer_autotune:
+    if not is_flashinfer_bf16_gemm_supported():
         logger.warning_once(
-            "bf16_linear_backend='flashinfer' requires FlashInfer autotuning, but "
-            "it is disabled; falling back to torch for unquantized BF16 linear layers."
+            "FlashInfer mm_bf16 is unavailable or unsupported; falling back to torch."
         )
         return "torch"
 
-    if not supported_backends:
-        logger.warning_once(
-            "bf16_linear_backend='flashinfer' was requested but no FlashInfer BF16 "
-            "GEMM backend is supported on this device; falling back to torch."
-        )
-        return "torch"
-
-    return "flashinfer"
+    return backend
 
 
 def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
@@ -442,9 +427,8 @@ def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
     elif current_platform.is_cpu():
         return cpu_unquantized_gemm
 
-    if _get_bf16_linear_backend() == "torch":
+    bf16_linear_backend = _get_bf16_linear_backend()
+    if bf16_linear_backend == "torch":
         return default_unquantized_gemm
-
-    # "flashinfer": route through FlashInfer mm_bf16 (backend="auto"); the
-    # FlashInfer autotuner selects the concrete kernel.
-    return cuda_flashinfer_bf16_gemm
+    else:
+        return cuda_flashinfer_bf16_gemm
