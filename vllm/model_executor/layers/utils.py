@@ -103,6 +103,34 @@ def default_unquantized_gemm(
     return torch.nn.functional.linear(x, weight, bias)
 
 
+# Plan/run dispatch for FlashInfer BF16 GEMMs: resolve the tuned kernel per
+# weight once (flashinfer.plan_mm_bf16), keep the per-call path to a bucket
+# lookup plus a prebound launch. Falls back to per-call mm_bf16 dispatch on
+# FlashInfer versions without the plan API.
+try:
+    from flashinfer.gemm import plan_mm_bf16 as _plan_mm_bf16
+except ImportError:
+    _plan_mm_bf16 = None
+
+_MM_BF16_PLANS: dict = {}
+
+
+def _mm_bf16_plan_max_m() -> int:
+    import os
+
+    env = os.environ.get("VLLM_BF16_PLAN_MAX_M")
+    if env:
+        return int(env)
+    try:
+        from vllm.config import get_current_vllm_config
+
+        return int(
+            get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        )
+    except Exception:
+        return 4096
+
+
 def cuda_flashinfer_bf16_gemm_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -142,7 +170,20 @@ def cuda_flashinfer_bf16_gemm_impl(
         return torch.nn.functional.linear(x, weight, bias)
 
     x_2d = x.reshape(M, K)
-    out_2d = flashinfer_bf16_mm_impl(x_2d, weight.t(), bias, pdl)
+    if _plan_mm_bf16 is not None:
+        key = (weight.data_ptr(), N, K, bias is None, pdl)
+        plan = _MM_BF16_PLANS.get(key)
+        if plan is None:
+            if torch.cuda.is_current_stream_capturing():
+                # Plans are built during the warmup dummy run; never tune
+                # inside CUDA graph capture.
+                return torch.nn.functional.linear(x, weight, bias)
+            plan = _MM_BF16_PLANS[key] = _plan_mm_bf16(
+                weight.t(), bias=bias, pdl=pdl, max_m=_mm_bf16_plan_max_m()
+            )
+        out_2d = plan.run(x_2d)
+    else:
+        out_2d = flashinfer_bf16_mm_impl(x_2d, weight.t(), bias, pdl)
     return out_2d.reshape(*x.shape[:-1], N)
 
 
