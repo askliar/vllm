@@ -194,6 +194,34 @@ def test_cache_prior_promotes_cached_expert_and_keeps_original_weight():
     assert router.metrics.top_j_violations == 0
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
+)
+def test_cache_prior_restores_loader_migrated_state_to_cpu():
+    logits = torch.tensor(
+        [
+            [2.0, 1.0, 0.0, -1.0],
+            [0.0, -1.0, 2.0, 1.0],
+        ],
+        device="cuda",
+    )
+    base = _StaticRouter(
+        torch.empty((2, 2), device="cuda"),
+        torch.empty((2, 2), dtype=torch.int32, device="cuda"),
+    )
+    router = _cache_prior_router(base, lambda_value=1.0)
+    router._last_use = router._last_use.cuda()
+
+    selected_weights, selected_ids = router._compute_routing(
+        torch.empty((2, 0), device="cuda"), logits, torch.int32
+    )
+
+    assert router._last_use.device.type == "cpu"
+    assert selected_weights.is_cuda
+    assert selected_ids.is_cuda
+    assert selected_ids[1].tolist() == [2, 0]
+
+
 def test_cache_prior_correction_bias_only_affects_expert_selection():
     logits = torch.zeros((1, 4))
     base = _StaticRouter(

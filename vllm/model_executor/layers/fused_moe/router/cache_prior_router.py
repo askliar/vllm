@@ -196,6 +196,14 @@ class CachePriorRouter(BaseRouter):
         self._range_total = 0.0
         self._range_count = 0
 
+    def _ensure_cpu_state(self) -> None:
+        # vLLM's model loader moves tensor-valued module attributes to CUDA,
+        # including this proof-only logical state. Cache-Prior reranking is
+        # intentionally evaluated on CPU, so keep its state colocated with the
+        # detached routing scores.
+        if self._last_use.device.type != "cpu":
+            self._last_use = self._last_use.cpu()
+
     def _scores(self, router_logits: torch.Tensor) -> torch.Tensor:
         if self.scoring_func == "softmax":
             return torch.softmax(router_logits, dim=-1)
@@ -339,6 +347,7 @@ class CachePriorRouter(BaseRouter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = router_logits.shape[0]
         metrics_before = self.metrics
+        self._ensure_cpu_state()
         if num_tokens > 1:
             self.reset_cache()
 
