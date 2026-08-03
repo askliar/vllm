@@ -113,6 +113,25 @@ def test_cache_prior_vectorized_lru_matches_scalar_reference():
     assert last_use.topk(5).indices.flip(0).tolist() == order
 
 
+def test_cache_prior_vectorized_lru_ignores_invalid_padding_ids():
+    expert_ids = torch.tensor([[0, -1], [1, 0], [-1, 2]])
+    priorities = torch.tensor([[0.9, 0.0], [0.8, 0.7], [0.0, 0.6]])
+
+    hits, last_use, clock = update_lru_state(
+        expert_ids,
+        priorities,
+        capacity=2,
+        num_experts=3,
+    )
+
+    torch.testing.assert_close(
+        hits,
+        torch.tensor([[False, False], [False, True], [False, False]]),
+    )
+    assert last_use.topk(2).indices.flip(0).tolist() == [0, 2]
+    assert clock == expert_ids.numel()
+
+
 def test_cache_prior_lambda_zero_preserves_base_router_outputs():
     weights = torch.tensor([[0.9, 0.1], [0.8, 0.7], [0.6, 0.5]])
     ids = torch.tensor([[0, 1], [0, 2], [2, 3]], dtype=torch.int32)
