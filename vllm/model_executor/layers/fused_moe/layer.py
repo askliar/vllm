@@ -357,6 +357,8 @@ def FusedMoE(
             topk_group=topk_group if use_grouped_topk else None,
             layer_name=layer_name,
             metrics_path=envs.VLLM_MOE_CACHE_PRIOR_METRICS_PATH,
+            trace_dir=envs.VLLM_MOE_CACHE_PRIOR_TRACE_DIR,
+            reset_path=envs.VLLM_MOE_CACHE_PRIOR_RESET_PATH,
         )
 
     if params_dtype is None:

@@ -133,6 +133,8 @@ class CachePriorRouter(BaseRouter):
         topk_group: int | None,
         layer_name: str = "",
         metrics_path: str = "",
+        trace_dir: str = "",
+        reset_path: str = "",
     ) -> None:
         super().__init__(
             top_k=base_router.top_k,
@@ -162,6 +164,14 @@ class CachePriorRouter(BaseRouter):
         self.topk_group = topk_group or 1
         self.layer_name = layer_name
         self.metrics_path = Path(metrics_path) if metrics_path else None
+        self.trace_dir = Path(trace_dir) if trace_dir else None
+        self.reset_path = Path(reset_path) if reset_path else None
+        self._range_reset_applied = False
+        layer_slug = "".join(
+            character if character.isalnum() else "_" for character in layer_name
+        )
+        self._trace_stem = f"{layer_slug or 'layer'}.pid{os.getpid()}"
+        self._trace_index = 0
         if self.global_num_experts % self.num_expert_group != 0:
             raise ValueError("num_experts must be divisible by num_expert_group")
 
@@ -200,6 +210,16 @@ class CachePriorRouter(BaseRouter):
     def reset_range_estimator(self) -> None:
         self._range_total = 0.0
         self._range_count = 0
+
+    def _maybe_reset_range_estimator(self) -> None:
+        if (
+            self._range_reset_applied
+            or self.reset_path is None
+            or not self.reset_path.exists()
+        ):
+            return
+        self.reset_range_estimator()
+        self._range_reset_applied = True
 
     def _ensure_cpu_state(self) -> None:
         # vLLM's model loader moves tensor-valued module attributes to CUDA,
@@ -301,7 +321,7 @@ class CachePriorRouter(BaseRouter):
         self,
         expert_ids: torch.Tensor,
         priorities: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         hits, self._last_use, self._clock = update_lru_state(
             expert_ids,
             priorities,
@@ -312,6 +332,50 @@ class CachePriorRouter(BaseRouter):
         )
         self._accesses += expert_ids.numel()
         self._hits += int(hits.sum().item())
+        return hits
+
+    def _write_prefill_trace(
+        self,
+        *,
+        original_ids: torch.Tensor,
+        selected_ids: torch.Tensor,
+        selected_weights: torch.Tensor,
+        hit_mask: torch.Tensor,
+        logit_range: torch.Tensor,
+        range_mean: torch.Tensor,
+        range_count_start: int,
+    ) -> None:
+        if self.trace_dir is None or original_ids.shape[0] <= 1:
+            return
+        fields = {
+            "original_ids.i16": original_ids.to(torch.int16),
+            "selected_ids.i16": selected_ids.to(torch.int16),
+            "selected_weights.f32": selected_weights.to(torch.float32),
+            "hit_mask.u8": hit_mask.to(torch.uint8),
+            "logit_range.f32": logit_range.to(torch.float32),
+            "range_mean.f32": range_mean.to(torch.float32),
+        }
+        self.trace_dir.mkdir(parents=True, exist_ok=True)
+        for suffix, tensor in fields.items():
+            path = self.trace_dir / f"{self._trace_stem}.{suffix}"
+            array = tensor.detach().cpu().contiguous().numpy()
+            with path.open("ab") as output:
+                output.write(array.tobytes())
+
+        record = {
+            "pid": os.getpid(),
+            "layer": self.layer_name,
+            "record": self._trace_index,
+            "tokens": original_ids.shape[0],
+            "top_k": original_ids.shape[1],
+            "num_experts": self.global_num_experts,
+            "range_count_start": range_count_start,
+            "range_count_end": self._range_count,
+        }
+        metadata_path = self.trace_dir / f"{self._trace_stem}.jsonl"
+        with metadata_path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(record, sort_keys=True) + "\n")
+        self._trace_index += 1
 
     def _write_prefill_metrics(
         self,
@@ -355,11 +419,13 @@ class CachePriorRouter(BaseRouter):
         self._ensure_cpu_state()
         if num_tokens > 1:
             self.reset_cache()
+        self._maybe_reset_range_estimator()
 
         logits_cpu = router_logits.detach().to(device="cpu", dtype=torch.float32)
         scores_cpu = self._scores(logits_cpu)
         selection_values = self._selection_values(scores_cpu)
         ranges = logits_cpu.amax(dim=-1) - logits_cpu.amin(dim=-1)
+        range_count_start = self._range_count
         range_means = self._running_means(ranges)
 
         if self.lambda_value == 0:
@@ -369,15 +435,26 @@ class CachePriorRouter(BaseRouter):
                 indices_type,
                 input_ids=input_ids,
             )
-            self._observe_fixed_trace(
-                topk_ids.detach().to(device="cpu", dtype=torch.long),
-                topk_weights.detach().to(device="cpu", dtype=torch.float32),
+            original_ids = topk_ids.detach().to(device="cpu", dtype=torch.long)
+            selected_weights = topk_weights.detach().to(
+                device="cpu", dtype=torch.float32
+            )
+            hit_mask = self._observe_fixed_trace(original_ids, selected_weights)
+            self._write_prefill_trace(
+                original_ids=original_ids,
+                selected_ids=original_ids,
+                selected_weights=selected_weights,
+                hit_mask=hit_mask,
+                logit_range=ranges,
+                range_mean=range_means,
+                range_count_start=range_count_start,
             )
             self._write_prefill_metrics(metrics_before, num_tokens)
             return topk_weights, topk_ids
 
         selected_ids_rows: list[torch.Tensor] = []
         selected_weights_rows: list[torch.Tensor] = []
+        hit_mask_rows: list[torch.Tensor] = []
         hit_count = 0
         changed_tokens = 0
         top_j_violations = 0
@@ -401,7 +478,8 @@ class CachePriorRouter(BaseRouter):
                 )
             selected_weights = selected_weights * self.routed_scaling_factor
 
-            hit_count += int(membership.gather(0, selected_ids).sum().item())
+            hit_mask = membership.gather(0, selected_ids)
+            hit_count += int(hit_mask.sum().item())
             changed_tokens += int(
                 not torch.equal(
                     selected_ids.sort().values,
@@ -416,20 +494,32 @@ class CachePriorRouter(BaseRouter):
             self._touch(selected_ids, selected_weights)
             selected_ids_rows.append(selected_ids)
             selected_weights_rows.append(selected_weights)
+            hit_mask_rows.append(hit_mask)
 
         self._accesses += num_tokens * self.top_k
         self._hits += hit_count
         self._changed_tokens += changed_tokens
         self._top_j_violations += top_j_violations
+        selected_ids_tensor = torch.stack(selected_ids_rows)
+        selected_weights_tensor = torch.stack(selected_weights_rows)
+        self._write_prefill_trace(
+            original_ids=original_ids,
+            selected_ids=selected_ids_tensor,
+            selected_weights=selected_weights_tensor,
+            hit_mask=torch.stack(hit_mask_rows),
+            logit_range=ranges,
+            range_mean=range_means,
+            range_count_start=range_count_start,
+        )
         self._write_prefill_metrics(metrics_before, num_tokens)
 
         output_ids_dtype = torch.int32 if indices_type is None else indices_type
         return (
-            torch.stack(selected_weights_rows).to(
+            selected_weights_tensor.to(
                 device=router_logits.device,
                 dtype=torch.float32,
             ),
-            torch.stack(selected_ids_rows).to(
+            selected_ids_tensor.to(
                 device=router_logits.device,
                 dtype=output_ids_dtype,
             ),
