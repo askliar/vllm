@@ -142,6 +142,15 @@ def backend_to_kernel_cls(
         raise ValueError(f"Unknown NvFP4 MoE backend: {backend.value}")
 
 
+def cache_prior_compatible_kernel_classes(
+    backend: NvFp4MoeBackend,
+) -> list[type[mk.FusedMoEExperts]]:
+    classes = backend_to_kernel_cls(backend)
+    if not envs.VLLM_MOE_CACHE_PRIOR_ENABLE:
+        return classes
+    return [cls for cls in classes if not issubclass(cls, mk.FusedMoEExpertsMonolithic)]
+
+
 def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
     """Map user's MoEBackend to NvFp4MoeBackend."""
     mapping = {
@@ -231,7 +240,9 @@ def select_nvfp4_moe_backend(
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[NvFp4MoeBackend, type[mk.FusedMoEExperts]]:
-        for k_cls in backend_to_kernel_cls(backend):
+        kernel_classes = cache_prior_compatible_kernel_classes(backend)
+        reason: str | None = "Cache-Prior routing requires a modular expert kernel"
+        for k_cls in kernel_classes:
             supported, reason = k_cls.is_supported_config(
                 k_cls, config, weight_key, activation_key, activation_format
             )
@@ -273,7 +284,7 @@ def select_nvfp4_moe_backend(
 
     # Select kernels in order of backend.
     for backend in AVAILABLE_BACKENDS:
-        for k_cls in backend_to_kernel_cls(backend):
+        for k_cls in cache_prior_compatible_kernel_classes(backend):
             supported, reason = k_cls.is_supported_config(
                 k_cls,
                 config,

@@ -25,6 +25,10 @@ from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.model_executor.layers.fused_moe.router.cache_prior_router import (
+    CachePriorRouter,
+)
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
@@ -320,6 +324,39 @@ def FusedMoE(
             zero_expert_type=zero_expert_type,
             num_logical_experts=logical_num_experts,
             hash_indices_table=hash_indices_table,
+        )
+
+    if envs.VLLM_MOE_CACHE_PRIOR_ENABLE:
+        if vllm_config.model_config is not None and not (
+            vllm_config.model_config.enforce_eager
+        ):
+            raise ValueError("Cache-Prior routing requires --enforce-eager")
+        if custom_routing_function is not None:
+            raise ValueError("Cache-Prior does not support a custom MoE router")
+        if zero_expert_type is not None or hash_indices_table is not None:
+            raise ValueError("Cache-Prior does not support zero or hash experts")
+        if eplb_state is not None or num_fused_shared_experts:
+            raise ValueError(
+                "Cache-Prior does not support EPLB or fused shared experts"
+            )
+        if envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY:
+            raise ValueError("Cache-Prior cannot be combined with routing simulation")
+        assert isinstance(router, BaseRouter)
+        router = CachePriorRouter(
+            router,
+            capacity=envs.VLLM_MOE_CACHE_PRIOR_CAPACITY,
+            lambda_value=envs.VLLM_MOE_CACHE_PRIOR_LAMBDA,
+            top_j=envs.VLLM_MOE_CACHE_PRIOR_TOP_J,
+            scoring_func=scoring_func,
+            renormalize=renormalize,
+            routed_scaling_factor=(
+                routed_scaling_factor if not apply_routed_scale_to_output else 1.0
+            ),
+            e_score_correction_bias=e_score_correction_bias,
+            num_expert_group=num_expert_group if use_grouped_topk else None,
+            topk_group=topk_group if use_grouped_topk else None,
+            layer_name=layer_name,
+            metrics_path=envs.VLLM_MOE_CACHE_PRIOR_METRICS_PATH,
         )
 
     if params_dtype is None:

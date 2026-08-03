@@ -5,6 +5,8 @@
 Run `pytest tests/kernels/moe/test_grouped_topk.py`.
 """
 
+import json
+
 import pytest
 import torch
 
@@ -15,12 +17,201 @@ from vllm.config import (
     get_cached_compilation_config,
     set_current_vllm_config,
 )
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.model_executor.layers.fused_moe.router.cache_prior_router import (
+    CachePriorRouter,
+    update_lru_state,
+)
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     GroupedTopk,
     fused_grouped_topk,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
+
+
+class _StaticRouter(BaseRouter):
+    def __init__(self, weights: torch.Tensor, ids: torch.Tensor) -> None:
+        super().__init__(top_k=ids.shape[-1], global_num_experts=4)
+        self.weights = weights
+        self.ids = ids
+
+    @property
+    def routing_method_type(self) -> RoutingMethodType:
+        return RoutingMethodType.Sigmoid
+
+    def _compute_routing(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        indices_type: torch.dtype | None,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output_ids = self.ids
+        if indices_type is not None:
+            output_ids = output_ids.to(indices_type)
+        return self.weights, output_ids
+
+
+def _cache_prior_router(
+    base_router: BaseRouter,
+    *,
+    lambda_value: float,
+    capacity: int = 2,
+    top_j: int = 1,
+    metrics_path: str = "",
+    correction_bias: torch.Tensor | None = None,
+) -> CachePriorRouter:
+    return CachePriorRouter(
+        base_router,
+        capacity=capacity,
+        lambda_value=lambda_value,
+        top_j=top_j,
+        scoring_func="sigmoid",
+        renormalize=False,
+        routed_scaling_factor=1.0,
+        e_score_correction_bias=correction_bias,
+        num_expert_group=1,
+        topk_group=1,
+        metrics_path=metrics_path,
+    )
+
+
+def test_cache_prior_vectorized_lru_matches_scalar_reference():
+    generator = torch.Generator().manual_seed(17)
+    priorities = torch.rand((31, 3), generator=generator)
+    expert_ids = torch.stack(
+        [torch.randperm(8, generator=generator)[:3] for _ in range(31)]
+    )
+
+    hits, last_use, clock = update_lru_state(
+        expert_ids,
+        priorities,
+        capacity=5,
+        num_experts=8,
+    )
+
+    order: list[int] = []
+    expected_hits: list[list[bool]] = []
+    for ids, weights in zip(expert_ids, priorities, strict=True):
+        expected_hits.append([int(expert_id) in order for expert_id in ids])
+        touches = sorted(
+            zip(ids.tolist(), weights.tolist(), strict=True),
+            key=lambda item: (-item[1], item[0]),
+        )
+        for expert_id, _ in touches:
+            if expert_id in order:
+                order.remove(expert_id)
+            elif len(order) == 5:
+                order.pop(0)
+            order.append(expert_id)
+
+    torch.testing.assert_close(hits, torch.tensor(expected_hits))
+    assert clock == expert_ids.numel()
+    assert last_use.topk(5).indices.flip(0).tolist() == order
+
+
+def test_cache_prior_lambda_zero_preserves_base_router_outputs():
+    weights = torch.tensor([[0.9, 0.1], [0.8, 0.7], [0.6, 0.5]])
+    ids = torch.tensor([[0, 1], [0, 2], [2, 3]], dtype=torch.int32)
+    router = _cache_prior_router(_StaticRouter(weights, ids), lambda_value=0.0)
+
+    actual_weights, actual_ids = router._compute_routing(
+        torch.empty((3, 0)),
+        torch.randn((3, 4)),
+        torch.int32,
+    )
+
+    torch.testing.assert_close(actual_weights, weights)
+    torch.testing.assert_close(actual_ids, ids)
+    assert router.metrics.accesses == 6
+    assert router.metrics.hits == 2
+    assert router.metrics.misses == 4
+
+
+def test_cache_prior_resets_logical_cache_for_each_prefill():
+    weights = torch.tensor([[0.9, 0.1], [0.9, 0.1]])
+    ids = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
+    router = _cache_prior_router(_StaticRouter(weights, ids), lambda_value=0.0)
+
+    for _ in range(2):
+        router._compute_routing(
+            torch.empty((2, 0)),
+            torch.randn((2, 4)),
+            torch.int32,
+        )
+
+    assert router.metrics.accesses == 8
+    assert router.metrics.hits == 4
+
+
+def test_cache_prior_writes_prefill_metrics(tmp_path):
+    weights = torch.tensor([[0.9, 0.1], [0.9, 0.1]])
+    ids = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
+    metrics_path = tmp_path / "metrics.jsonl"
+    router = _cache_prior_router(
+        _StaticRouter(weights, ids),
+        lambda_value=0.0,
+        metrics_path=str(metrics_path),
+    )
+
+    router._compute_routing(
+        torch.empty((2, 0)),
+        torch.randn((2, 4)),
+        torch.int32,
+    )
+
+    record = json.loads(metrics_path.read_text())
+    assert record["accesses"] == 4
+    assert record["hits"] == 2
+    assert record["misses"] == 2
+
+
+def test_cache_prior_promotes_cached_expert_and_keeps_original_weight():
+    logits = torch.tensor(
+        [
+            [2.0, 1.0, 0.0, -1.0],
+            [0.0, -1.0, 2.0, 1.0],
+        ]
+    )
+    base = _StaticRouter(
+        torch.empty((2, 2)),
+        torch.empty((2, 2), dtype=torch.int32),
+    )
+    router = _cache_prior_router(base, lambda_value=1.0)
+
+    selected_weights, selected_ids = router._compute_routing(
+        torch.empty((2, 0)), logits, torch.int32
+    )
+
+    assert selected_ids[1].tolist() == [2, 0]
+    expected_scores = logits.sigmoid()[1].gather(0, selected_ids[1].long())
+    torch.testing.assert_close(selected_weights[1], expected_scores)
+    assert router.metrics.hits == 1
+    assert router.metrics.changed_tokens == 1
+    assert router.metrics.top_j_violations == 0
+
+
+def test_cache_prior_correction_bias_only_affects_expert_selection():
+    logits = torch.zeros((1, 4))
+    base = _StaticRouter(
+        torch.empty((1, 2)),
+        torch.empty((1, 2), dtype=torch.int32),
+    )
+    router = _cache_prior_router(
+        base,
+        lambda_value=1.0,
+        correction_bias=torch.tensor([2.0, 1.0, 0.0, -1.0]),
+    )
+
+    selected_weights, selected_ids = router._compute_routing(
+        torch.empty((1, 0)), logits, torch.int32
+    )
+
+    assert selected_ids.tolist() == [[0, 1]]
+    torch.testing.assert_close(selected_weights, torch.full((1, 2), 0.5))
 
 
 def _run_single_group_topk(
