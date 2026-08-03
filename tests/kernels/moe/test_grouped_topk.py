@@ -62,6 +62,8 @@ def _cache_prior_router(
     capacity: int = 2,
     top_j: int = 1,
     metrics_path: str = "",
+    trace_dir: str = "",
+    reset_path: str = "",
     correction_bias: torch.Tensor | None = None,
     scoring_func: str = "sigmoid",
 ) -> CachePriorRouter:
@@ -77,6 +79,8 @@ def _cache_prior_router(
         num_expert_group=1,
         topk_group=1,
         metrics_path=metrics_path,
+        trace_dir=trace_dir,
+        reset_path=reset_path,
     )
 
 
@@ -187,6 +191,72 @@ def test_cache_prior_writes_prefill_metrics(tmp_path):
     assert record["accesses"] == 4
     assert record["hits"] == 2
     assert record["misses"] == 2
+
+
+@pytest.mark.parametrize("lambda_value", [0.0, 1.0])
+def test_cache_prior_writes_replayable_prefill_trace(tmp_path, lambda_value):
+    logits = torch.tensor([[2.0, 1.0, 0.0, -1.0], [0.0, -1.0, 2.0, 1.0]])
+    weights = logits.sigmoid().topk(2, dim=-1).values
+    ids = logits.topk(2, dim=-1).indices.to(torch.int32)
+    router = _cache_prior_router(
+        _StaticRouter(weights, ids),
+        lambda_value=lambda_value,
+        trace_dir=str(tmp_path),
+    )
+
+    selected_weights, selected_ids = router._compute_routing(
+        torch.empty((2, 0)), logits, torch.int32
+    )
+
+    metadata_path = next(tmp_path.glob("*.jsonl"))
+    record = json.loads(metadata_path.read_text())
+    assert record["tokens"] == 2
+    assert record["top_k"] == 2
+    assert record["range_count_start"] == 0
+    assert record["range_count_end"] == 2
+
+    stem = metadata_path.with_suffix("")
+    original = torch.from_file(
+        str(stem) + ".original_ids.i16", dtype=torch.int16, size=4
+    ).view(2, 2)
+    selected = torch.from_file(
+        str(stem) + ".selected_ids.i16", dtype=torch.int16, size=4
+    ).view(2, 2)
+    saved_weights = torch.from_file(
+        str(stem) + ".selected_weights.f32", dtype=torch.float32, size=4
+    ).view(2, 2)
+    logit_range = torch.from_file(
+        str(stem) + ".logit_range.f32", dtype=torch.float32, size=2
+    )
+    range_mean = torch.from_file(
+        str(stem) + ".range_mean.f32", dtype=torch.float32, size=2
+    )
+
+    torch.testing.assert_close(original, ids.to(torch.int16))
+    torch.testing.assert_close(selected, selected_ids.to(torch.int16))
+    torch.testing.assert_close(saved_weights, selected_weights)
+    torch.testing.assert_close(logit_range, torch.tensor([3.0, 3.0]))
+    torch.testing.assert_close(range_mean, torch.tensor([3.0, 3.0]))
+
+
+def test_cache_prior_resets_profiled_range_state_when_signaled(tmp_path):
+    logits = torch.tensor([[2.0, 1.0, 0.0, -1.0], [0.0, -1.0, 2.0, 1.0]])
+    weights = logits.sigmoid().topk(2, dim=-1).values
+    ids = logits.topk(2, dim=-1).indices.to(torch.int32)
+    reset_path = tmp_path / "range-reset"
+    router = _cache_prior_router(
+        _StaticRouter(weights, ids),
+        lambda_value=0.0,
+        reset_path=str(reset_path),
+    )
+    router._compute_routing(torch.empty((2, 0)), logits, torch.int32)
+    assert router._range_count == 2
+
+    reset_path.touch()
+    router._compute_routing(torch.empty((2, 0)), logits, torch.int32)
+
+    assert router._range_count == 2
+    assert router._range_reset_applied
 
 
 def test_cache_prior_promotes_cached_expert_and_keeps_original_weight():

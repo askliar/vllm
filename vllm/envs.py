@@ -207,6 +207,8 @@ if TYPE_CHECKING:
     VLLM_MOE_CACHE_PRIOR_LAMBDA: float = 0.0
     VLLM_MOE_CACHE_PRIOR_TOP_J: int = 1
     VLLM_MOE_CACHE_PRIOR_METRICS_PATH: str = ""
+    VLLM_MOE_CACHE_PRIOR_TRACE_DIR: str = ""
+    VLLM_MOE_CACHE_PRIOR_RESET_PATH: str = ""
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
@@ -1589,6 +1591,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MOE_CACHE_PRIOR_METRICS_PATH": lambda: os.getenv(
         "VLLM_MOE_CACHE_PRIOR_METRICS_PATH", ""
+    ),
+    "VLLM_MOE_CACHE_PRIOR_TRACE_DIR": lambda: os.getenv(
+        "VLLM_MOE_CACHE_PRIOR_TRACE_DIR", ""
+    ),
+    "VLLM_MOE_CACHE_PRIOR_RESET_PATH": lambda: os.getenv(
+        "VLLM_MOE_CACHE_PRIOR_RESET_PATH", ""
     ),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(
