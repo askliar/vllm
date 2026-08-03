@@ -72,6 +72,8 @@ def update_lru_state(
         stable=True,
     )
     ordered_ids = ids_by_id.gather(-1, priority_order).to(torch.long)
+    valid_ordered_ids = (ordered_ids >= 0) & (ordered_ids < num_experts)
+    scatter_ids = torch.where(valid_ordered_ids, ordered_ids, num_experts)
     timestamps = torch.arange(
         clock,
         clock + tokens * top_k,
@@ -80,12 +82,13 @@ def update_lru_state(
     ).view(tokens, top_k)
 
     events = torch.full(
-        (tokens, num_experts),
+        (tokens, num_experts + 1),
         -1,
         dtype=torch.int64,
         device=expert_ids.device,
     )
-    events.scatter_(1, ordered_ids, timestamps)
+    events.scatter_(1, scatter_ids, timestamps)
+    events = events[:, :num_experts]
     last_use_inclusive = torch.maximum(
         torch.cummax(events, dim=0).values,
         last_use.unsqueeze(0),
@@ -102,7 +105,9 @@ def update_lru_state(
     )
     membership = torch.zeros_like(last_use_before, dtype=torch.bool)
     membership.scatter_(1, resident_ids, resident_values >= 0)
-    hits = membership.gather(1, expert_ids.to(torch.long))
+    valid_expert_ids = (expert_ids >= 0) & (expert_ids < num_experts)
+    gather_ids = expert_ids.to(torch.long).clamp(0, num_experts - 1)
+    hits = membership.gather(1, gather_ids) & valid_expert_ids
     return hits, last_use_inclusive[-1], clock + tokens * top_k
 
 
