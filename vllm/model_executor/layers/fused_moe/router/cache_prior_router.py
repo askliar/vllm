@@ -359,7 +359,7 @@ class CachePriorRouter(BaseRouter):
         logits_cpu = router_logits.detach().to(device="cpu", dtype=torch.float32)
         scores_cpu = self._scores(logits_cpu)
         selection_values = self._selection_values(scores_cpu)
-        ranges = selection_values.amax(dim=-1) - selection_values.amin(dim=-1)
+        ranges = logits_cpu.amax(dim=-1) - logits_cpu.amin(dim=-1)
         range_means = self._running_means(ranges)
 
         if self.lambda_value == 0:
@@ -388,10 +388,12 @@ class CachePriorRouter(BaseRouter):
             protected = membership.clone()
             if self.top_j:
                 protected[original_ids[row, : self.top_j]] = True
-            reranked_values = selection_values[row] + (
+            reranked_logits = logits_cpu[row] + (
                 self.lambda_value * range_means[row] * protected
             )
-            selected_ids = self._select_ids(reranked_values.unsqueeze(0))[0]
+            reranked_scores = self._scores(reranked_logits.unsqueeze(0))
+            reranked_values = self._selection_values(reranked_scores)
+            selected_ids = self._select_ids(reranked_values)[0]
             selected_weights = scores_cpu[row].gather(0, selected_ids)
             if self.renormalize:
                 selected_weights = selected_weights / selected_weights.sum().clamp_min(

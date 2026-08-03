@@ -63,13 +63,14 @@ def _cache_prior_router(
     top_j: int = 1,
     metrics_path: str = "",
     correction_bias: torch.Tensor | None = None,
+    scoring_func: str = "sigmoid",
 ) -> CachePriorRouter:
     return CachePriorRouter(
         base_router,
         capacity=capacity,
         lambda_value=lambda_value,
         top_j=top_j,
-        scoring_func="sigmoid",
+        scoring_func=scoring_func,
         renormalize=False,
         routed_scaling_factor=1.0,
         e_score_correction_bias=correction_bias,
@@ -211,6 +212,30 @@ def test_cache_prior_promotes_cached_expert_and_keeps_original_weight():
     assert router.metrics.hits == 1
     assert router.metrics.changed_tokens == 1
     assert router.metrics.top_j_violations == 0
+
+
+def test_cache_prior_bias_is_applied_to_raw_logits_before_softmax():
+    logits = torch.tensor(
+        [
+            [2.0, 1.0, 0.0, -1.0],
+            [0.0, -1.0, 10.0, 9.0],
+        ]
+    )
+    base = _StaticRouter(
+        torch.empty((2, 2)),
+        torch.empty((2, 2), dtype=torch.int32),
+    )
+    router = _cache_prior_router(
+        base,
+        lambda_value=0.5,
+        scoring_func="softmax",
+    )
+
+    _, selected_ids = router._compute_routing(torch.empty((2, 0)), logits, torch.int32)
+
+    # Adding 0.5 * the raw-logit range does not yet promote cached expert 0.
+    # Adding the same normalized-probability range would promote it here.
+    assert selected_ids[1].tolist() == [2, 3]
 
 
 @pytest.mark.skipif(
