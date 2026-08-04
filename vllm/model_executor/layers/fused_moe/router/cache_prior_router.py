@@ -111,6 +111,82 @@ def update_lru_state(
     return hits, last_use_inclusive[-1], clock + tokens * top_k
 
 
+def update_lru_state_batched(
+    expert_ids: torch.Tensor,
+    priorities: torch.Tensor,
+    *,
+    capacity: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Compute independent fixed-trace LRU states for a prompt batch."""
+    if expert_ids.ndim != 3:
+        raise ValueError("expert_ids must have shape [batch, tokens, top_k]")
+    if priorities.shape != expert_ids.shape:
+        raise ValueError("priorities must have the same shape as expert_ids")
+    if capacity <= 0 or capacity > num_experts:
+        raise ValueError("capacity must be in [1, num_experts]")
+
+    batch_size, tokens, top_k = expert_ids.shape
+    if tokens == 0:
+        return (
+            torch.zeros_like(expert_ids, dtype=torch.bool),
+            torch.full(
+                (batch_size, num_experts),
+                -1,
+                dtype=torch.int64,
+                device=expert_ids.device,
+            ),
+            0,
+        )
+
+    id_order = torch.argsort(expert_ids, dim=-1, stable=True)
+    ids_by_id = expert_ids.gather(-1, id_order)
+    priorities_by_id = priorities.gather(-1, id_order)
+    priority_order = torch.argsort(
+        priorities_by_id,
+        dim=-1,
+        descending=True,
+        stable=True,
+    )
+    ordered_ids = ids_by_id.gather(-1, priority_order).to(torch.long)
+    valid_ordered_ids = (ordered_ids >= 0) & (ordered_ids < num_experts)
+    scatter_ids = torch.where(valid_ordered_ids, ordered_ids, num_experts)
+    timestamps = torch.arange(
+        tokens * top_k,
+        dtype=torch.int64,
+        device=expert_ids.device,
+    ).view(1, tokens, top_k)
+
+    events = torch.full(
+        (batch_size, tokens, num_experts + 1),
+        -1,
+        dtype=torch.int64,
+        device=expert_ids.device,
+    )
+    events.scatter_(2, scatter_ids, timestamps.expand(batch_size, -1, -1))
+    events = events[:, :, :num_experts]
+    last_use_inclusive = torch.cummax(events, dim=1).values
+    initial = torch.full(
+        (batch_size, 1, num_experts),
+        -1,
+        dtype=torch.int64,
+        device=expert_ids.device,
+    )
+    last_use_before = torch.cat((initial, last_use_inclusive[:, :-1]), dim=1)
+
+    resident_values, resident_ids = torch.topk(
+        last_use_before,
+        k=capacity,
+        dim=-1,
+    )
+    membership = torch.zeros_like(last_use_before, dtype=torch.bool)
+    membership.scatter_(2, resident_ids, resident_values >= 0)
+    valid_expert_ids = (expert_ids >= 0) & (expert_ids < num_experts)
+    gather_ids = expert_ids.to(torch.long).clamp(0, num_experts - 1)
+    hits = membership.gather(2, gather_ids) & valid_expert_ids
+    return hits, last_use_inclusive[:, -1], tokens * top_k
+
+
 class CachePriorRouter(BaseRouter):
     """Proof-oriented Cache-Prior wrapper around an existing MoE router.
 
@@ -183,6 +259,8 @@ class CachePriorRouter(BaseRouter):
         self._hits = 0
         self._changed_tokens = 0
         self._top_j_violations = 0
+        self._evaluation_batch_size = 0
+        self._evaluation_sequence_length = 0
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -210,6 +288,16 @@ class CachePriorRouter(BaseRouter):
     def reset_range_estimator(self) -> None:
         self._range_total = 0.0
         self._range_count = 0
+
+    def set_evaluation_batch_layout(
+        self,
+        batch_size: int,
+        sequence_length: int,
+    ) -> None:
+        if batch_size <= 0 or sequence_length <= 1:
+            raise ValueError("evaluation batch dimensions must be positive")
+        self._evaluation_batch_size = batch_size
+        self._evaluation_sequence_length = sequence_length
 
     def _maybe_reset_range_estimator(self) -> None:
         if (
@@ -317,6 +405,41 @@ class CachePriorRouter(BaseRouter):
         self._last_use.scatter_(0, ordered_ids, timestamps)
         self._clock += self.top_k
 
+    def _batched_membership(self, last_use: torch.Tensor) -> torch.Tensor:
+        resident_values, resident_ids = torch.topk(
+            last_use,
+            k=self.capacity,
+            dim=-1,
+        )
+        membership = torch.zeros_like(last_use, dtype=torch.bool)
+        membership.scatter_(1, resident_ids, resident_values >= 0)
+        return membership
+
+    def _batched_touch(
+        self,
+        last_use: torch.Tensor,
+        expert_ids: torch.Tensor,
+        priorities: torch.Tensor,
+        clock: int,
+    ) -> int:
+        id_order = torch.argsort(expert_ids, dim=-1, stable=True)
+        ids_by_id = expert_ids.gather(-1, id_order)
+        priorities_by_id = priorities.gather(-1, id_order)
+        priority_order = torch.argsort(
+            priorities_by_id,
+            dim=-1,
+            descending=True,
+            stable=True,
+        )
+        ordered_ids = ids_by_id.gather(-1, priority_order).to(torch.long)
+        timestamps = torch.arange(
+            clock,
+            clock + self.top_k,
+            dtype=torch.int64,
+        ).expand(expert_ids.shape[0], -1)
+        last_use.scatter_(1, ordered_ids, timestamps)
+        return clock + self.top_k
+
     def _observe_fixed_trace(
         self,
         expert_ids: torch.Tensor,
@@ -344,6 +467,8 @@ class CachePriorRouter(BaseRouter):
         logit_range: torch.Tensor,
         range_mean: torch.Tensor,
         range_count_start: int,
+        sequences: int = 1,
+        tokens_per_sequence: int | None = None,
     ) -> None:
         if self.trace_dir is None or original_ids.shape[0] <= 1:
             return
@@ -371,6 +496,8 @@ class CachePriorRouter(BaseRouter):
             "num_experts": self.global_num_experts,
             "range_count_start": range_count_start,
             "range_count_end": self._range_count,
+            "sequences": sequences,
+            "tokens_per_sequence": tokens_per_sequence or original_ids.shape[0],
         }
         metadata_path = self.trace_dir / f"{self._trace_stem}.jsonl"
         with metadata_path.open("a", encoding="utf-8") as output:
@@ -381,6 +508,8 @@ class CachePriorRouter(BaseRouter):
         self,
         before: CachePriorMetrics,
         num_tokens: int,
+        sequences: int = 1,
+        tokens_per_sequence: int | None = None,
     ) -> None:
         if self.metrics_path is None or num_tokens <= 1:
             return
@@ -401,10 +530,202 @@ class CachePriorRouter(BaseRouter):
             "miss_rate": (accesses - hits) / accesses if accesses else 0.0,
             "changed_tokens": after.changed_tokens - before.changed_tokens,
             "top_j_violations": (after.top_j_violations - before.top_j_violations),
+            "sequences": sequences,
+            "tokens_per_sequence": tokens_per_sequence or num_tokens,
         }
         self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
         with self.metrics_path.open("a", encoding="utf-8") as output:
             output.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _write_evaluation_call_shape(self, num_tokens: int) -> None:
+        if self.metrics_path is None:
+            return
+        path = self.metrics_path.with_name(
+            f"{self.metrics_path.stem}-calls{self.metrics_path.suffix}"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "pid": os.getpid(),
+            "layer": self.layer_name,
+            "num_tokens": num_tokens,
+            "configured_batch_size": self._evaluation_batch_size,
+            "configured_sequence_length": self._evaluation_sequence_length,
+        }
+        with path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _compute_batched_prefill(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        indices_type: torch.dtype | None,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sequence_length = self._evaluation_sequence_length
+        num_tokens = router_logits.shape[0]
+        batch_size, remainder = divmod(num_tokens, sequence_length)
+        if not batch_size or remainder:
+            raise RuntimeError("Cache-Prior received an unexpected packed batch shape")
+
+        metrics_before = self.metrics
+        logits_cpu = router_logits.detach().to(device="cpu", dtype=torch.float32)
+        scores_cpu = self._scores(logits_cpu)
+        selection_values = self._selection_values(scores_cpu)
+        ranges = logits_cpu.amax(dim=-1) - logits_cpu.amin(dim=-1)
+        range_count_start = self._range_count
+        range_means = self._running_means(ranges)
+
+        batch_shape = (batch_size, sequence_length, self.top_k)
+        if self.lambda_value == 0:
+            topk_weights, topk_ids = self.base_router._compute_routing(
+                hidden_states,
+                router_logits,
+                indices_type,
+                input_ids=input_ids,
+            )
+            original_ids = topk_ids.detach().to(device="cpu", dtype=torch.long)
+            selected_weights = topk_weights.detach().to(
+                device="cpu", dtype=torch.float32
+            )
+            hit_mask, _, _ = update_lru_state_batched(
+                original_ids.view(batch_shape),
+                selected_weights.view(batch_shape),
+                capacity=self.capacity,
+                num_experts=self.global_num_experts,
+            )
+            self._accesses += original_ids.numel()
+            self._hits += int(hit_mask.sum().item())
+            self._write_prefill_trace(
+                original_ids=original_ids,
+                selected_ids=original_ids,
+                selected_weights=selected_weights,
+                hit_mask=hit_mask.view(num_tokens, self.top_k),
+                logit_range=ranges,
+                range_mean=range_means,
+                range_count_start=range_count_start,
+                sequences=batch_size,
+                tokens_per_sequence=sequence_length,
+            )
+            self._write_prefill_metrics(
+                metrics_before,
+                num_tokens,
+                sequences=batch_size,
+                tokens_per_sequence=sequence_length,
+            )
+            return topk_weights, topk_ids
+
+        logits_batch = logits_cpu.view(
+            batch_size, sequence_length, self.global_num_experts
+        )
+        scores_batch = scores_cpu.view(
+            batch_size, sequence_length, self.global_num_experts
+        )
+        range_means_batch = range_means.view(batch_size, sequence_length)
+        original_ids = self._select_ids(selection_values).view(batch_shape)
+        last_use = torch.full(
+            (batch_size, self.global_num_experts),
+            -1,
+            dtype=torch.int64,
+        )
+        clock = 0
+        selected_ids_steps: list[torch.Tensor] = []
+        selected_weights_steps: list[torch.Tensor] = []
+        hit_mask_steps: list[torch.Tensor] = []
+        hit_count = 0
+        changed_tokens = 0
+        top_j_violations = 0
+
+        for position in range(sequence_length):
+            membership = self._batched_membership(last_use)
+            protected = membership.clone()
+            if self.top_j:
+                protected.scatter_(
+                    1,
+                    original_ids[:, position, : self.top_j],
+                    True,
+                )
+            reranked_logits = logits_batch[:, position] + (
+                self.lambda_value * range_means_batch[:, position, None] * protected
+            )
+            reranked_scores = self._scores(reranked_logits)
+            reranked_values = self._selection_values(reranked_scores)
+            selected_ids = self._select_ids(reranked_values)
+            selected_weights = scores_batch[:, position].gather(1, selected_ids)
+            if self.renormalize:
+                selected_weights = selected_weights / selected_weights.sum(
+                    dim=-1, keepdim=True
+                ).clamp_min(torch.finfo(selected_weights.dtype).tiny)
+            selected_weights = selected_weights * self.routed_scaling_factor
+
+            hit_mask = membership.gather(1, selected_ids)
+            hit_count += int(hit_mask.sum().item())
+            changed_tokens += int(
+                (
+                    ~(
+                        selected_ids.sort(dim=-1).values
+                        == original_ids[:, position].sort(dim=-1).values
+                    ).all(dim=-1)
+                )
+                .sum()
+                .item()
+            )
+            if self.top_j:
+                retained = (
+                    (
+                        original_ids[:, position, : self.top_j, None]
+                        == selected_ids[:, None, :]
+                    )
+                    .any(dim=-1)
+                    .all(dim=-1)
+                )
+                top_j_violations += int((~retained).sum().item())
+            clock = self._batched_touch(
+                last_use,
+                selected_ids,
+                selected_weights,
+                clock,
+            )
+            selected_ids_steps.append(selected_ids)
+            selected_weights_steps.append(selected_weights)
+            hit_mask_steps.append(hit_mask)
+
+        selected_ids_tensor = torch.stack(selected_ids_steps, dim=1)
+        selected_weights_tensor = torch.stack(selected_weights_steps, dim=1)
+        hit_mask_tensor = torch.stack(hit_mask_steps, dim=1)
+        self._accesses += num_tokens * self.top_k
+        self._hits += hit_count
+        self._changed_tokens += changed_tokens
+        self._top_j_violations += top_j_violations
+        self._write_prefill_trace(
+            original_ids=original_ids.view(num_tokens, self.top_k),
+            selected_ids=selected_ids_tensor.view(num_tokens, self.top_k),
+            selected_weights=selected_weights_tensor.view(num_tokens, self.top_k),
+            hit_mask=hit_mask_tensor.view(num_tokens, self.top_k),
+            logit_range=ranges,
+            range_mean=range_means,
+            range_count_start=range_count_start,
+            sequences=batch_size,
+            tokens_per_sequence=sequence_length,
+        )
+        self._write_prefill_metrics(
+            metrics_before,
+            num_tokens,
+            sequences=batch_size,
+            tokens_per_sequence=sequence_length,
+        )
+
+        output_ids_dtype = torch.int32 if indices_type is None else indices_type
+        return (
+            selected_weights_tensor.view(num_tokens, self.top_k).to(
+                device=router_logits.device,
+                dtype=torch.float32,
+            ),
+            selected_ids_tensor.view(num_tokens, self.top_k).to(
+                device=router_logits.device,
+                dtype=output_ids_dtype,
+            ),
+        )
 
     def _compute_routing(
         self,
@@ -415,6 +736,29 @@ class CachePriorRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = router_logits.shape[0]
+        if self._evaluation_batch_size:
+            self._write_evaluation_call_shape(num_tokens)
+            # vLLM may split a queued prompt set into several scheduler steps
+            # according to available KV-cache concurrency. Every evaluation
+            # request has the same full sequence length, so a positive exact
+            # multiple is a packed prefill chunk. Each row gets an independent
+            # logical expert cache; the shorter generation call is excluded.
+            batch_size, remainder = divmod(num_tokens, self._evaluation_sequence_length)
+            if batch_size and remainder == 0:
+                return self._compute_batched_prefill(
+                    hidden_states,
+                    router_logits,
+                    indices_type,
+                    input_ids=input_ids,
+                )
+            # The one-token generation requested only to obtain prompt logprobs
+            # is outside the evaluated prefill. Keep it out of cache metrics.
+            return self.base_router._compute_routing(
+                hidden_states,
+                router_logits,
+                indices_type,
+                input_ids=input_ids,
+            )
         metrics_before = self.metrics
         self._ensure_cpu_state()
         if num_tokens > 1:
