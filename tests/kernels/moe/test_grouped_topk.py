@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.fused_moe.router.cache_prior_router import (
     CachePriorRouter,
     update_lru_state,
+    update_lru_state_batched,
 )
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     GroupedTopk,
@@ -135,6 +136,81 @@ def test_cache_prior_vectorized_lru_ignores_invalid_padding_ids():
     )
     assert last_use.topk(2).indices.flip(0).tolist() == [0, 2]
     assert clock == expert_ids.numel()
+
+
+def test_cache_prior_batched_lru_matches_independent_sequences():
+    generator = torch.Generator().manual_seed(29)
+    priorities = torch.rand((4, 17, 3), generator=generator)
+    expert_ids = torch.stack(
+        [
+            torch.stack([torch.randperm(8, generator=generator)[:3] for _ in range(17)])
+            for _ in range(4)
+        ]
+    )
+
+    hits, last_use, clock = update_lru_state_batched(
+        expert_ids,
+        priorities,
+        capacity=5,
+        num_experts=8,
+    )
+    expected = [
+        update_lru_state(
+            ids,
+            weights,
+            capacity=5,
+            num_experts=8,
+        )
+        for ids, weights in zip(expert_ids, priorities, strict=True)
+    ]
+
+    torch.testing.assert_close(hits, torch.stack([result[0] for result in expected]))
+    torch.testing.assert_close(
+        last_use, torch.stack([result[1] for result in expected])
+    )
+    assert clock == expected[0][2]
+
+
+def test_cache_prior_scheduler_chunk_matches_serial_windows():
+    logits = torch.tensor(
+        [
+            [
+                [2.0, 1.0, 0.0, -1.0],
+                [0.0, -1.0, 2.0, 1.0],
+                [1.0, 0.0, 2.0, -1.0],
+            ],
+            [
+                [-1.0, 2.0, 1.0, 0.0],
+                [2.0, 0.0, -1.0, 1.0],
+                [0.0, 2.0, 1.0, -1.0],
+            ],
+        ]
+    )
+    flat_logits = logits.view(-1, logits.shape[-1])
+    base = _StaticRouter(
+        torch.empty((flat_logits.shape[0], 2)),
+        torch.empty((flat_logits.shape[0], 2), dtype=torch.int32),
+    )
+    batched = _cache_prior_router(base, lambda_value=1.0)
+    # The evaluator queued five requests, but this scheduler step contains two
+    # complete requests. Cache-Prior must derive the current chunk size.
+    batched.set_evaluation_batch_layout(5, 3)
+
+    batched_weights, batched_ids = batched._compute_routing(
+        torch.empty((6, 0)), flat_logits, torch.int32
+    )
+
+    serial = _cache_prior_router(base, lambda_value=1.0)
+    serial_results = [
+        serial._compute_routing(torch.empty((3, 0)), window, torch.int32)
+        for window in logits
+    ]
+    serial_weights = torch.cat([result[0] for result in serial_results])
+    serial_ids = torch.cat([result[1] for result in serial_results])
+
+    torch.testing.assert_close(batched_weights, serial_weights)
+    torch.testing.assert_close(batched_ids, serial_ids)
+    assert batched.metrics == serial.metrics
 
 
 def test_cache_prior_lambda_zero_preserves_base_router_outputs():
