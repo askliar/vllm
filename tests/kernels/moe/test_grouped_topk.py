@@ -20,6 +20,7 @@ from vllm.config import (
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.fused_moe.router.cache_prior_router import (
+    CachePriorBatchMetadata,
     CachePriorRouter,
     update_lru_state,
     update_lru_state_batched,
@@ -33,8 +34,13 @@ from vllm.utils.torch_utils import set_random_seed
 
 
 class _StaticRouter(BaseRouter):
-    def __init__(self, weights: torch.Tensor, ids: torch.Tensor) -> None:
-        super().__init__(top_k=ids.shape[-1], global_num_experts=4)
+    def __init__(
+        self,
+        weights: torch.Tensor,
+        ids: torch.Tensor,
+        num_experts: int = 4,
+    ) -> None:
+        super().__init__(top_k=ids.shape[-1], global_num_experts=num_experts)
         self.weights = weights
         self.ids = ids
 
@@ -60,6 +66,8 @@ def _cache_prior_router(
     base_router: BaseRouter,
     *,
     lambda_value: float,
+    cache_bias_mode: str = "logit",
+    decode_only: bool = False,
     capacity: int = 2,
     top_j: int = 1,
     metrics_path: str = "",
@@ -67,22 +75,117 @@ def _cache_prior_router(
     reset_path: str = "",
     correction_bias: torch.Tensor | None = None,
     scoring_func: str = "sigmoid",
+    num_expert_group: int = 1,
+    topk_group: int = 1,
 ) -> CachePriorRouter:
     return CachePriorRouter(
         base_router,
         capacity=capacity,
         lambda_value=lambda_value,
+        cache_bias_mode=cache_bias_mode,
+        decode_only=decode_only,
         top_j=top_j,
         scoring_func=scoring_func,
         renormalize=False,
         routed_scaling_factor=1.0,
         e_score_correction_bias=correction_bias,
-        num_expert_group=1,
-        topk_group=1,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
         metrics_path=metrics_path,
         trace_dir=trace_dir,
         reset_path=reset_path,
     )
+
+
+def test_cache_prior_decode_only_keeps_prefill_fixed_and_request_local():
+    prefill_weights = torch.tensor([[0.7, 0.6], [0.7, 0.6], [0.9, 0.8], [0.9, 0.8]])
+    prefill_ids = torch.tensor([[2, 3], [2, 3], [0, 1], [0, 1]], dtype=torch.int32)
+    base = _StaticRouter(prefill_weights, prefill_ids)
+    router = _cache_prior_router(
+        base,
+        lambda_value=0.5,
+        cache_bias_mode="selection",
+        decode_only=True,
+    )
+    prefill_metadata = CachePriorBatchMetadata(
+        request_ids=("a", "b"),
+        num_scheduled_tokens=(2, 2),
+        num_computed_tokens=(0, 0),
+        num_prompt_tokens=(2, 2),
+    )
+    prefill_logits = torch.tensor(
+        [
+            [0.0, -1.0, 2.0, 1.0],
+            [0.0, -1.0, 2.0, 1.0],
+            [2.0, 1.0, 0.0, -1.0],
+            [2.0, 1.0, 0.0, -1.0],
+        ]
+    )
+
+    actual_weights, actual_ids = router._compute_decode_only_generation(
+        torch.empty((4, 0)),
+        prefill_logits,
+        torch.int32,
+        prefill_metadata,
+    )
+
+    torch.testing.assert_close(actual_weights, prefill_weights)
+    torch.testing.assert_close(actual_ids, prefill_ids)
+    assert router.metrics.accesses == 0
+
+    base.weights = torch.tensor([[0.9, 0.8], [0.9, 0.8]])
+    base.ids = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
+    decode_metadata = CachePriorBatchMetadata(
+        request_ids=("a", "b"),
+        num_scheduled_tokens=(1, 1),
+        num_computed_tokens=(2, 2),
+        num_prompt_tokens=(2, 2),
+    )
+    decode_logits = torch.tensor([[2.2, 1.4, 0.85, 0.4], [2.2, 1.4, 0.85, 0.4]])
+
+    _, selected_ids = router._compute_decode_only_generation(
+        torch.empty((2, 0)),
+        decode_logits,
+        torch.int32,
+        decode_metadata,
+    )
+
+    assert set(selected_ids[0].tolist()) == {0, 2}
+    assert set(selected_ids[1].tolist()) == {0, 1}
+    assert router.metrics.accesses == 4
+    assert router.metrics.hits == 3
+    assert router.metrics.changed_tokens == 1
+    assert router.metrics.top_j_violations == 0
+
+
+def test_cache_prior_decode_only_defers_bias_in_mixed_forward():
+    base_weights = torch.tensor([[0.9, 0.8], [0.7, 0.6]])
+    base_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    router = _cache_prior_router(
+        _StaticRouter(base_weights, base_ids),
+        lambda_value=100.0,
+        cache_bias_mode="selection",
+        decode_only=True,
+    )
+    router._request_last_use["decode"] = torch.tensor([0, -1, 1, -1])
+    router._request_clocks["decode"] = 2
+    metadata = CachePriorBatchMetadata(
+        request_ids=("decode", "prefill"),
+        num_scheduled_tokens=(1, 1),
+        num_computed_tokens=(2, 0),
+        num_prompt_tokens=(2, 1),
+    )
+
+    actual_weights, actual_ids = router._compute_decode_only_generation(
+        torch.empty((2, 0)),
+        torch.tensor([[2.0, 1.0, 0.0, -1.0], [0.0, -1.0, 2.0, 1.0]]),
+        torch.int32,
+        metadata,
+    )
+
+    torch.testing.assert_close(actual_weights, base_weights)
+    torch.testing.assert_close(actual_ids, base_ids)
+    assert router.metrics.changed_tokens == 0
 
 
 def test_cache_prior_vectorized_lru_matches_scalar_reference():
@@ -211,6 +314,89 @@ def test_cache_prior_scheduler_chunk_matches_serial_windows():
     torch.testing.assert_close(batched_weights, serial_weights)
     torch.testing.assert_close(batched_ids, serial_ids)
     assert batched.metrics == serial.metrics
+
+
+def test_cache_prior_top_j_group_is_not_masked():
+    logits = torch.tensor(
+        [
+            [-2.0, -3.0, 3.0, 2.5, -4.0, -5.0],
+            [3.0, 2.0, 2.9, 2.8, -4.0, -5.0],
+        ]
+    )
+    base = _StaticRouter(
+        torch.empty((2, 2)),
+        torch.empty((2, 2), dtype=torch.int32),
+        num_experts=6,
+    )
+    router = _cache_prior_router(
+        base,
+        lambda_value=1.0,
+        num_expert_group=3,
+        topk_group=1,
+    )
+
+    _, selected_ids = router._compute_routing(
+        torch.empty((2, 0)),
+        logits,
+        torch.int32,
+    )
+
+    assert 0 in selected_ids[1].tolist()
+    assert router.metrics.top_j_violations == 0
+
+
+def test_cache_prior_top_j_is_pinned_after_correction_bias():
+    base = _StaticRouter(
+        torch.empty((1, 2)),
+        torch.empty((1, 2), dtype=torch.int32),
+        num_experts=6,
+    )
+    router = _cache_prior_router(
+        base,
+        lambda_value=1.0,
+        correction_bias=torch.tensor([0.0, 0.0, 0.4, 0.3, 0.2, 0.1]),
+        num_expert_group=3,
+        topk_group=2,
+    )
+    selection_values = torch.tensor([[0.1, 0.2, 0.9, 0.8, 0.7, 0.6]])
+
+    selected_ids = router._select_ids(
+        selection_values,
+        protected_ids=torch.tensor([[0]]),
+    )
+
+    assert 0 in selected_ids[0].tolist()
+
+
+def test_cache_prior_selection_bias_preserves_top_j_after_correction_bias():
+    logits = torch.tensor(
+        [
+            [-5.0, 0.0, 0.0, -5.0],
+            [2.1972246, 0.0, 0.0, -5.0],
+        ]
+    )
+    base = _StaticRouter(
+        torch.empty((2, 2)),
+        torch.empty((2, 2), dtype=torch.int32),
+    )
+    correction_bias = torch.tensor([0.0, 0.39, 0.38, 0.0])
+    logit_router = _cache_prior_router(
+        base,
+        lambda_value=1.0,
+        correction_bias=correction_bias,
+    )
+    selection_router = _cache_prior_router(
+        base,
+        lambda_value=1.0,
+        cache_bias_mode="selection",
+        correction_bias=correction_bias,
+    )
+
+    logit_router._compute_routing(torch.empty((2, 0)), logits, torch.int32)
+    selection_router._compute_routing(torch.empty((2, 0)), logits, torch.int32)
+
+    assert logit_router.metrics.top_j_violations == 1
+    assert selection_router.metrics.top_j_violations == 0
 
 
 def test_cache_prior_lambda_zero_preserves_base_router_outputs():

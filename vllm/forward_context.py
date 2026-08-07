@@ -268,6 +268,7 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    additional_kwargs: dict[str, Any] | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -315,7 +316,7 @@ def set_forward_context(
     if cudagraph_runtime_mode != CUDAGraphMode.NONE and num_tokens is not None:
         batch_descriptor = batch_descriptor or BatchDescriptor(num_tokens=num_tokens)
 
-    additional_kwargs = current_platform.set_additional_forward_context(
+    platform_additional_kwargs = current_platform.set_additional_forward_context(
         attn_metadata=attn_metadata,
         vllm_config=vllm_config,
         dp_metadata=dp_metadata,
@@ -325,6 +326,14 @@ def set_forward_context(
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
     )
+    merged_additional_kwargs = dict(platform_additional_kwargs or {})
+    if additional_kwargs:
+        duplicate_keys = merged_additional_kwargs.keys() & additional_kwargs.keys()
+        if duplicate_keys:
+            raise ValueError(
+                f"duplicate forward-context keys: {sorted(duplicate_keys)}"
+            )
+        merged_additional_kwargs.update(additional_kwargs)
 
     forward_context = create_forward_context(
         attn_metadata,
@@ -334,7 +343,7 @@ def set_forward_context(
         batch_descriptor,
         ubatch_slices,
         slot_mapping,
-        additional_kwargs,
+        merged_additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
     )

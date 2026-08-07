@@ -64,6 +64,10 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_ma
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
+from vllm.model_executor.layers.fused_moe.router.cache_prior_router import (
+    CACHE_PRIOR_BATCH_METADATA_KEY,
+    CachePriorBatchMetadata,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -95,6 +99,7 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
@@ -561,6 +566,8 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self._cache_prior_kv_control_snapshot: dict[str, torch.Tensor] | None = None
+        self.cache_prior_kv_control_result: dict[str, object] | None = None
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -4246,6 +4253,29 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            cache_prior_forward_kwargs = None
+            if (
+                envs.VLLM_MOE_CACHE_PRIOR_ENABLE
+                and envs.VLLM_MOE_CACHE_PRIOR_DECODE_ONLY
+            ):
+                cache_prior_forward_kwargs = {
+                    CACHE_PRIOR_BATCH_METADATA_KEY: CachePriorBatchMetadata(
+                        request_ids=tuple(req_ids),
+                        num_scheduled_tokens=tuple(
+                            int(value) for value in num_scheduled_tokens_np
+                        ),
+                        num_computed_tokens=tuple(
+                            int(value)
+                            for value in self.input_batch.num_computed_tokens_cpu[
+                                :num_reqs
+                            ]
+                        ),
+                        num_prompt_tokens=tuple(
+                            int(value)
+                            for value in self.input_batch.num_prompt_tokens[:num_reqs]
+                        ),
+                    )
+                }
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
@@ -4440,6 +4470,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                additional_kwargs=cache_prior_forward_kwargs,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -4454,6 +4485,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        if envs.VLLM_MOE_CACHE_PRIOR_KV_CONTROL:
+            self._capture_cache_prior_logical_kv(cache_prior_forward_kwargs)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4533,6 +4567,71 @@ class GPUModelRunner(
             deferred_state_corrections_fn()
 
         return None
+
+    def _capture_cache_prior_logical_kv(
+        self,
+        forward_kwargs: dict[str, object] | None,
+    ) -> None:
+        """Compare logical request KV after two identical full-prefill calls."""
+        if forward_kwargs is None:
+            return
+        metadata = forward_kwargs.get(CACHE_PRIOR_BATCH_METADATA_KEY)
+        if not isinstance(metadata, CachePriorBatchMetadata):
+            return
+        if len(metadata.request_ids) != 1:
+            raise RuntimeError("KV control requires exactly one request")
+        if not (
+            metadata.num_computed_tokens == (0,)
+            and metadata.num_scheduled_tokens == metadata.num_prompt_tokens
+        ):
+            raise RuntimeError("KV control requires one unchunked full prefill")
+
+        layer_to_group = {
+            layer_name: group_id
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+            if layer_name not in self.runner_only_attn_layers
+        }
+        layer_names = sorted(layer_to_group, key=extract_layer_index)
+        if len(layer_names) != len(self.kv_caches):
+            raise RuntimeError(
+                "KV control could not align cache layers: "
+                f"names={len(layer_names)}, tensors={len(self.kv_caches)}"
+            )
+
+        logical_cache: dict[str, torch.Tensor] = {}
+        for layer_name, cache in zip(layer_names, self.kv_caches, strict=True):
+            block_table = self.input_batch.block_table[layer_to_group[layer_name]]
+            num_blocks = int(block_table.num_blocks_per_row[0])
+            block_ids = torch.as_tensor(
+                block_table.block_table.np[0, :num_blocks].copy(),
+                dtype=torch.long,
+                device=cache.device,
+            )
+            logical_cache[layer_name] = (
+                cache.index_select(0, block_ids).detach().cpu().clone()
+            )
+
+        if self._cache_prior_kv_control_snapshot is None:
+            self._cache_prior_kv_control_snapshot = logical_cache
+            self.cache_prior_kv_control_result = None
+            return
+
+        baseline = self._cache_prior_kv_control_snapshot
+        mismatched = [
+            layer_name
+            for layer_name in layer_names
+            if not torch.equal(baseline[layer_name], logical_cache[layer_name])
+        ]
+        self.cache_prior_kv_control_result = {
+            "equal": not mismatched,
+            "layers": len(layer_names),
+            "mismatched_layers": mismatched,
+            "bytes_compared": sum(
+                value.numel() * value.element_size() for value in logical_cache.values()
+            ),
+        }
+        self._cache_prior_kv_control_snapshot = None
 
     def _input_fits_in_drafter(
         self, common_attn_metadata: CommonAttentionMetadata | None
