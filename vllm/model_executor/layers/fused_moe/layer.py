@@ -348,6 +348,8 @@ def FusedMoEFactory(
             router,
             capacity=envs.VLLM_MOE_CACHE_PRIOR_CAPACITY,
             lambda_value=envs.VLLM_MOE_CACHE_PRIOR_LAMBDA,
+            cache_bias_mode=envs.VLLM_MOE_CACHE_PRIOR_BIAS_MODE,
+            decode_only=envs.VLLM_MOE_CACHE_PRIOR_DECODE_ONLY,
             top_j=envs.VLLM_MOE_CACHE_PRIOR_TOP_J,
             scoring_func=scoring_func,
             renormalize=renormalize,

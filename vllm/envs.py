@@ -205,6 +205,9 @@ if TYPE_CHECKING:
     VLLM_MOE_CACHE_PRIOR_ENABLE: bool = False
     VLLM_MOE_CACHE_PRIOR_CAPACITY: int = 32
     VLLM_MOE_CACHE_PRIOR_LAMBDA: float = 0.0
+    VLLM_MOE_CACHE_PRIOR_BIAS_MODE: Literal["logit", "selection"] = "logit"
+    VLLM_MOE_CACHE_PRIOR_DECODE_ONLY: bool = False
+    VLLM_MOE_CACHE_PRIOR_KV_CONTROL: bool = False
     VLLM_MOE_CACHE_PRIOR_TOP_J: int = 1
     VLLM_MOE_CACHE_PRIOR_METRICS_PATH: str = ""
     VLLM_MOE_CACHE_PRIOR_TRACE_DIR: str = ""
@@ -1585,6 +1588,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MOE_CACHE_PRIOR_LAMBDA": lambda: float(
         os.getenv("VLLM_MOE_CACHE_PRIOR_LAMBDA", "0.0")
+    ),
+    "VLLM_MOE_CACHE_PRIOR_BIAS_MODE": env_with_choices(
+        "VLLM_MOE_CACHE_PRIOR_BIAS_MODE",
+        "logit",
+        ["logit", "selection"],
+    ),
+    "VLLM_MOE_CACHE_PRIOR_DECODE_ONLY": lambda: bool(
+        int(os.getenv("VLLM_MOE_CACHE_PRIOR_DECODE_ONLY", "0"))
+    ),
+    "VLLM_MOE_CACHE_PRIOR_KV_CONTROL": lambda: bool(
+        int(os.getenv("VLLM_MOE_CACHE_PRIOR_KV_CONTROL", "0"))
     ),
     "VLLM_MOE_CACHE_PRIOR_TOP_J": lambda: int(
         os.getenv("VLLM_MOE_CACHE_PRIOR_TOP_J", "1")
