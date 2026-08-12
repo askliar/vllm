@@ -299,6 +299,23 @@ class CachePriorRouter(BaseRouter):
         self._top_j_violations = 0
         self._evaluation_batch_size = 0
         self._evaluation_sequence_length = 0
+        # A long-context request may execute thousands of one-token decode
+        # forwards.  Keep the default one-record behavior for existing users,
+        # while allowing large evaluations to coalesce count-preserving router
+        # metrics before appending to a shared Lustre file.
+        self._metrics_flush_every = max(
+            1, int(os.getenv("VLLM_MOE_CACHE_PRIOR_METRICS_FLUSH_EVERY", "1"))
+        )
+        self._pending_decode_metrics = {
+            "records": 0,
+            "requests": 0,
+            "prefill_tokens": 0,
+            "decode_tokens": 0,
+            "accesses": 0,
+            "hits": 0,
+            "changed_tokens": 0,
+            "top_j_violations": 0,
+        }
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -737,28 +754,42 @@ class CachePriorRouter(BaseRouter):
     ) -> None:
         if self.metrics_path is None or decode_tokens == 0:
             return
+        pending = self._pending_decode_metrics
+        pending["records"] += 1
+        pending["requests"] += request_count
+        pending["prefill_tokens"] += prefill_tokens
+        pending["decode_tokens"] += decode_tokens
+        pending["accesses"] += accesses
+        pending["hits"] += hits
+        pending["changed_tokens"] += changed_tokens
+        pending["top_j_violations"] += top_j_violations
+        if pending["records"] < self._metrics_flush_every:
+            return
         record = {
             "pid": os.getpid(),
             "layer": self.layer_name,
             "phase": "decode",
-            "requests": request_count,
-            "prefill_tokens": prefill_tokens,
-            "decode_tokens": decode_tokens,
+            "coalesced_records": pending["records"],
+            "requests": pending["requests"],
+            "prefill_tokens": pending["prefill_tokens"],
+            "decode_tokens": pending["decode_tokens"],
             "capacity": self.capacity,
             "lambda": self.lambda_value,
             "cache_bias_mode": self.cache_bias_mode,
             "top_j": self.top_j,
-            "accesses": accesses,
-            "hits": hits,
-            "misses": accesses - hits,
-            "hit_rate": hits / accesses if accesses else 0.0,
-            "miss_rate": (accesses - hits) / accesses if accesses else 0.0,
-            "changed_tokens": changed_tokens,
-            "top_j_violations": top_j_violations,
+            "accesses": pending["accesses"],
+            "hits": pending["hits"],
+            "misses": pending["accesses"] - pending["hits"],
+            "hit_rate": pending["hits"] / pending["accesses"] if pending["accesses"] else 0.0,
+            "miss_rate": (pending["accesses"] - pending["hits"]) / pending["accesses"] if pending["accesses"] else 0.0,
+            "changed_tokens": pending["changed_tokens"],
+            "top_j_violations": pending["top_j_violations"],
         }
         self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
         with self.metrics_path.open("a", encoding="utf-8") as output:
             output.write(json.dumps(record, sort_keys=True) + "\n")
+        for key in pending:
+            pending[key] = 0
 
     def _write_generation_trace(
         self,
