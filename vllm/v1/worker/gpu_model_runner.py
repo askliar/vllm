@@ -4362,10 +4362,7 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
             cache_prior_forward_kwargs = None
-            if (
-                envs.VLLM_MOE_CACHE_PRIOR_ENABLE
-                and envs.VLLM_MOE_CACHE_PRIOR_DECODE_ONLY
-            ):
+            if envs.VLLM_MOE_CACHE_PRIOR_DECODE_ONLY:
                 cache_prior_forward_kwargs = {
                     CACHE_PRIOR_BATCH_METADATA_KEY: CachePriorBatchMetadata(
                         request_ids=tuple(req_ids),
@@ -4381,6 +4378,14 @@ class GPUModelRunner(
                         num_prompt_tokens=tuple(
                             int(value)
                             for value in self.input_batch.num_prompt_tokens[:num_reqs]
+                        ),
+                        num_draft_tokens=tuple(
+                            len(
+                                scheduler_output.scheduled_spec_decode_tokens.get(
+                                    req_id, ()
+                                )
+                            )
+                            for req_id in req_ids
                         ),
                     )
                 }
