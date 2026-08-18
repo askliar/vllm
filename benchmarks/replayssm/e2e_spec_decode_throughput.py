@@ -24,6 +24,7 @@ Example (B300):
 import argparse
 import hashlib
 import json
+import statistics
 import subprocess
 import sys
 import time
@@ -49,11 +50,25 @@ def parse_args():
     )
     p.add_argument("--spec-method", default="mtp")
     p.add_argument(
+        "--synthetic-acceptance-length",
+        type=float,
+        default=None,
+        help="Use vLLM's synthetic rejection sampler at this fixed mean "
+        "acceptance length. Pass num_spec + 1 for an all-accepted workload.",
+    )
+    p.add_argument(
         "--replayssm-backend",
         choices=["flashinfer", "triton"],
         default="flashinfer",
         help="Mamba backend used by all modes. Use flashinfer for this branch "
         "and triton for the exact PR #49847 worktree.",
+    )
+    p.add_argument(
+        "--replayssm-pdl",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Benchmark-only PDL override for vLLM causal-conv1d and "
+        "FlashInfer ReplaySSM. 'auto' preserves production behavior.",
     )
     p.add_argument(
         "--buffer-len",
@@ -72,6 +87,12 @@ def parse_args():
         default=30.0,
         help="Sustained full-batch decode before timing, to ramp the "
         "GPU SM clock to its steady-state boost.",
+    )
+    p.add_argument(
+        "--measure-repeats",
+        type=int,
+        default=1,
+        help="Timed requests per loaded model; reported TPS uses the median.",
     )
     p.add_argument(
         "--enable-thinking",
@@ -125,7 +146,31 @@ def _sum_counter(metrics, name):
     )
 
 
+def _override_replayssm_pdl(enabled: bool) -> None:
+    """Override only the two modules in the conv1d -> ReplaySSM PDL chain."""
+    from vllm.model_executor.layers.mamba import mamba_mixer2
+    from vllm.model_executor.layers.mamba.ops import causal_conv1d
+
+    platform = causal_conv1d.current_platform
+    if enabled and not platform.is_arch_support_pdl():
+        raise RuntimeError("PDL was forced on for a GPU that does not support it")
+
+    class _PlatformOverride:
+        def __getattr__(self, name):
+            return getattr(platform, name)
+
+        def is_arch_support_pdl(self):
+            return enabled
+
+    override = _PlatformOverride()
+    causal_conv1d.current_platform = override
+    mamba_mixer2.current_platform = override
+
+
 def run_worker(args):
+    if args.replayssm_pdl != "auto":
+        _override_replayssm_pdl(args.replayssm_pdl == "on")
+
     import torch
 
     from vllm import LLM, SamplingParams
@@ -186,6 +231,11 @@ def run_worker(args):
             "method": args.spec_method,
             "num_speculative_tokens": args.num_spec,
         }
+        if args.synthetic_acceptance_length is not None:
+            spec_cfg.update(
+                rejection_sample_method="synthetic",
+                synthetic_acceptance_length=args.synthetic_acceptance_length,
+            )
         # Override only the draft MoE backend (the trtllm hang is in the draft).
         if args.moe_backend:
             spec_cfg["moe_backend"] = args.moe_backend
@@ -215,7 +265,9 @@ def run_worker(args):
     pre_acc = _sum_counter(llm.get_metrics(), "vllm:spec_decode_num_accepted_tokens")
     pre_dft = _sum_counter(llm.get_metrics(), "vllm:spec_decode_num_drafts")
 
-    elapsed, outs = timed_chat()
+    measurements = [timed_chat() for _ in range(args.measure_repeats)]
+    elapsed = statistics.median(item[0] for item in measurements)
+    outs = measurements[-1][1]
     produced = min(len(o.outputs[0].token_ids) for o in outs)
     assert produced == args.max_tokens, f"expected {args.max_tokens}, got {produced}"
     tok_s = args.batch_size * args.max_tokens / elapsed
@@ -241,6 +293,8 @@ def run_worker(args):
                 [o.outputs[0].token_ids for o in outs], separators=(",", ":")
             ).encode()
         ).hexdigest(),
+        "replayssm_pdl": args.replayssm_pdl,
+        "elapsed_samples_s": [item[0] for item in measurements],
     }
     print(
         f"[{mode}] {elapsed:.2f}s  {tok_s:,.0f} tok/s"
@@ -270,6 +324,8 @@ def run_one_mode(args, mode):
         args.spec_method,
         "--replayssm-backend",
         args.replayssm_backend,
+        "--replayssm-pdl",
+        args.replayssm_pdl,
         "--buffer-len",
         str(args.buffer_len),
         "--max-tokens",
@@ -284,7 +340,14 @@ def run_one_mode(args, mode):
         str(args.gpu_memory_utilization),
         "--warmup-s",
         str(args.warmup_s),
+        "--measure-repeats",
+        str(args.measure_repeats),
     ]
+    if args.synthetic_acceptance_length is not None:
+        cmd += [
+            "--synthetic-acceptance-length",
+            str(args.synthetic_acceptance_length),
+        ]
     if args.enable_thinking:
         cmd.append("--enable-thinking")
     if args.moe_backend:
@@ -323,7 +386,7 @@ def main():
         f"pp={args.pipeline_parallel_size}  "
         f"batch_size={args.batch_size}  num_spec={args.num_spec}  "
         f"buffer_len={args.buffer_len}  max_tokens={args.max_tokens}  "
-        f"backend={args.replayssm_backend}"
+        f"backend={args.replayssm_backend}  pdl={args.replayssm_pdl}"
     )
 
     modes = [m for m in args.modes.split(",") if m]
