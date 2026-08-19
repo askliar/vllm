@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NemotronH-MTP model with attention layers."""
 
+import copy
 import typing
 from collections.abc import Callable, Iterable
 
@@ -36,6 +37,14 @@ from .nemotron_h import (
     NemotronHAttentionDecoderLayer,
     NemotronHMoEDecoderLayer,
 )
+
+
+def get_mtp_layer_config(config: NemotronHConfig, layer_type: str) -> NemotronHConfig:
+    layer_config = copy.deepcopy(config)
+    layer_config.sliding_window = (
+        config.mtp_window_size[0] if layer_type == "W" else None
+    )
+    return layer_config
 
 
 class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
@@ -252,10 +261,11 @@ class NemotronHMultiTokenPredictor(nn.Module):
             is_end_of_step = step_rel_idx == self.pattern_len - 1
 
             layer_prefix = f"{prefix}.layers.{i}"
+            layer_config = get_mtp_layer_config(config, char)
 
             # TODO smor- remove double layers formation
             common_kwargs = dict(
-                config=config,
+                config=layer_config,
                 layer_idx=self.mtp_start_layer_idx + i,
                 model_config=vllm_config.model_config,
                 cache_config=vllm_config.cache_config,
@@ -266,7 +276,7 @@ class NemotronHMultiTokenPredictor(nn.Module):
                 has_end_norm=is_end_of_step,
             )
 
-            if char == "*":
+            if char in ("*", "W"):
                 self.layers[str(i)] = NemotronHMTPAttentionDecoderLayer(**common_kwargs)
             elif char == "E":
                 self.layers[str(i)] = NemotronHMTPMoEDecoderLayer(**common_kwargs)

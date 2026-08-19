@@ -53,6 +53,8 @@ class NemotronHConfig(PretrainedConfig):
             M: Mamba2, *: Attention, -: MLP
         mtp_hybrid_override_pattern (`str`, *optional*, defaults to `"*E"`):
             The pattern of the MTP layers.
+        mtp_window_size (`list[int]` or `None`, *optional*, defaults to `None`):
+            Left and right window sizes for `W` layers in the MTP pattern.
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer in the
             Transformer encoder.
@@ -153,6 +155,7 @@ class NemotronHConfig(PretrainedConfig):
         num_hidden_layers=52,
         hybrid_override_pattern="M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-",
         mtp_hybrid_override_pattern="*E",
+        mtp_window_size=None,
         num_attention_heads=32,
         head_dim=128,
         num_key_value_heads=8,  # nemo: num_query_groups
@@ -207,6 +210,7 @@ class NemotronHConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.hybrid_override_pattern = hybrid_override_pattern
         self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
+        self.mtp_window_size = mtp_window_size
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         self.sliding_window = sliding_window
@@ -222,6 +226,16 @@ class NemotronHConfig(PretrainedConfig):
         assert re.match(r"^[*-ME]+$", self.hybrid_override_pattern), (
             "hybrid_override_pattern must only contain characters 'M', '*', '-', or 'E'"
         )
+        assert re.match(r"^[W*E]+$", self.mtp_hybrid_override_pattern), (
+            "mtp_hybrid_override_pattern must only contain characters 'W', '*', or 'E'"
+        )
+        if "W" in self.mtp_hybrid_override_pattern:
+            assert (
+                self.mtp_window_size is not None and len(self.mtp_window_size) == 2
+            ), (
+                "mtp_window_size=[left, right] is required when the MTP pattern "
+                "contains 'W'"
+            )
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
