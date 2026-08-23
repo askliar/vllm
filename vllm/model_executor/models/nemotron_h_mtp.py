@@ -23,7 +23,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    sharded_weight_loader,
+)
 from vllm.model_executor.models.utils import (
     WeightsMapper,
     make_empty_intermediate_tensors_factory,
@@ -43,6 +46,9 @@ def get_mtp_layer_config(config: NemotronHConfig, layer_type: str) -> NemotronHC
     layer_config = copy.deepcopy(config)
     layer_config.sliding_window = (
         config.mtp_window_size[0] if layer_type == "W" else None
+    )
+    layer_config.mtp_attention_softmax_type = (
+        config.mtp_softmax_type if layer_type in ("W", "*") else "vanilla"
     )
     return layer_config
 
@@ -515,6 +521,14 @@ class NemotronHMTP(nn.Module, SupportsPP):
             if is_expert_weight:
                 continue
 
+            if name.endswith(".mixer.sinks"):
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                sharded_weight_loader(0)(param, loaded_weight)
+                loaded_params.add(name)
+                continue
+
             if name.endswith(".bias") and name not in params_dict:
                 continue
 
@@ -525,5 +539,17 @@ class NemotronHMTP(nn.Module, SupportsPP):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        required_params = set()
+        if getattr(self.config, "mtp_softmax_type", "vanilla") == "learnable":
+            for layer_idx, symbol in enumerate(self.model.pattern_str):
+                if symbol in ("W", "*"):
+                    required_params.add(f"model.layers.{layer_idx}.mixer.sinks")
+        missing_required = required_params - loaded_params
+        if missing_required:
+            raise ValueError(
+                "Nemotron-H MTP sink tensors were not loaded: "
+                f"{sorted(missing_required)}"
+            )
 
         return loaded_params

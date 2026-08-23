@@ -454,6 +454,18 @@ class NemotronHAttention(nn.Module):
         # Get per-layer sliding window from config (for heterogeneous models)
         sliding_window = getattr(config, "sliding_window", None)
 
+        softmax_type = getattr(config, "mtp_attention_softmax_type", "vanilla")
+        if softmax_type == "learnable":
+            self.sinks = nn.Parameter(
+                torch.empty(self.num_heads), requires_grad=False
+            )
+        elif softmax_type == "off-by-one":
+            self.register_buffer(
+                "sinks", torch.zeros(self.num_heads), persistent=False
+            )
+        else:
+            self.sinks = None
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -463,6 +475,7 @@ class NemotronHAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
             per_layer_sliding_window=sliding_window,
+            sinks=self.sinks,
         )
 
     def forward(

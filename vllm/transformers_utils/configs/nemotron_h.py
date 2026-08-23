@@ -55,6 +55,9 @@ class NemotronHConfig(PretrainedConfig):
             The pattern of the MTP layers.
         mtp_window_size (`list[int]` or `None`, *optional*, defaults to `None`):
             Left and right window sizes for `W` layers in the MTP pattern.
+        mtp_softmax_type (`str`, *optional*, defaults to `"vanilla"`):
+            MTP attention softmax variant. `"learnable"` loads per-head sink
+            logits and `"off-by-one"` uses fixed zero-valued sink logits.
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer in the
             Transformer encoder.
@@ -156,6 +159,7 @@ class NemotronHConfig(PretrainedConfig):
         hybrid_override_pattern="M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-",
         mtp_hybrid_override_pattern="*E",
         mtp_window_size=None,
+        mtp_softmax_type="vanilla",
         num_attention_heads=32,
         head_dim=128,
         num_key_value_heads=8,  # nemo: num_query_groups
@@ -211,6 +215,7 @@ class NemotronHConfig(PretrainedConfig):
         self.hybrid_override_pattern = hybrid_override_pattern
         self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
         self.mtp_window_size = mtp_window_size
+        self.mtp_softmax_type = mtp_softmax_type
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         self.sliding_window = sliding_window
@@ -236,6 +241,7 @@ class NemotronHConfig(PretrainedConfig):
                 "mtp_window_size=[left, right] is required when the MTP pattern "
                 "contains 'W'"
             )
+        assert self.mtp_softmax_type in ("vanilla", "off-by-one", "learnable")
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
