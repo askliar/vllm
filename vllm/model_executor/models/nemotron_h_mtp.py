@@ -44,13 +44,15 @@ from .nemotron_h import (
 
 def get_mtp_layer_config(config: NemotronHConfig, layer_type: str) -> NemotronHConfig:
     layer_config = copy.deepcopy(config)
+    mtp_window_size = getattr(config, "mtp_window_size", None)
+    mtp_softmax_type = getattr(config, "mtp_softmax_type", "vanilla")
     layer_config.sliding_window = (
-        config.mtp_window_size[0]
-        if layer_type == "*" and config.mtp_window_size is not None
+        mtp_window_size[0]
+        if layer_type == "*" and mtp_window_size is not None
         else None
     )
     layer_config.mtp_attention_softmax_type = (
-        config.mtp_softmax_type if layer_type == "*" else "vanilla"
+        mtp_softmax_type if layer_type == "*" else "vanilla"
     )
     return layer_config
 
