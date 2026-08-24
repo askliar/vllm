@@ -15,20 +15,34 @@ def make_config(**kwargs) -> NemotronHConfig:
     )
 
 
-def test_mtp_sliding_attention_uses_its_window_without_affecting_global_attention():
-    config = make_config(
-        mtp_hybrid_override_pattern="W*E",
-        mtp_window_size=[1024, 0],
-    )
+def test_mtp_attention_uses_global_attention_without_window():
+    config = make_config(mtp_hybrid_override_pattern="*E")
 
-    sliding_config = get_mtp_layer_config(config, "W")
-    global_config = get_mtp_layer_config(config, "*")
+    attention_config = get_mtp_layer_config(config, "*")
 
-    assert sliding_config.sliding_window == 1024
-    assert global_config.sliding_window is None
+    assert attention_config.sliding_window is None
     assert config.sliding_window is None
 
 
-def test_mtp_sliding_attention_requires_window_size():
+def test_mtp_attention_uses_configured_sliding_window():
+    config = make_config(
+        mtp_hybrid_override_pattern="*E",
+        mtp_window_size=[1024, 0],
+    )
+
+    attention_config = get_mtp_layer_config(config, "*")
+    expert_config = get_mtp_layer_config(config, "E")
+
+    assert attention_config.sliding_window == 1024
+    assert expert_config.sliding_window is None
+    assert config.sliding_window is None
+
+
+def test_mtp_window_size_requires_left_and_right_values():
     with pytest.raises(AssertionError, match="mtp_window_size"):
-        make_config(mtp_hybrid_override_pattern="W")
+        make_config(mtp_hybrid_override_pattern="*E", mtp_window_size=[1024])
+
+
+def test_mtp_pattern_requires_exactly_one_attention_layer():
+    with pytest.raises(AssertionError, match="exactly one attention layer"):
+        make_config(mtp_hybrid_override_pattern="**E")

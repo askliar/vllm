@@ -52,9 +52,11 @@ class NemotronHConfig(PretrainedConfig):
             characters where each character represents
             M: Mamba2, *: Attention, -: MLP
         mtp_hybrid_override_pattern (`str`, *optional*, defaults to `"*E"`):
-            The pattern of the MTP layers.
+            The pattern of the MTP layers. It must contain exactly one attention
+            layer (`*`).
         mtp_window_size (`list[int]` or `None`, *optional*, defaults to `None`):
-            Left and right window sizes for `W` layers in the MTP pattern.
+            Left and right window sizes for the MTP attention layer. If omitted,
+            the attention layer uses global attention.
         mtp_softmax_type (`str`, *optional*, defaults to `"vanilla"`):
             MTP attention softmax variant. `"learnable"` loads per-head sink
             logits and `"off-by-one"` uses fixed zero-valued sink logits.
@@ -231,16 +233,15 @@ class NemotronHConfig(PretrainedConfig):
         assert re.match(r"^[*-ME]+$", self.hybrid_override_pattern), (
             "hybrid_override_pattern must only contain characters 'M', '*', '-', or 'E'"
         )
-        assert re.match(r"^[W*E]+$", self.mtp_hybrid_override_pattern), (
-            "mtp_hybrid_override_pattern must only contain characters 'W', '*', or 'E'"
+        assert re.match(r"^[*E]+$", self.mtp_hybrid_override_pattern), (
+            "mtp_hybrid_override_pattern must only contain characters '*' or 'E'"
         )
-        if "W" in self.mtp_hybrid_override_pattern:
-            assert (
-                self.mtp_window_size is not None and len(self.mtp_window_size) == 2
-            ), (
-                "mtp_window_size=[left, right] is required when the MTP pattern "
-                "contains 'W'"
-            )
+        assert self.mtp_hybrid_override_pattern.count("*") == 1, (
+            "mtp_hybrid_override_pattern must contain exactly one attention layer"
+        )
+        assert self.mtp_window_size is None or len(self.mtp_window_size) == 2, (
+            "mtp_window_size must be None or [left, right]"
+        )
         assert self.mtp_softmax_type in ("vanilla", "off-by-one", "learnable")
         # for backward compatibility
         if num_key_value_heads is None:

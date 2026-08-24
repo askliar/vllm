@@ -45,10 +45,12 @@ from .nemotron_h import (
 def get_mtp_layer_config(config: NemotronHConfig, layer_type: str) -> NemotronHConfig:
     layer_config = copy.deepcopy(config)
     layer_config.sliding_window = (
-        config.mtp_window_size[0] if layer_type == "W" else None
+        config.mtp_window_size[0]
+        if layer_type == "*" and config.mtp_window_size is not None
+        else None
     )
     layer_config.mtp_attention_softmax_type = (
-        config.mtp_softmax_type if layer_type in ("W", "*") else "vanilla"
+        config.mtp_softmax_type if layer_type == "*" else "vanilla"
     )
     return layer_config
 
@@ -282,7 +284,7 @@ class NemotronHMultiTokenPredictor(nn.Module):
                 has_end_norm=is_end_of_step,
             )
 
-            if char in ("*", "W"):
+            if char == "*":
                 self.layers[str(i)] = NemotronHMTPAttentionDecoderLayer(**common_kwargs)
             elif char == "E":
                 self.layers[str(i)] = NemotronHMTPMoEDecoderLayer(**common_kwargs)
@@ -543,7 +545,7 @@ class NemotronHMTP(nn.Module, SupportsPP):
         required_params = set()
         if getattr(self.config, "mtp_softmax_type", "vanilla") == "learnable":
             for layer_idx, symbol in enumerate(self.model.pattern_str):
-                if symbol in ("W", "*"):
+                if symbol == "*":
                     required_params.add(f"model.layers.{layer_idx}.mixer.sinks")
         missing_required = required_params - loaded_params
         if missing_required:
