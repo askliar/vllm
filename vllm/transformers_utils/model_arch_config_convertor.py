@@ -591,10 +591,17 @@ class AnyModelArchConfigConvertor(ModelArchConfigConvertorBase):
         """Yield per-layer entries (values), tolerating int/str dict keys."""
         return list(per_layer_config.values())
 
+    def _get_per_layer_overrides(self) -> dict:
+        heterogeneity_spec = getattr(self.hf_text_config, "_heterogeneity_spec", None)
+        if heterogeneity_spec is not None:
+            return heterogeneity_spec.per_layer_overrides
+        per_layer_config = getattr(self.hf_text_config, "per_layer_config", None)
+        return per_layer_config if isinstance(per_layer_config, dict) else {}
+
     def get_total_num_kv_heads(self) -> int:
         # Return the max KV head count across non-skipped attention layers
         # so the KV cache is allocated large enough for every layer.
-        per_layer_config = getattr(self.hf_text_config, "per_layer_config", None)
+        per_layer_config = self._get_per_layer_overrides()
         if per_layer_config:
             num_hidden_layers = getattr(self.hf_text_config, "num_hidden_layers", 0)
             global_kv = super().get_total_num_kv_heads()
@@ -614,7 +621,7 @@ class AnyModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return super().get_total_num_kv_heads()
 
     def get_num_experts(self) -> int:
-        per_layer_config = getattr(self.hf_text_config, "per_layer_config", None)
+        per_layer_config = self._get_per_layer_overrides()
         if per_layer_config:
             num_hidden_layers = getattr(self.hf_text_config, "num_hidden_layers", 0)
             global_experts = super().get_num_experts()

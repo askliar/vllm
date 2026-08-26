@@ -35,7 +35,12 @@ class AnyModelConfig(VerifyAndUpdateConfig):
         # For VL models per_layer_config lives on text_config, not hf_config.
         text_config = hf_config.get_text_config()
 
-        per_layer_config = getattr(text_config, "per_layer_config", None)
+        heterogeneity_spec = getattr(text_config, "_heterogeneity_spec", None)
+        per_layer_config = (
+            heterogeneity_spec.per_layer_overrides
+            if heterogeneity_spec is not None
+            else getattr(text_config, "per_layer_config", None)
+        )
         if per_layer_config:
             n_layers = text_config.num_hidden_layers
             for key in per_layer_config:
