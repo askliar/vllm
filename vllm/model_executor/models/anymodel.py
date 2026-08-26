@@ -117,6 +117,15 @@ def _iter_layer_overrides(per_layer_config):
         yield int(key), entry
 
 
+def _get_per_layer_overrides(config) -> dict:
+    """Return sparse layer overrides from either HF config representation."""
+    heterogeneity_spec = getattr(config, "_heterogeneity_spec", None)
+    if heterogeneity_spec is not None:
+        return heterogeneity_spec.per_layer_overrides
+    per_layer_config = getattr(config, "per_layer_config", None)
+    return per_layer_config if isinstance(per_layer_config, dict) else {}
+
+
 class NoOpAttention(nn.Module):
     """Identity pass-through replacing a skipped attention block."""
 
@@ -403,7 +412,7 @@ def _patch_anymodel_layers(
         if arch_info.layer_hf_config
         else config
     )
-    per_layer_config = layer_base_config.per_layer_config
+    per_layer_config = _get_per_layer_overrides(layer_base_config)
 
     obj = model
     for part in arch_info.layers_path.split("."):
@@ -592,6 +601,14 @@ class AnyModel(nn.Module, HasNoOps):
         base_init_prefix = (
             arch_info.init_prefix if arch_info.init_prefix is not None else prefix
         )
+        config = vllm_config.model_config.hf_config
+        layer_base_config = (
+            getattr(config, arch_info.layer_hf_config)
+            if arch_info.layer_hf_config
+            else config
+        )
+        if getattr(layer_base_config, "is_heterogeneous", False):
+            layer_base_config.allow_global_per_layer_attribute_access = True
         super().__init__(vllm_config=vllm_config, prefix=base_init_prefix)
         _patch_anymodel_layers(self, vllm_config, arch_info, base_init_prefix)
 
@@ -605,7 +622,7 @@ class AnyModel(nn.Module, HasNoOps):
                 if arch_info.layer_hf_config
                 else config
             )
-            per_layer_config = getattr(layer_base_config, "per_layer_config", None)
+            per_layer_config = _get_per_layer_overrides(layer_base_config)
             if per_layer_config:
                 noop_prefixes = _collect_noop_prefixes(per_layer_config, arch_info)
                 if noop_prefixes:

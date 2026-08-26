@@ -25,6 +25,7 @@ from transformers import PretrainedConfig
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_configs,
@@ -166,6 +167,11 @@ def _anymodel_hf_overrides(
     *,
     case: _Case,
 ) -> PretrainedConfig:
+    if hf_config.model_type.startswith("dummy_"):
+        hf_config.architectures = ["AnyModel"]
+        hf_config.base_architecture = case.base_arch
+        return hf_config
+
     hf_config = dummy_hf_overrides(hf_config, model_arch=case.base_arch)
     text_cfg = hf_config.get_text_config()
     text_cfg.num_hidden_layers = _NUM_LAYERS
@@ -181,6 +187,12 @@ def _anymodel_hf_overrides(
 
 def _kv_cache_stub(self, vllm_config):
     kv_cache_specs = self.model_executor.get_kv_cache_specs()
+    layout = resolve_kv_cache_layout(
+        vllm_config,
+        self.model_executor.get_supported_kv_cache_layouts(),
+        [spec for worker_specs in kv_cache_specs for spec in worker_specs.values()],
+    )
+    self.model_executor.set_kv_cache_layout(layout.name)
     kv_cache_configs = get_kv_cache_configs(
         vllm_config,
         kv_cache_specs,
@@ -218,7 +230,7 @@ def _teardown_engine():
     current_platform.__class__._global_graph_pool = None
 
 
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def _run_anymodel_e2e(case: _Case):
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     attention_config = (
@@ -253,11 +265,12 @@ def _identity_anymodel_overrides(
     hf_config.architectures = ["AnyModel"]
     hf_config.base_architecture = _PARITY_BASE_ARCH
     # Sparse dict: empty means every layer uses the global config unchanged.
-    text_cfg.per_layer_config = {}
+    if hasattr(text_cfg, "num_hidden_layers"):
+        text_cfg.per_layer_config = {}
     return hf_config
 
 
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def _run_anymodel_parity():
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     sampling = SamplingParams(temperature=0, max_tokens=64)
@@ -327,7 +340,7 @@ def _capture_layer_outputs(model) -> tuple[list, list]:
     return captured, handles
 
 
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def _run_anymodel_layer_parity():
     """Assert per-decoder-layer hidden states match exactly between plain and
     identity-wrapped AnyModel. With identical weights and no block overrides,
@@ -383,7 +396,7 @@ def test_anymodel_layer_parity():
     _run_anymodel_layer_parity()
 
 
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def _run_anymodel_throughput_parity():
     """Assert identity-wrapped AnyModel throughput is not materially worse than
     plain. Regressions here catch issues like the pooling-runner misclassification
@@ -445,6 +458,11 @@ def _base_llama_overrides(hf_config: PretrainedConfig) -> PretrainedConfig:
 def _reduced_anymodel_overrides(
     hf_config: PretrainedConfig,
 ) -> PretrainedConfig:
+    if hf_config.model_type.startswith("dummy_"):
+        hf_config.architectures = ["AnyModel"]
+        hf_config.base_architecture = _REDUCTION_ARCH
+        return hf_config
+
     hf_config = dummy_hf_overrides(hf_config, model_arch=_REDUCTION_ARCH)
     text_cfg = hf_config.get_text_config()
     text_cfg.num_hidden_layers = _NUM_LAYERS
@@ -466,7 +484,7 @@ def _reduced_anymodel_overrides(
     return hf_config
 
 
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def _run_anymodel_size_reduction():
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     common = dict(load_format="dummy", enforce_eager=True, gpu_memory_utilization=0.80)
@@ -493,7 +511,7 @@ def test_anymodel_size_reduction():
 _NAS_CONFIG_PATH = Path(__file__).resolve().parents[0] / "fixtures" / "nas_config.json"
 
 
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def _run_puzzletron_nas_config():
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     from vllm.model_executor.models.anymodel import (
