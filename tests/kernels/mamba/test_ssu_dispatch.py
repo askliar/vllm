@@ -22,6 +22,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 )
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -466,22 +467,10 @@ def test_modelwide_replayssm_postprocess_launches_materializer_once(monkeypatch)
     assert kwargs["heads_per_group"] == 2
     assert kwargs["max_window"] == 16
     assert kwargs["ring_buffer_len"] == 20
-    torch.testing.assert_close(
-        ctx.src_slots,
-        torch.tensor(
-            [[1, -1], [1, -1], [4, -1], [4, -1]],
-            dtype=torch.int32,
-            device="cuda",
-        ),
-    )
-    torch.testing.assert_close(
-        ctx.dst_slots,
-        torch.tensor(
-            [[2, -1], [2, -1], [5, -1], [5, -1]],
-            dtype=torch.int32,
-            device="cuda",
-        ),
-    )
+    assert ctx.src_slots[:, 0].tolist() == [1, 1, 4, 4]
+    assert ctx.dst_slots[:, 0].tolist() == [2, 2, 5, 5]
+    assert ctx.src_slots[:, 1].tolist() == [NULL_BLOCK_ID] * 4
+    assert ctx.dst_slots[:, 1].tolist() == [NULL_BLOCK_ID] * 4
     assert ctx.plan_ring_start.tolist() == [2, 0]
     assert ctx.plan_flush_count.tolist() == [6, -1]
     assert groups[0][0]._replayssm_prev_num_accepted[1].item() == 6
