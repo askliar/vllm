@@ -17,8 +17,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     is_conv_state_dim_first,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
-    materialize_replayssm_prefix,
-    materialize_replayssm_prefix_mtp_gpu,
+    ReplaySSMModelContext,
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
@@ -592,6 +591,7 @@ def precopy_mamba_align_fused_kernel(
     state_inner_sizes_ptr,
     state_conv_widths_ptr,
     state_group_indices_ptr,
+    state_skip_precopy_ptr,
     state_dim_row_count_ptr,
     state_dim_row_stride_ptr,
     idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx (-1 to skip)
@@ -635,6 +635,10 @@ def precopy_mamba_align_fused_kernel(
     # state in-block via num_accepted (preserved when no boundary is crossed),
     # so there is nothing to copy.
     if src_col < 0 or src_col == dst_col:
+        return
+    if tl.load(state_skip_precopy_ptr + state_idx):
+        # FlashInfer ReplaySSM materializes this temporal destination before the
+        # generic pre-copy launch. Copy only conv/other model-owned states here.
         return
 
     token_bias = tl.load(token_bias_ptr + req_idx)
@@ -857,6 +861,7 @@ class MambaSpecDecodeGPUContext:
     num_scheduled_tokens_buf: CpuGpuBuffer | None = None
     num_computed_tokens_buf: CpuGpuBuffer | None = None
     num_draft_tokens_buf: CpuGpuBuffer | None = None
+    is_prefilling_buf: CpuGpuBuffer | None = None
     precopy_src_col_buf: CpuGpuBuffer | None = None
     precopy_token_bias_buf: CpuGpuBuffer | None = None
 
@@ -867,6 +872,9 @@ class MambaSpecDecodeGPUContext:
     # populate time so the per-step postprocess can skip the layer scan for
     # Triton / non-ReplaySSM configs.
     has_flashinfer_replayssm: bool = False
+    # Persistent all-layer ReplaySSM descriptors, populated with the cache
+    # addresses on first real forward. None for non-FlashInfer configurations.
+    replayssm: ReplaySSMModelContext | None = None
 
     @classmethod
     def create(
@@ -965,9 +973,11 @@ class MambaSpecDecodeGPUContext:
             num_scheduled_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_computed_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_draft_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            is_prefilling_buf=make_buffer(max_num_reqs, dtype=torch.bool),
             precopy_src_col_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             precopy_token_bias_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             is_initialized=False,
+            replayssm=None,
         )
 
     def initialize_from_forward_context(
@@ -1145,6 +1155,20 @@ class MambaSpecDecodeGPUContext:
         for i, bt in enumerate(block_tables):
             self.block_table_ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
 
+        if self.has_flashinfer_replayssm:
+            self.replayssm = ReplaySSMModelContext.create(
+                kv_cache_config,
+                self.mamba_group_ids,
+                forward_context,
+                block_tables,
+                self.num_accepted_tokens_out.numel(),
+            )
+            if self.replayssm is None:
+                raise RuntimeError(
+                    "FlashInfer ReplaySSM state was discovered but its model-wide "
+                    "materialization context could not be initialized"
+                )
+
         self.is_initialized = True
 
     def compute_aligned_state_indices(
@@ -1283,6 +1307,7 @@ class MambaSpecDecodeGPUContext:
             self.state_inner_sizes,
             self.state_conv_widths,
             self.state_group_indices,
+            self.state_skip_postprocess,
             self.state_dim_row_count,
             self.state_dim_row_stride,
             idx_mapping,
@@ -1496,27 +1521,6 @@ def _resolve_fused_precopy(
     )
 
 
-def _should_materialize_replayssm_prefix(
-    cache_config: CacheConfig,
-    forward_context: dict[str, Any],
-    src_cols: list[int],
-    num_reqs: int,
-) -> bool:
-    """True for FlashInfer ReplaySSM STP copies that cross a block column."""
-    if getattr(cache_config, "use_replayssm", False) is not True:
-        return False
-    if not any(col >= 0 for col in src_cols[:num_reqs]):
-        return False
-    for layer in forward_context.values():
-        mamba_config = getattr(layer, "mamba_config", None)
-        if (
-            getattr(layer, "use_replayssm", False)
-            and getattr(mamba_config, "backend", None) == MambaBackendEnum.FLASHINFER
-        ):
-            return True
-    return False
-
-
 def preprocess_mamba(
     scheduler_output: SchedulerOutput,
     kv_cache_config: KVCacheConfig,
@@ -1613,28 +1617,17 @@ def preprocess_mamba(
                 )
             input_batch.num_accepted_tokens_cpu[i] = 1
 
-    if _should_materialize_replayssm_prefix(
-        cache_config, forward_context, src_cols, num_reqs
-    ):
-        # Exact-ify the hashed source slot before conv/SSM memcpy seeds the new
-        # running column from it. Both the fused precopy and the scalar block
-        # copy read that slot, so this has to run ahead of either one (mirrors
-        # MambaHybridModelState.preprocess_state on V2).
-        materialize_replayssm_prefix(
-            kv_cache_config,
-            mamba_group_ids,
-            forward_context,
-            input_batch.req_ids,
-            requests,
-            src_cols,
-            dst_cols,
-            num_reqs,
-        )
-
     if fused is not None:
         fused.state_idx.copy_to_gpu(num_reqs)
         fused.src_col.copy_to_gpu(num_reqs)
         fused.token_bias.copy_to_gpu(num_reqs)
+        if fused.ctx.replayssm is not None:
+            fused.ctx.replayssm.preprocess_and_materialize(
+                idx_mapping=None,
+                src_cols=fused.src_col.gpu,
+                dst_cols=fused.state_idx.gpu,
+                num_reqs=num_reqs,
+            )
         fused.ctx.run_fused_precopy(
             num_reqs=num_reqs,
             state_idx_gpu=fused.state_idx.gpu,
@@ -1704,7 +1697,7 @@ def postprocess_mamba_align_gpu(
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: MambaStateCopyFuncsByType,
 ) -> None:
-    """GPU-side mamba postprocess for spec decode + hybrid + align mode.
+    """GPU-side Mamba postprocess for fused align state maintenance.
 
     Lazily binds the fused-kernel context to the persistent block tables and
     forward-context state pointers on the first call, runs the fused kernel,
@@ -1712,13 +1705,14 @@ def postprocess_mamba_align_gpu(
     batch's CPU tensor for the next iteration's preprocess.
     """
     ctx = bufs.postprocess_align
-    # Caller is responsible for gating on spec decode + hybrid; this assert is
-    # a tripwire if those gates ever drift apart.
+    # The caller enables this context for spec-decode hybrid state copies or
+    # for model-owned FlashInfer ReplaySSM lifecycle maintenance under STP.
     assert ctx is not None
     assert ctx.mamba_state_idx_buf is not None
     assert ctx.num_scheduled_tokens_buf is not None
     assert ctx.num_computed_tokens_buf is not None
     assert ctx.num_draft_tokens_buf is not None
+    assert ctx.is_prefilling_buf is not None
 
     if not ctx.is_initialized:
         ctx.initialize_from_forward_context(
@@ -1739,19 +1733,18 @@ def postprocess_mamba_align_gpu(
         num_computed_tokens_gpu=ctx.num_computed_tokens_buf.gpu,
         num_draft_tokens_gpu=ctx.num_draft_tokens_buf.gpu,
     )
-    if ctx.has_flashinfer_replayssm:
-        materialize_replayssm_prefix_mtp_gpu(
-            kv_cache_config,
-            ctx.mamba_group_ids,
-            forward_context,
-            [
-                input_batch.block_table[gid].get_device_tensor(num_reqs)
-                for gid in range(len(kv_cache_config.kv_cache_groups))
-            ],
-            ctx.materialize_src_cols,
-            ctx.materialize_dst_cols,
-            ctx.materialize_token_counts,
-            num_reqs,
+    if ctx.replayssm is not None:
+        ctx.replayssm.postprocess_and_materialize(
+            idx_mapping=None,
+            query_metadata=ctx.num_scheduled_tokens_buf.gpu,
+            query_is_cumulative=False,
+            num_accepted_tokens=num_accepted_tokens_gpu,
+            is_prefilling=ctx.is_prefilling_buf.gpu,
+            live_cols=ctx.mamba_state_idx_buf.gpu,
+            materialize_src_cols=ctx.materialize_src_cols,
+            materialize_dst_cols=ctx.materialize_dst_cols,
+            materialize_token_counts=ctx.materialize_token_counts,
+            num_reqs=num_reqs,
         )
 
     # ``num_accepted_tokens_out`` is pre-initialized from
@@ -1775,7 +1768,7 @@ def stage_postprocess_inputs_to_gpu(
 
     Walks ``req_ids[:num_reqs]`` once, writing each request's mamba block
     index and scheduled/computed/draft token counts into the matching pinned
-    numpy views, then issues four non-blocking H→D copies. The fused kernel
+    numpy views, then issues five non-blocking H→D copies. The fused kernel
     indexes the resulting GPU tensors by ``req_idx``. Buffers live on ``ctx``
     and only exist when the postprocess kernel is enabled.
 
@@ -1786,6 +1779,7 @@ def stage_postprocess_inputs_to_gpu(
     assert ctx.num_scheduled_tokens_buf is not None
     assert ctx.num_computed_tokens_buf is not None
     assert ctx.num_draft_tokens_buf is not None
+    assert ctx.is_prefilling_buf is not None
 
     scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
     num_scheduled = scheduler_output.num_scheduled_tokens
@@ -1793,6 +1787,7 @@ def stage_postprocess_inputs_to_gpu(
     scheduled_np = ctx.num_scheduled_tokens_buf.np
     computed_np = ctx.num_computed_tokens_buf.np
     draft_np = ctx.num_draft_tokens_buf.np
+    prefill_np = ctx.is_prefilling_buf.np
 
     for i in range(num_reqs):
         req_id = req_ids[i]
@@ -1805,8 +1800,12 @@ def stage_postprocess_inputs_to_gpu(
         scheduled_np[i] = num_scheduled[req_id]
         computed_np[i] = requests[req_id].num_computed_tokens
         draft_np[i] = len(scheduled_spec_tokens.get(req_id, []))
+        prefill_np[i] = (
+            requests[req_id].num_computed_tokens < requests[req_id].num_prompt_tokens
+        )
 
     ctx.mamba_state_idx_buf.copy_to_gpu(num_reqs)
     ctx.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_computed_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_draft_tokens_buf.copy_to_gpu(num_reqs)
+    ctx.is_prefilling_buf.copy_to_gpu(num_reqs)

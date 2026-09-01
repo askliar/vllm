@@ -125,12 +125,10 @@ def test_replayssm_autotune_slots_restore_state_and_trackers():
     )
     mixer._replayssm_ring_start = torch.full((4,), 3, dtype=torch.int32)
     mixer._replayssm_prev_num_accepted = torch.full((4,), 3, dtype=torch.int32)
-    mixer._replayssm_prev_query_len = torch.full((4,), 3, dtype=torch.int32)
     tracked = (
         *mixer.kv_cache,
         mixer._replayssm_ring_start,
         mixer._replayssm_prev_num_accepted,
-        mixer._replayssm_prev_query_len,
     )
 
     block_ids = np.arange(10, 14, dtype=np.int32).reshape(4, 1)

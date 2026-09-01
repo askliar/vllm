@@ -11,10 +11,6 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.mamba import MambaBackendEnum
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
-from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
-    materialize_replayssm_prefix_gpu,
-    materialize_replayssm_prefix_mtp_gpu,
-)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
@@ -93,6 +89,9 @@ class MambaHybridModelState(DefaultModelState):
         self.cache_config = vllm_config.cache_config
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+        self._is_prefilling_gpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.bool, device=self.device
         )
         # Pre-copy "align" prefix-cache state (V2). The migration of each
         # request's mamba state across block boundaries runs as a fused GPU
@@ -235,18 +234,12 @@ class MambaHybridModelState(DefaultModelState):
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
         )
-        if self._use_flashinfer_replayssm:
-            # Exact-ify the hashed source slot before the conv/SSM memcpy
-            # seeds the new running column from it.
-            materialize_replayssm_prefix_gpu(
-                kv_cache_config,
-                mamba_group_ids,
-                self.vllm_config.compilation_config.static_forward_context,
-                block_tables,
-                self._mamba_src_col_gpu,
-                self._mamba_state_idx_gpu,
-                input_batch.idx_mapping,
-                num_reqs,
+        if ctx.replayssm is not None:
+            ctx.replayssm.preprocess_and_materialize(
+                idx_mapping=input_batch.idx_mapping,
+                src_cols=self._mamba_src_col_gpu,
+                dst_cols=self._mamba_state_idx_gpu,
+                num_reqs=num_reqs,
             )
         ctx.run_fused_precopy(
             num_reqs,
@@ -285,6 +278,7 @@ class MambaHybridModelState(DefaultModelState):
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
             input_batch.is_prefilling_np
         )
+        self._is_prefilling_gpu[:num_reqs].copy_(is_prefilling, non_blocking=True)
         # During CUDAGraph capture, num_decode_draft_tokens_cpu and num_accepted_tokens
         # are created by attn_metadata_builder.build_for_cudagraph_capture, so we only
         # compute them during actual (non-capture) forward execution.
@@ -366,6 +360,8 @@ class MambaHybridModelState(DefaultModelState):
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        is_prefilling: torch.Tensor | None = None,
     ) -> None:
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
@@ -421,17 +417,29 @@ class MambaHybridModelState(DefaultModelState):
             # non-spec boundary where src_col != dst_col. Rows that need no
             # work carry the -1 src_col sentinel and cost nothing.
             if self._use_flashinfer_replayssm:
-                assert self._mamba_kv_cache_config is not None
-                assert self._mamba_block_tables is not None
-                materialize_replayssm_prefix_mtp_gpu(
-                    self._mamba_kv_cache_config,
-                    self._mamba_group_ids,
-                    self.vllm_config.compilation_config.static_forward_context,
-                    self._mamba_block_tables,
-                    self._mamba_ctx.materialize_src_cols,
-                    self._mamba_ctx.materialize_dst_cols,
-                    self._mamba_ctx.materialize_token_counts,
-                    num_reqs,
+                replayssm = self._mamba_ctx.replayssm
+                assert replayssm is not None
+                if query_start_loc is None:
+                    raise RuntimeError(
+                        "ReplaySSM postprocess requires the query_start_loc from "
+                        "the forward that produced this acceptance"
+                    )
+                if is_prefilling is None:
+                    is_prefilling = self._is_prefilling_gpu[:num_reqs]
+                replayssm.postprocess_and_materialize(
+                    idx_mapping=idx_mapping,
+                    query_metadata=query_start_loc,
+                    query_is_cumulative=True,
+                    # run_fused_postprocess_align can reset the live buffer to
+                    # one for the next step. Its persistent snapshot still
+                    # contains the acceptance produced by this forward.
+                    num_accepted_tokens=self._mamba_ctx.num_accepted_tokens_out,
+                    is_prefilling=is_prefilling,
+                    live_cols=self._mamba_state_idx_gpu,
+                    materialize_src_cols=self._mamba_ctx.materialize_src_cols,
+                    materialize_dst_cols=self._mamba_ctx.materialize_dst_cols,
+                    materialize_token_counts=(self._mamba_ctx.materialize_token_counts),
+                    num_reqs=num_reqs,
                 )
 
 

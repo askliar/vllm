@@ -170,19 +170,14 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
 
 
 @pytest.mark.parametrize(
-    ("backend", "expected_order"),
+    ("with_replayssm", "expected_order"),
     [
-        pytest.param(
-            MambaBackendEnum.FLASHINFER,
-            ["materialize", "copy"],
-            id="flashinfer",
-        ),
-        pytest.param(MambaBackendEnum.TRITON, ["copy"], id="triton"),
+        pytest.param(True, ["materialize", "copy"], id="replayssm"),
+        pytest.param(False, ["copy"], id="generic"),
     ],
 )
-def test_preprocess_mamba_materializes_only_for_flashinfer_replayssm(
-    monkeypatch,
-    backend: MambaBackendEnum,
+def test_preprocess_mamba_uses_modelwide_materializer_when_present(
+    with_replayssm: bool,
     expected_order: list[str],
 ):
     spec = MagicMock(block_size=4, num_speculative_blocks=0)
@@ -196,24 +191,18 @@ def test_preprocess_mamba_materializes_only_for_flashinfer_replayssm(
     sched = _make_scheduler_output(set(), None, set())
     sched.num_scheduled_tokens = {"r0": 1}
 
-    mixer = MagicMock(use_replayssm=True)
-    mixer.mamba_config.backend = backend
-    forward_context = {"mixer": mixer}
-
     order: list[str] = []
-
-    monkeypatch.setattr(
-        "vllm.v1.worker.mamba_utils.materialize_replayssm_prefix",
-        lambda *args, **kwargs: order.append("materialize"),
-    )
-    monkeypatch.setattr(
-        "vllm.v1.worker.mamba_utils.collect_mamba_copy_meta",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        "vllm.v1.worker.mamba_utils.do_mamba_copy_block",
-        lambda _copy_bufs: order.append("copy"),
-    )
+    device = torch.device("cpu")
+    align_ctx = MagicMock(is_initialized=True)
+    align_ctx.mamba_state_idx_buf = _MockCpuGpuBuffer(1, torch.int32, device)
+    align_ctx.precopy_src_col_buf = _MockCpuGpuBuffer(1, torch.int32, device)
+    align_ctx.precopy_token_bias_buf = _MockCpuGpuBuffer(1, torch.int32, device)
+    align_ctx.replayssm = MagicMock() if with_replayssm else None
+    if align_ctx.replayssm is not None:
+        align_ctx.replayssm.preprocess_and_materialize.side_effect = lambda **kwargs: (
+            order.append("materialize")
+        )
+    align_ctx.run_fused_precopy.side_effect = lambda **kwargs: order.append("copy")
 
     preprocess_mamba(
         sched,
@@ -222,9 +211,10 @@ def test_preprocess_mamba_materializes_only_for_flashinfer_replayssm(
         mamba_state_idx,
         input_batch,
         requests,
-        forward_context,
+        {},
         {},
         copy_bufs,
+        align_ctx=align_ctx,
     )
 
     assert order == expected_order
@@ -239,15 +229,15 @@ def test_postprocess_mamba_align_materializes_after_fused_copy(monkeypatch):
     ctx.num_scheduled_tokens_buf = MagicMock()
     ctx.num_computed_tokens_buf = MagicMock()
     ctx.num_draft_tokens_buf = MagicMock()
+    ctx.is_prefilling_buf = MagicMock()
     ctx.num_accepted_tokens_out = torch.tensor([3], dtype=torch.int32)
     ctx.materialize_src_cols = torch.tensor([2], dtype=torch.int32)
     ctx.materialize_dst_cols = torch.tensor([1], dtype=torch.int32)
     ctx.materialize_token_counts = torch.tensor([2], dtype=torch.int32)
     ctx.run_fused_postprocess.side_effect = lambda **kwargs: order.append("copy")
-
-    monkeypatch.setattr(
-        "vllm.v1.worker.mamba_utils.materialize_replayssm_prefix_mtp_gpu",
-        lambda *args, **kwargs: order.append("materialize"),
+    ctx.replayssm = MagicMock()
+    ctx.replayssm.postprocess_and_materialize.side_effect = lambda **kwargs: (
+        order.append("materialize")
     )
 
     block_table = MagicMock()
@@ -559,12 +549,18 @@ def _make_requests(
     req_ids: list[str],
     num_computed_tokens: list[int],
     block_ids_per_req: list[list[int]],
+    num_prompt_tokens: list[int] | None = None,
 ) -> dict[str, MagicMock]:
     """Create mock CachedRequestState objects."""
     requests = {}
     for i, req_id in enumerate(req_ids):
         req = MagicMock()
         req.num_computed_tokens = num_computed_tokens[i]
+        req.num_prompt_tokens = (
+            num_computed_tokens[i]
+            if num_prompt_tokens is None
+            else num_prompt_tokens[i]
+        )
         req.block_ids = {0: block_ids_per_req[i]}  # group_id=0
         requests[req_id] = req
     return requests
@@ -798,13 +794,14 @@ def test_mamba_groups_support_mixed_specs_in_uniform_group():
 
 
 def _make_staging_ctx(max_num_reqs: int, device: torch.device) -> MagicMock:
-    """Build a MambaSpecDecodeGPUContext stand-in exposing only the four
+    """Build a MambaSpecDecodeGPUContext stand-in exposing only the five
     per-request staging buffers touched by stage_postprocess_inputs_to_gpu."""
     ctx = MagicMock()
     ctx.mamba_state_idx_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
     ctx.num_scheduled_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
     ctx.num_computed_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
     ctx.num_draft_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
+    ctx.is_prefilling_buf = _MockCpuGpuBuffer(max_num_reqs, torch.bool, device)
     return ctx
 
 
@@ -844,6 +841,7 @@ def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
         req_ids=req_ids,
         num_computed_tokens=[10, 20, 30],
         block_ids_per_req=[[0], [0], [0]],
+        num_prompt_tokens=[11, 20, 40],
     )
     mamba_state_idx = {"req_a": 100, "req_b": 200, "req_c": 300}
     # A trailing entry past num_reqs must not be read.
@@ -868,6 +866,9 @@ def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
         ctx.num_computed_tokens_buf.np[:num_reqs], [10, 20, 30]
     )
     np.testing.assert_array_equal(ctx.num_draft_tokens_buf.np[:num_reqs], [2, 0, 4])
+    np.testing.assert_array_equal(
+        ctx.is_prefilling_buf.np[:num_reqs], [True, False, True]
+    )
     for buf in bufs:
         assert (buf.np[num_reqs:] == sentinel).all()
 
@@ -878,6 +879,10 @@ def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
     assert torch.equal(
         ctx.num_draft_tokens_buf.gpu[:num_reqs],
         torch.tensor([2, 0, 4], dtype=torch.int32),
+    )
+    assert torch.equal(
+        ctx.is_prefilling_buf.gpu[:num_reqs],
+        torch.tensor([True, False, True]),
     )
 
 

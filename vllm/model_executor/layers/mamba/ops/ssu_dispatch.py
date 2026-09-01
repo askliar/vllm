@@ -11,6 +11,7 @@ the backend defaults to 'cpu'.
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from functools import cache
 from inspect import signature
 from typing import Any
@@ -27,198 +28,595 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 logger = init_logger(__name__)
 
 
-@triton.jit(
-    do_not_specialize=["n_slots", "state_batch_indices_stride"],
-    do_not_specialize_on_alignment=["state_batch_indices"],
-)
-def _update_replayssm_ring_trackers_kernel(
-    ring_start,
-    prev_num_accepted,
-    prev_query_len,
-    state_batch_indices,
-    state_batch_indices_stride,
-    n_slots,
-    num_states,
-    logical_window: tl.constexpr,
-    ring_buffer_len: tl.constexpr,
-    pad_slot_id: tl.constexpr,
-    RESET: tl.constexpr,
-    BLOCK: tl.constexpr,
-) -> None:
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n_slots
-    slots = tl.load(
-        state_batch_indices + offsets * state_batch_indices_stride,
-        mask=mask,
-        other=pad_slot_id,
-    )
-    valid = mask & (slots != pad_slot_id) & (slots >= 0) & (slots < num_states)
-    if RESET:
-        tl.store(ring_start + slots, 0, mask=valid)
-        tl.store(prev_num_accepted + slots, 0, mask=valid)
-        tl.store(prev_query_len + slots, 0, mask=valid)
-    else:
-        prev = tl.load(prev_num_accepted + slots, mask=valid, other=0)
-        start = tl.load(ring_start + slots, mask=valid, other=0)
-        must_checkpoint = prev + 1 > logical_window
-        next_start = tl.where(
-            must_checkpoint,
-            (start + prev) % ring_buffer_len,
-            start,
-        )
-        next_prev = tl.where(must_checkpoint, 1, prev + 1)
-        tl.store(ring_start + slots, next_start, mask=valid)
-        tl.store(prev_num_accepted + slots, next_prev, mask=valid)
-
-
-@triton.jit(
-    do_not_specialize=["n_slots", "state_batch_indices_stride"],
-    do_not_specialize_on_alignment=["state_batch_indices"],
-)
-def _commit_replayssm_ring_trackers_kernel(
-    ring_start,
-    prev_num_accepted,
-    prev_query_len,
-    state_batch_indices,
+@triton.jit(do_not_specialize=["num_reqs"])
+def _postprocess_replayssm_modelwide_kernel(
+    # Per-request step metadata.
+    idx_mapping,
+    query_metadata,
     num_accepted_tokens,
-    query_start_loc,
-    state_batch_indices_stride,
-    n_slots,
-    num_states,
-    logical_window: tl.constexpr,
-    ring_buffer_len: tl.constexpr,
-    pad_slot_id: tl.constexpr,
-    BLOCK: tl.constexpr,
+    is_prefilling,
+    live_cols,
+    materialize_src_cols,
+    materialize_dst_cols,
+    materialize_token_counts,
+    # Per-group address tables.
+    block_table_ptrs,
+    tracker_ring_start_ptrs,
+    tracker_num_committed_ptrs,
+    tracker_capacities,
+    group_layer_offsets,
+    # FlashInfer plan outputs.
+    src_slots,
+    dst_slots,
+    plan_ring_start,
+    plan_flush_count,
+    # Runtime sizes.
+    block_table_stride_req: tl.int64,
+    slot_table_stride_layer: tl.int64,
+    num_reqs,
+    # Compile-time model constants.
+    MAX_LAYERS_PER_GROUP: tl.constexpr,
+    LOGICAL_WINDOW: tl.constexpr,
+    RING_BUFFER_LEN: tl.constexpr,
+    PAD_SLOT_ID: tl.constexpr,
+    QUERY_IS_CUMULATIVE: tl.constexpr,
+    HAS_IDX_MAPPING: tl.constexpr,
 ) -> None:
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n_slots
-    slots = tl.load(
-        state_batch_indices + offsets * state_batch_indices_stride,
-        mask=mask,
-        other=pad_slot_id,
+    """Plan materialization and commit all ReplaySSM trackers in one launch.
+
+    One CTA owns one ``(batch row, cache group)`` pair, and is therefore the
+    only writer of that group's tracker for the request. Group zero writes the
+    request-level ``ring_start``/``flush_count`` snapshot shared by every layer;
+    every group fills the layer rows belonging to its physical slot namespace.
+    """
+    batch_idx = tl.program_id(0)
+    group_idx = tl.program_id(1)
+    active = batch_idx < num_reqs
+    req_idx = batch_idx
+    if HAS_IDX_MAPPING:
+        req_idx = tl.load(idx_mapping + batch_idx, mask=active, other=-1)
+    valid_req = active & (req_idx >= 0)
+
+    if group_idx == 0:
+        # Always overwrite the request decision, including padded rows, so a
+        # fixed-capacity FlashInfer call never observes stale work.
+        tl.store(plan_ring_start + batch_idx, 0)
+        tl.store(plan_flush_count + batch_idx, -1)
+
+    block_table = tl.load(block_table_ptrs + group_idx).to(tl.pointer_type(tl.int32))
+    tracker_start = tl.load(tracker_ring_start_ptrs + group_idx).to(
+        tl.pointer_type(tl.int32)
     )
-    valid = mask & (slots != pad_slot_id) & (slots >= 0) & (slots < num_states)
-    prev = tl.load(prev_num_accepted + slots, mask=valid, other=0)
-    start = tl.load(ring_start + slots, mask=valid, other=0)
-    previous_query_len = tl.load(prev_query_len + slots, mask=valid, other=0)
-    accepted = tl.load(num_accepted_tokens + offsets, mask=mask, other=0)
-    must_checkpoint = (previous_query_len > 0) & (
-        prev + previous_query_len > logical_window
+    tracker_committed = tl.load(tracker_num_committed_ptrs + group_idx).to(
+        tl.pointer_type(tl.int32)
     )
-    next_start = tl.where(
-        must_checkpoint,
-        (start + prev) % ring_buffer_len,
-        start,
+    tracker_capacity = tl.load(tracker_capacities + group_idx)
+
+    live_col = tl.load(live_cols + req_idx, mask=valid_req, other=-1)
+    valid_live_col = valid_req & (live_col >= 0)
+    live_slot = tl.load(
+        block_table + batch_idx * block_table_stride_req + live_col,
+        mask=valid_live_col,
+        other=PAD_SLOT_ID,
     )
-    next_prev = tl.where(
-        previous_query_len == 0,
-        0,
-        tl.where(must_checkpoint, accepted, prev + accepted),
+    valid_live = (
+        valid_live_col
+        & (live_slot != PAD_SLOT_ID)
+        & (live_slot >= 0)
+        & (live_slot < tracker_capacity)
     )
-    current_query_len = tl.load(
-        query_start_loc + offsets + 1, mask=mask, other=0
-    ) - tl.load(query_start_loc + offsets, mask=mask, other=0)
-    tl.store(ring_start + slots, next_start, mask=valid)
-    tl.store(prev_num_accepted + slots, next_prev, mask=valid)
-    tl.store(prev_query_len + slots, current_query_len, mask=valid)
+
+    src_col = tl.load(materialize_src_cols + batch_idx, mask=active, other=-1)
+    dst_col = tl.load(materialize_dst_cols + batch_idx, mask=active, other=-1)
+    wants_materialize = valid_req & (src_col >= 0) & (dst_col >= 0)
+    materialize_src_slot = tl.load(
+        block_table + batch_idx * block_table_stride_req + src_col,
+        mask=wants_materialize,
+        other=PAD_SLOT_ID,
+    )
+    materialize_dst_slot = tl.load(
+        block_table + batch_idx * block_table_stride_req + dst_col,
+        mask=wants_materialize,
+        other=PAD_SLOT_ID,
+    )
+    valid_materialize = (
+        wants_materialize
+        & (materialize_src_slot != PAD_SLOT_ID)
+        & (materialize_dst_slot != PAD_SLOT_ID)
+        & (materialize_src_slot >= 0)
+        & (materialize_dst_slot >= 0)
+        & (materialize_src_slot < tracker_capacity)
+        & (materialize_dst_slot < tracker_capacity)
+    )
+
+    # Fill every flattened layer row for this group. Invalid rows still receive
+    # the pad sentinel; request-level flush_count=-1 suppresses native writes.
+    layer_begin = tl.load(group_layer_offsets + group_idx)
+    layer_end = tl.load(group_layer_offsets + group_idx + 1)
+    for layer_offset in tl.static_range(0, MAX_LAYERS_PER_GROUP):
+        layer_idx = layer_begin + layer_offset
+        layer_valid = layer_idx < layer_end
+        table_offset = layer_idx * slot_table_stride_layer + batch_idx
+        tl.store(
+            src_slots + table_offset,
+            tl.where(valid_materialize, materialize_src_slot, PAD_SLOT_ID),
+            mask=layer_valid,
+        )
+        tl.store(
+            dst_slots + table_offset,
+            tl.where(valid_materialize, materialize_dst_slot, PAD_SLOT_ID),
+            mask=layer_valid,
+        )
+
+    prefilling = tl.load(is_prefilling + batch_idx, mask=active, other=1)
+    if valid_live:
+        if prefilling:
+            # Prefill wrote a new canonical state. No replay rows belong to it.
+            tl.store(tracker_start + live_slot, 0)
+            tl.store(tracker_committed + live_slot, 0)
+            if valid_materialize & (group_idx == 0):
+                # The prefill kernel already produced an exact canonical state;
+                # count zero asks FlashInfer to copy it byte-for-byte.
+                tl.store(plan_ring_start + batch_idx, 0)
+                tl.store(plan_flush_count + batch_idx, 0)
+        else:
+            old_start = tl.load(tracker_start + live_slot)
+            old_committed = tl.load(tracker_committed + live_slot)
+            if QUERY_IS_CUMULATIVE:
+                query_len = tl.load(query_metadata + batch_idx + 1) - tl.load(
+                    query_metadata + batch_idx
+                )
+            else:
+                query_len = tl.load(query_metadata + batch_idx)
+            accepted = tl.maximum(tl.load(num_accepted_tokens + req_idx), 1)
+            checkpointed = old_committed + query_len > LOGICAL_WINDOW
+            next_start = tl.where(
+                checkpointed,
+                (old_start + old_committed) % RING_BUFFER_LEN,
+                old_start,
+            )
+            next_committed = tl.where(checkpointed, accepted, old_committed + accepted)
+
+            if valid_materialize & (group_idx == 0):
+                boundary_count = tl.load(materialize_token_counts + batch_idx)
+                flush_count = next_committed - (accepted - boundary_count)
+                tl.store(plan_ring_start + batch_idx, next_start)
+                tl.store(plan_flush_count + batch_idx, flush_count)
+
+            tl.store(tracker_start + live_slot, next_start)
+            tl.store(tracker_committed + live_slot, next_committed)
+
+    if valid_materialize:
+        # The immutable plan above preserves any in-place transition for the
+        # materializer; subsequent forwards see a canonical empty replay.
+        tl.store(tracker_start + materialize_dst_slot, 0)
+        tl.store(tracker_committed + materialize_dst_slot, 0)
 
 
-def update_replayssm_ring_trackers(
-    ring_start: torch.Tensor,
-    prev_num_accepted: torch.Tensor,
-    prev_query_len: torch.Tensor,
-    state_batch_indices: torch.Tensor,
-    logical_window: int | None = None,
-    ring_buffer_len: int | None = None,
-    pad_slot_id: int = NULL_BLOCK_ID,
+@triton.jit(do_not_specialize=["num_reqs"])
+def _preprocess_replayssm_modelwide_kernel(
+    idx_mapping,
+    src_cols,
+    dst_cols,
+    block_table_ptrs,
+    tracker_ring_start_ptrs,
+    tracker_num_committed_ptrs,
+    tracker_capacities,
+    group_layer_offsets,
+    src_slots,
+    dst_slots,
+    plan_ring_start,
+    plan_flush_count,
+    block_table_stride_req: tl.int64,
+    slot_table_stride_layer: tl.int64,
+    num_reqs,
+    MAX_LAYERS_PER_GROUP: tl.constexpr,
+    PAD_SLOT_ID: tl.constexpr,
+    HAS_IDX_MAPPING: tl.constexpr,
 ) -> None:
-    """Reset selected trackers, or advance them when a window is provided."""
-    if state_batch_indices.dim() > 1:
-        state_batch_indices = state_batch_indices[:, 0]
-    n_slots = state_batch_indices.numel()
-    if n_slots == 0:
-        return
-    reset = logical_window is None
-    if reset:
-        logical_window = 0
-        ring_buffer_len = 1
-    else:
-        assert ring_buffer_len is not None
-    block = 128
-    _update_replayssm_ring_trackers_kernel[(triton.cdiv(n_slots, block),)](
-        ring_start,
-        prev_num_accepted,
-        prev_query_len,
-        state_batch_indices,
-        state_batch_indices.stride(0),
-        n_slots,
-        min(
-            ring_start.numel(),
-            prev_num_accepted.numel(),
-            prev_query_len.numel(),
-        ),
-        logical_window,
-        ring_buffer_len,
-        pad_slot_id,
-        RESET=reset,
-        BLOCK=block,
+    """Seed a new running slot from a canonical align source model-wide."""
+    batch_idx = tl.program_id(0)
+    group_idx = tl.program_id(1)
+    active = batch_idx < num_reqs
+    req_idx = batch_idx
+    if HAS_IDX_MAPPING:
+        req_idx = tl.load(idx_mapping + batch_idx, mask=active, other=-1)
+    valid_req = active & (req_idx >= 0)
+
+    if group_idx == 0:
+        tl.store(plan_ring_start + batch_idx, 0)
+        tl.store(plan_flush_count + batch_idx, -1)
+
+    block_table = tl.load(block_table_ptrs + group_idx).to(tl.pointer_type(tl.int32))
+    tracker_start = tl.load(tracker_ring_start_ptrs + group_idx).to(
+        tl.pointer_type(tl.int32)
     )
-
-
-def reset_replayssm_ring_trackers(
-    ring_start: torch.Tensor,
-    prev_num_accepted: torch.Tensor,
-    prev_query_len: torch.Tensor,
-    state_batch_indices: torch.Tensor,
-    pad_slot_id: int = NULL_BLOCK_ID,
-) -> None:
-    """Reset selected ReplaySSM ring trackers."""
-    update_replayssm_ring_trackers(
-        ring_start,
-        prev_num_accepted,
-        prev_query_len,
-        state_batch_indices,
-        pad_slot_id=pad_slot_id,
+    tracker_committed = tl.load(tracker_num_committed_ptrs + group_idx).to(
+        tl.pointer_type(tl.int32)
     )
-
-
-def commit_replayssm_ring_trackers(
-    ring_start: torch.Tensor,
-    prev_num_accepted: torch.Tensor,
-    prev_query_len: torch.Tensor,
-    state_batch_indices: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    logical_window: int,
-    ring_buffer_len: int,
-    pad_slot_id: int = NULL_BLOCK_ID,
-) -> None:
-    """Commit the preceding speculative window and record the current one."""
-    if state_batch_indices.dim() > 1:
-        state_batch_indices = state_batch_indices[:, 0]
-    n_slots = state_batch_indices.numel()
-    if n_slots == 0:
-        return
-    block = 128
-    _commit_replayssm_ring_trackers_kernel[(triton.cdiv(n_slots, block),)](
-        ring_start,
-        prev_num_accepted,
-        prev_query_len,
-        state_batch_indices,
-        num_accepted_tokens,
-        query_start_loc,
-        state_batch_indices.stride(0),
-        n_slots,
-        min(
-            ring_start.numel(),
-            prev_num_accepted.numel(),
-            prev_query_len.numel(),
-        ),
-        logical_window,
-        ring_buffer_len,
-        pad_slot_id,
-        BLOCK=block,
+    tracker_capacity = tl.load(tracker_capacities + group_idx)
+    src_col = tl.load(src_cols + req_idx, mask=valid_req, other=-1)
+    dst_col = tl.load(dst_cols + req_idx, mask=valid_req, other=-1)
+    wants_copy = valid_req & (src_col >= 0) & (dst_col >= 0) & (src_col != dst_col)
+    src_slot = tl.load(
+        block_table + batch_idx * block_table_stride_req + src_col,
+        mask=wants_copy,
+        other=PAD_SLOT_ID,
     )
+    dst_slot = tl.load(
+        block_table + batch_idx * block_table_stride_req + dst_col,
+        mask=wants_copy,
+        other=PAD_SLOT_ID,
+    )
+    valid = (
+        wants_copy
+        & (src_slot != PAD_SLOT_ID)
+        & (dst_slot != PAD_SLOT_ID)
+        & (src_slot >= 0)
+        & (dst_slot >= 0)
+        & (src_slot < tracker_capacity)
+        & (dst_slot < tracker_capacity)
+    )
+    if valid & (group_idx == 0):
+        # Align sources are made canonical by the preceding postprocess (or by
+        # the prefix-cache producer), so this is an exact state copy.
+        tl.store(plan_ring_start + batch_idx, 0)
+        tl.store(plan_flush_count + batch_idx, 0)
+
+    layer_begin = tl.load(group_layer_offsets + group_idx)
+    layer_end = tl.load(group_layer_offsets + group_idx + 1)
+    for layer_offset in tl.static_range(0, MAX_LAYERS_PER_GROUP):
+        layer_idx = layer_begin + layer_offset
+        layer_valid = layer_idx < layer_end
+        table_offset = layer_idx * slot_table_stride_layer + batch_idx
+        tl.store(
+            src_slots + table_offset,
+            tl.where(valid, src_slot, PAD_SLOT_ID),
+            mask=layer_valid,
+        )
+        tl.store(
+            dst_slots + table_offset,
+            tl.where(valid, dst_slot, PAD_SLOT_ID),
+            mask=layer_valid,
+        )
+
+    if valid:
+        # The new request must not inherit lifecycle metadata from a prior
+        # owner of the destination slot.
+        tl.store(tracker_start + dst_slot, 0)
+        tl.store(tracker_committed + dst_slot, 0)
+
+
+@dataclass
+class ReplaySSMModelContext:
+    """Persistent all-layer tables for ReplaySSM post-step maintenance."""
+
+    mixers: list[Any]
+    group_layer_offsets: torch.Tensor
+    block_table_ptrs: torch.Tensor
+    tracker_ring_start_ptrs: torch.Tensor
+    tracker_num_committed_ptrs: torch.Tensor
+    tracker_capacities: torch.Tensor
+    state_ptrs: torch.Tensor
+    state_slot_strides: torch.Tensor
+    x_cache_ptrs: torch.Tensor
+    x_cache_slot_strides: torch.Tensor
+    b_cache_ptrs: torch.Tensor
+    b_cache_slot_strides: torch.Tensor
+    dt_cache_ptrs: torch.Tensor
+    dt_cache_slot_strides: torch.Tensor
+    a_ptrs: torch.Tensor
+    scale_ptrs: torch.Tensor
+    scale_slot_strides: torch.Tensor
+    src_slots: torch.Tensor
+    dst_slots: torch.Tensor
+    plan_ring_start: torch.Tensor
+    plan_flush_count: torch.Tensor
+    precopy_src_slots: torch.Tensor
+    precopy_dst_slots: torch.Tensor
+    precopy_ring_start: torch.Tensor
+    precopy_flush_count: torch.Tensor
+    block_table_stride_req: int
+    max_num_reqs: int
+    num_groups: int
+    max_layers_per_group: int
+    logical_window: int
+    ring_buffer_len: int
+
+    @classmethod
+    def create(
+        cls,
+        kv_cache_config: KVCacheConfig,
+        mamba_group_ids: Sequence[int],
+        forward_context: Mapping[str, Any],
+        block_tables: Sequence[torch.Tensor],
+        max_num_reqs: int,
+    ) -> "ReplaySSMModelContext | None":
+        grouped = _flashinfer_replayssm_mixers_by_group(
+            kv_cache_config, mamba_group_ids, forward_context
+        )
+        if not grouped:
+            return None
+        if len(block_tables) != len(mamba_group_ids):
+            raise ValueError(
+                f"expected {len(mamba_group_ids)} Mamba block tables, "
+                f"got {len(block_tables)}"
+            )
+        block_table_by_gid = dict(zip(mamba_group_ids, block_tables))
+        replayssm_block_tables = [block_table_by_gid[gid] for gid, _ in grouped]
+
+        mixers = [mixer for _, group_mixers in grouped for mixer in group_mixers]
+        if not _replayssm_materialize_ready(mixers):
+            return None
+        first = mixers[0]
+        first_ssm = first.kv_cache[1]
+        first_x = first.kv_cache[2]
+        first_b = first.kv_cache[4]
+        compatibility = (
+            first_ssm.dtype,
+            first_x.dtype,
+            first.A.dtype,
+            first_ssm.size(1),
+            first_ssm.size(2),
+            first_ssm.size(3),
+            first_ssm.size(1) // first_b.size(1),
+            int(first.replayssm_buffer_len),
+            first_x.size(2),
+            bool(first.mamba_config.enable_stochastic_rounding),
+            int(first.mamba_config.stochastic_rounding_philox_rounds or 0),
+        )
+        for mixer in mixers[1:]:
+            ssm = mixer.kv_cache[1]
+            x_cache = mixer.kv_cache[2]
+            b_cache = mixer.kv_cache[4]
+            current = (
+                ssm.dtype,
+                x_cache.dtype,
+                mixer.A.dtype,
+                ssm.size(1),
+                ssm.size(2),
+                ssm.size(3),
+                ssm.size(1) // b_cache.size(1),
+                int(mixer.replayssm_buffer_len),
+                x_cache.size(2),
+                bool(mixer.mamba_config.enable_stochastic_rounding),
+                int(mixer.mamba_config.stochastic_rounding_philox_rounds or 0),
+            )
+            if current != compatibility:
+                raise ValueError(
+                    "A single model-wide FlashInfer ReplaySSM materialization "
+                    "launch requires identical layer specialization; got "
+                    f"{compatibility} and {current}"
+                )
+
+        device = first_ssm.device
+        group_offsets = [0]
+        for _, group_mixers in grouped:
+            group_offsets.append(group_offsets[-1] + len(group_mixers))
+        max_layers_per_group = max(
+            group_offsets[i + 1] - group_offsets[i]
+            for i in range(len(group_offsets) - 1)
+        )
+        tracker_owners = [group_mixers[0] for _, group_mixers in grouped]
+        strides = {int(block_table.stride(0)) for block_table in replayssm_block_tables}
+        if len(strides) != 1:
+            raise ValueError(
+                "model-wide ReplaySSM requires one block-table row stride; "
+                f"got {sorted(strides)}"
+            )
+
+        zero_table = torch.zeros(len(mixers), dtype=torch.int64, device=device)
+        return cls(
+            mixers=mixers,
+            group_layer_offsets=torch.tensor(
+                group_offsets, dtype=torch.int32, device=device
+            ),
+            block_table_ptrs=_cuda_i64_ptrs(replayssm_block_tables),
+            tracker_ring_start_ptrs=_cuda_i64_ptrs(
+                [m._replayssm_ring_start for m in tracker_owners]
+            ),
+            tracker_num_committed_ptrs=_cuda_i64_ptrs(
+                [m._replayssm_prev_num_accepted for m in tracker_owners]
+            ),
+            tracker_capacities=torch.tensor(
+                [m._replayssm_ring_start.numel() for m in tracker_owners],
+                dtype=torch.int32,
+                device=device,
+            ),
+            state_ptrs=_cuda_i64_ptrs([m.kv_cache[1] for m in mixers]),
+            state_slot_strides=_cuda_i64_slot_strides([m.kv_cache[1] for m in mixers]),
+            x_cache_ptrs=_cuda_i64_ptrs([m.kv_cache[2] for m in mixers]),
+            x_cache_slot_strides=_cuda_i64_slot_strides(
+                [m.kv_cache[2] for m in mixers]
+            ),
+            b_cache_ptrs=_cuda_i64_ptrs([m.kv_cache[4] for m in mixers]),
+            b_cache_slot_strides=_cuda_i64_slot_strides(
+                [m.kv_cache[4] for m in mixers]
+            ),
+            dt_cache_ptrs=_cuda_i64_ptrs([m.kv_cache[3] for m in mixers]),
+            dt_cache_slot_strides=_cuda_i64_slot_strides(
+                [m.kv_cache[3] for m in mixers]
+            ),
+            a_ptrs=_cuda_i64_ptrs([m.A for m in mixers]),
+            scale_ptrs=zero_table,
+            scale_slot_strides=zero_table.clone(),
+            src_slots=torch.full(
+                (len(mixers), max_num_reqs),
+                NULL_BLOCK_ID,
+                dtype=torch.int32,
+                device=device,
+            ),
+            dst_slots=torch.full(
+                (len(mixers), max_num_reqs),
+                NULL_BLOCK_ID,
+                dtype=torch.int32,
+                device=device,
+            ),
+            plan_ring_start=torch.zeros(max_num_reqs, dtype=torch.int32, device=device),
+            plan_flush_count=torch.full(
+                (max_num_reqs,), -1, dtype=torch.int32, device=device
+            ),
+            precopy_src_slots=torch.full(
+                (len(mixers), max_num_reqs),
+                NULL_BLOCK_ID,
+                dtype=torch.int32,
+                device=device,
+            ),
+            precopy_dst_slots=torch.full(
+                (len(mixers), max_num_reqs),
+                NULL_BLOCK_ID,
+                dtype=torch.int32,
+                device=device,
+            ),
+            precopy_ring_start=torch.zeros(
+                max_num_reqs, dtype=torch.int32, device=device
+            ),
+            precopy_flush_count=torch.full(
+                (max_num_reqs,), -1, dtype=torch.int32, device=device
+            ),
+            block_table_stride_req=next(iter(strides)),
+            max_num_reqs=max_num_reqs,
+            num_groups=len(grouped),
+            max_layers_per_group=max_layers_per_group,
+            logical_window=int(first.replayssm_buffer_len),
+            ring_buffer_len=first_x.size(2),
+        )
+
+    def postprocess_and_materialize(
+        self,
+        *,
+        idx_mapping: torch.Tensor | None,
+        query_metadata: torch.Tensor,
+        query_is_cumulative: bool,
+        num_accepted_tokens: torch.Tensor,
+        is_prefilling: torch.Tensor,
+        live_cols: torch.Tensor,
+        materialize_src_cols: torch.Tensor,
+        materialize_dst_cols: torch.Tensor,
+        materialize_token_counts: torch.Tensor,
+        num_reqs: int,
+    ) -> None:
+        """Commit lifecycle metadata, then materialize all layers once."""
+        if num_reqs == 0:
+            return
+        _postprocess_replayssm_modelwide_kernel[(self.max_num_reqs, self.num_groups)](
+            idx_mapping,
+            query_metadata,
+            num_accepted_tokens,
+            is_prefilling,
+            live_cols,
+            materialize_src_cols,
+            materialize_dst_cols,
+            materialize_token_counts,
+            self.block_table_ptrs,
+            self.tracker_ring_start_ptrs,
+            self.tracker_num_committed_ptrs,
+            self.tracker_capacities,
+            self.group_layer_offsets,
+            self.src_slots,
+            self.dst_slots,
+            self.plan_ring_start,
+            self.plan_flush_count,
+            self.block_table_stride_req,
+            self.src_slots.stride(0),
+            num_reqs,
+            MAX_LAYERS_PER_GROUP=self.max_layers_per_group,
+            LOGICAL_WINDOW=self.logical_window,
+            RING_BUFFER_LEN=self.ring_buffer_len,
+            PAD_SLOT_ID=NULL_BLOCK_ID,
+            QUERY_IS_CUMULATIVE=query_is_cumulative,
+            HAS_IDX_MAPPING=idx_mapping is not None,
+        )
+
+        self._materialize_planned(
+            self.src_slots,
+            self.dst_slots,
+            self.plan_ring_start,
+            self.plan_flush_count,
+        )
+
+    def preprocess_and_materialize(
+        self,
+        *,
+        idx_mapping: torch.Tensor | None,
+        src_cols: torch.Tensor,
+        dst_cols: torch.Tensor,
+        num_reqs: int,
+    ) -> None:
+        """Seed new running slots from canonical align sources once."""
+        if num_reqs == 0:
+            return
+        _preprocess_replayssm_modelwide_kernel[(self.max_num_reqs, self.num_groups)](
+            idx_mapping,
+            src_cols,
+            dst_cols,
+            self.block_table_ptrs,
+            self.tracker_ring_start_ptrs,
+            self.tracker_num_committed_ptrs,
+            self.tracker_capacities,
+            self.group_layer_offsets,
+            self.precopy_src_slots,
+            self.precopy_dst_slots,
+            self.precopy_ring_start,
+            self.precopy_flush_count,
+            self.block_table_stride_req,
+            self.precopy_src_slots.stride(0),
+            num_reqs,
+            MAX_LAYERS_PER_GROUP=self.max_layers_per_group,
+            PAD_SLOT_ID=NULL_BLOCK_ID,
+            HAS_IDX_MAPPING=idx_mapping is not None,
+        )
+        self._materialize_planned(
+            self.precopy_src_slots,
+            self.precopy_dst_slots,
+            self.precopy_ring_start,
+            self.precopy_flush_count,
+        )
+
+    def _materialize_planned(
+        self,
+        src_slots: torch.Tensor,
+        dst_slots: torch.Tensor,
+        ring_start: torch.Tensor,
+        flush_count: torch.Tensor,
+    ) -> None:
+        first = self.mixers[0]
+        mamba_config = first.mamba_config
+        rand_seed = None
+        philox_rounds = 0
+        if mamba_config.enable_stochastic_rounding:
+            rand_seed = torch.randint(
+                0, 2**32, (1,), device=src_slots.device, dtype=torch.int64
+            )
+            philox_rounds = mamba_config.stochastic_rounding_philox_rounds or 10
+        _load_replayssm_materialize()(
+            self.state_ptrs,
+            self.state_slot_strides,
+            self.x_cache_ptrs,
+            self.x_cache_slot_strides,
+            self.b_cache_ptrs,
+            self.b_cache_slot_strides,
+            self.dt_cache_ptrs,
+            self.dt_cache_slot_strides,
+            self.a_ptrs,
+            self.scale_ptrs,
+            self.scale_slot_strides,
+            src_slots,
+            dst_slots,
+            ring_start,
+            flush_count,
+            state_dtype=first.kv_cache[1].dtype,
+            input_dtype=first.kv_cache[2].dtype,
+            matrixA_dtype=first.A.dtype,
+            dim=first.kv_cache[1].size(2),
+            dstate=first.kv_cache[1].size(3),
+            num_heads=first.kv_cache[1].size(1),
+            heads_per_group=(first.kv_cache[1].size(1) // first.kv_cache[4].size(1)),
+            max_window=self.logical_window,
+            ring_buffer_len=self.ring_buffer_len,
+            rand_seed=rand_seed,
+            philox_rounds=philox_rounds,
+        )
 
 
 class MambaSSUBackend(ABC):
@@ -487,22 +885,19 @@ def selective_state_update_replayssm_flashinfer(
     dt_cache: torch.Tensor,
     ring_start: torch.Tensor,
     prev_num_accepted_tokens: torch.Tensor,
-    prev_query_len: torch.Tensor,
-    logical_window: int,
     D: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     dt_softplus: bool = False,
     state_batch_indices: torch.Tensor | None = None,
     null_block_id: int = NULL_BLOCK_ID,
     scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-    update_trackers: bool = True,
     enable_stochastic_rounding: bool = False,
     stochastic_rounding_philox_rounds: int = 0,
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: int | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
-    """Run FlashInfer checkpointing SSU and optionally advance shared trackers."""
+    """Run FlashInfer checkpointing SSU with model-owned tracker metadata."""
     if _flashinfer_replayssm_kernel is None:
         raise RuntimeError(
             "FlashInfer ReplaySSM has not been initialized. "
@@ -530,7 +925,7 @@ def selective_state_update_replayssm_flashinfer(
         if enable_stochastic_rounding
         else None
     )
-    result = _flashinfer_replayssm_kernel(
+    return _flashinfer_replayssm_kernel(
         state,
         x_cache,
         B_cache,
@@ -557,17 +952,6 @@ def selective_state_update_replayssm_flashinfer(
         cumAdt_vec=cumAdt_vec,
         cb_old=cb_old,
     )
-    if update_trackers and indices is not None:
-        update_replayssm_ring_trackers(
-            ring_start,
-            prev_num_accepted_tokens,
-            prev_query_len,
-            indices,
-            logical_window=logical_window,
-            ring_buffer_len=x_cache.size(2),
-            pad_slot_id=null_block_id,
-        )
-    return result
 
 
 def _reinterpret_u64_as_i64(value: int) -> int:
@@ -631,249 +1015,6 @@ def _load_replayssm_materialize() -> Callable[..., None]:
     return replayssm_materialize
 
 
-def materialize_replayssm_prefix(
-    kv_cache_config: KVCacheConfig,
-    mamba_group_ids: Sequence[int],
-    forward_context: Mapping[str, Any],
-    req_ids: Sequence[str],
-    requests: Mapping[str, Any],
-    src_cols: Sequence[int],
-    dst_cols: Sequence[int],
-    num_reqs: int,
-) -> None:
-    """Materialize FlashInfer ReplaySSM SSM state for V1 align column copies.
-
-    Writes the exact checkpoint in-place on the hashed source slot, then
-    resets source and running-slot trackers. Convolution copy is left to
-    the caller.
-
-    The caller must invoke this only for FlashInfer ReplaySSM when STP
-    copies across a block column.
-    """
-    grouped = _flashinfer_replayssm_mixers_by_group(
-        kv_cache_config, mamba_group_ids, forward_context
-    )
-    if not grouped:
-        raise RuntimeError(
-            "materialize_replayssm_prefix requires FlashInfer ReplaySSM mixers"
-        )
-
-    replayssm_materialize = _load_replayssm_materialize()
-    batch_req_ids = req_ids[:num_reqs]
-    for gid, mixers in grouped:
-        _materialize_replayssm_prefix_group(
-            mixers,
-            gid,
-            batch_req_ids,
-            requests,
-            src_cols,
-            dst_cols,
-            num_reqs,
-            replayssm_materialize,
-        )
-
-
-def _materialize_replayssm_prefix_group(
-    mixers: list[Any],
-    gid: int,
-    req_ids: Sequence[str],
-    requests: Mapping[str, Any],
-    src_cols: Sequence[int],
-    dst_cols: Sequence[int],
-    num_reqs: int,
-    replayssm_materialize: Callable[..., None],
-) -> None:
-    if not _replayssm_materialize_ready(mixers):
-        return
-    src_phys = [0] * num_reqs
-    dst_phys = [0] * num_reqs
-    for i, req_id in enumerate(req_ids):
-        src_col = src_cols[i]
-        if src_col < 0:
-            continue
-        block_ids = requests[req_id].block_ids[gid]
-        src_phys[i] = int(block_ids[src_col])
-        dst_phys[i] = int(block_ids[dst_cols[i]])
-
-    device = mixers[0].kv_cache[1].device
-    src_row = torch.tensor(src_phys, dtype=torch.int32, device=device)
-    dst_row = torch.tensor(dst_phys, dtype=torch.int32, device=device)
-    copied = torch.tensor(
-        [col >= 0 for col in src_cols[:num_reqs]],
-        dtype=torch.bool,
-        device=device,
-    )
-    src_clamped = src_row.clamp(min=0, max=mixers[0]._replayssm_ring_start.numel() - 1)
-    flush_count = torch.where(
-        copied,
-        mixers[0]._replayssm_prev_num_accepted[src_clamped],
-        torch.tensor(-1, dtype=torch.int32, device=device),
-    )
-    _launch_replayssm_materialize(
-        mixers, src_row, src_row, flush_count, replayssm_materialize
-    )
-    reset_replayssm_ring_trackers(
-        mixers[0]._replayssm_ring_start,
-        mixers[0]._replayssm_prev_num_accepted,
-        mixers[0]._replayssm_prev_query_len,
-        src_row[copied],
-    )
-    reset_replayssm_ring_trackers(
-        mixers[0]._replayssm_ring_start,
-        mixers[0]._replayssm_prev_num_accepted,
-        mixers[0]._replayssm_prev_query_len,
-        dst_row[copied],
-    )
-
-
-def materialize_replayssm_prefix_gpu(
-    kv_cache_config: KVCacheConfig,
-    mamba_group_ids: Sequence[int],
-    forward_context: Mapping[str, Any],
-    block_tables: Sequence[torch.Tensor],
-    src_col_gpu: torch.Tensor,
-    dst_col_gpu: torch.Tensor,
-    idx_mapping: torch.Tensor,
-    num_reqs: int,
-) -> None:
-    """V2 align materialize: gather physical slots from GPU block tables.
-
-    ``src_col_gpu`` / ``dst_col_gpu`` are request-state order. ``block_tables``
-    and ``idx_mapping`` are batch order. Writes the hashed source slot
-    in-place (``src_col != dst_col``), then resets source and running
-    trackers. Convolution copy is left to the caller.
-    """
-    grouped = _flashinfer_replayssm_mixers_by_group(
-        kv_cache_config, mamba_group_ids, forward_context
-    )
-    if not grouped:
-        raise RuntimeError(
-            "materialize_replayssm_prefix_gpu requires FlashInfer ReplaySSM mixers"
-        )
-
-    replayssm_materialize = _load_replayssm_materialize()
-    req_idx = idx_mapping[:num_reqs]
-    valid_req = req_idx >= 0
-    req_clamped = req_idx.clamp(min=0)
-    src_col = src_col_gpu[req_clamped]
-    dst_col = dst_col_gpu[req_clamped]
-    copied = valid_req & (src_col >= 0) & (src_col != dst_col)
-    batch = torch.arange(num_reqs, device=src_col.device, dtype=torch.int64)
-    for gid, mixers in grouped:
-        if not _replayssm_materialize_ready(mixers):
-            continue
-        block_table = block_tables[gid]
-        max_col = block_table.size(1) - 1
-        src_row = block_table[batch, src_col.clamp(min=0, max=max_col)]
-        dst_row = block_table[batch, dst_col.clamp(min=0, max=max_col)]
-        src_clamped = src_row.clamp(
-            min=0, max=mixers[0]._replayssm_ring_start.numel() - 1
-        )
-        flush_count = torch.where(
-            copied,
-            mixers[0]._replayssm_prev_num_accepted[src_clamped],
-            torch.tensor(-1, dtype=torch.int32, device=src_row.device),
-        )
-        _launch_replayssm_materialize(
-            mixers,
-            src_row.to(dtype=torch.int32),
-            src_row.to(dtype=torch.int32),
-            flush_count,
-            replayssm_materialize,
-        )
-        reset_replayssm_ring_trackers(
-            mixers[0]._replayssm_ring_start,
-            mixers[0]._replayssm_prev_num_accepted,
-            mixers[0]._replayssm_prev_query_len,
-            src_row[copied],
-        )
-        reset_replayssm_ring_trackers(
-            mixers[0]._replayssm_ring_start,
-            mixers[0]._replayssm_prev_num_accepted,
-            mixers[0]._replayssm_prev_query_len,
-            dst_row[copied],
-        )
-
-
-def materialize_replayssm_prefix_mtp_gpu(
-    kv_cache_config: KVCacheConfig,
-    mamba_group_ids: Sequence[int],
-    forward_context: Mapping[str, Any],
-    block_tables: Sequence[torch.Tensor],
-    src_cols: torch.Tensor,
-    dst_cols: torch.Tensor,
-    token_counts: torch.Tensor,
-    num_reqs: int,
-) -> None:
-    """Materialize committed MTP state into block-aligned prefix slots."""
-    grouped = _flashinfer_replayssm_mixers_by_group(
-        kv_cache_config, mamba_group_ids, forward_context
-    )
-    if not grouped:
-        return
-
-    replayssm_materialize = _load_replayssm_materialize()
-    src_col = src_cols[:num_reqs]
-    dst_col = dst_cols[:num_reqs]
-    copied = src_col >= 0
-    batch = torch.arange(num_reqs, device=src_col.device, dtype=torch.int64)
-    for gid, mixers in grouped:
-        if not _replayssm_materialize_ready(mixers):
-            continue
-        block_table = block_tables[gid]
-        max_col = block_table.size(1) - 1
-        src_row = block_table[batch, src_col.clamp(min=0, max=max_col)]
-        dst_row = block_table[batch, dst_col.clamp(min=0, max=max_col)]
-        src_clamped = src_row.clamp(
-            min=0, max=mixers[0]._replayssm_ring_start.numel() - 1
-        )
-        prev_count = mixers[0]._replayssm_prev_num_accepted[src_clamped]
-        query_count = mixers[0]._replayssm_prev_query_len[src_clamped]
-        boundary_count = token_counts[:num_reqs]
-        is_spec_decode = query_count > 0
-        # Spec-decode trackers describe the history before the current query.
-        # When that query forced a checkpoint, the source state already includes
-        # the old history and the current query starts after it in the ring.
-        checkpointed = (
-            copied
-            & is_spec_decode
-            & (prev_count + query_count > mixers[0].replayssm_buffer_len)
-        )
-
-        ring_start = mixers[0]._replayssm_ring_start[src_clamped]
-        ring_start = torch.where(
-            checkpointed,
-            (ring_start + prev_count) % mixers[0].kv_cache[2].size(2),
-            ring_start,
-        )
-        flush_count = torch.where(
-            is_spec_decode,
-            torch.where(checkpointed, boundary_count, prev_count + boundary_count),
-            # STP advances its tracker after the forward call, so prev_count
-            # already includes the current token.
-            prev_count,
-        )
-        flush_count = torch.where(
-            copied,
-            flush_count,
-            torch.tensor(-1, dtype=torch.int32, device=src_row.device),
-        )
-        _launch_replayssm_materialize(
-            mixers,
-            src_row.to(dtype=torch.int32),
-            dst_row.to(dtype=torch.int32),
-            flush_count,
-            replayssm_materialize,
-            ring_start=ring_start,
-        )
-        reset_replayssm_ring_trackers(
-            mixers[0]._replayssm_ring_start,
-            mixers[0]._replayssm_prev_num_accepted,
-            mixers[0]._replayssm_prev_query_len,
-            dst_row[copied],
-        )
-
-
 def _replayssm_materialize_ready(mixers: list[Any]) -> bool:
     """False only before the caches are allocated; raises on a bad cache.
 
@@ -903,70 +1044,6 @@ def _replayssm_materialize_ready(mixers: list[Any]) -> bool:
             "--replayssm-buffer-len >= 1"
         )
     return True
-
-
-def _launch_replayssm_materialize(
-    mixers: list[Any],
-    src_row: torch.Tensor,
-    dst_row: torch.Tensor,
-    flush_count: torch.Tensor,
-    replayssm_materialize: Callable[..., None],
-    *,
-    ring_start: torch.Tensor | None = None,
-) -> None:
-    ssm = mixers[0].kv_cache[1]
-    x_cache = mixers[0].kv_cache[2]
-    ring_start_full = mixers[0]._replayssm_ring_start
-
-    slot_hi = ring_start_full.numel() - 1
-    src_clamped = src_row.clamp(min=0, max=slot_hi)
-    if ring_start is None:
-        ring_start = ring_start_full[src_clamped]
-    num_layers = len(mixers)
-    src_slots = src_row.unsqueeze(0).expand(num_layers, -1).contiguous()
-    dst_slots = dst_row.unsqueeze(0).expand(num_layers, -1).contiguous()
-
-    states = [m.kv_cache[1] for m in mixers]
-    x_caches = [m.kv_cache[2] for m in mixers]
-    dt_caches = [m.kv_cache[3] for m in mixers]
-    b_caches = [m.kv_cache[4] for m in mixers]
-    a_weights = [m.A for m in mixers]
-    zero_table = torch.zeros(num_layers, dtype=torch.int64, device=ssm.device)
-    mamba_config = mixers[0].mamba_config
-    rand_seed = None
-    philox_rounds = 0
-    if mamba_config.enable_stochastic_rounding:
-        rand_seed = torch.randint(0, 2**32, (1,), device=ssm.device, dtype=torch.int64)
-        philox_rounds = mamba_config.stochastic_rounding_philox_rounds or 10
-
-    replayssm_materialize(
-        _cuda_i64_ptrs(states),
-        _cuda_i64_slot_strides(states),
-        _cuda_i64_ptrs(x_caches),
-        _cuda_i64_slot_strides(x_caches),
-        _cuda_i64_ptrs(b_caches),
-        _cuda_i64_slot_strides(b_caches),
-        _cuda_i64_ptrs(dt_caches),
-        _cuda_i64_slot_strides(dt_caches),
-        _cuda_i64_ptrs(a_weights),
-        zero_table,
-        zero_table,
-        src_slots,
-        dst_slots,
-        ring_start,
-        flush_count,
-        state_dtype=ssm.dtype,
-        input_dtype=x_cache.dtype,
-        matrixA_dtype=mixers[0].A.dtype,
-        dim=ssm.size(2),
-        dstate=ssm.size(3),
-        num_heads=ssm.size(1),
-        heads_per_group=ssm.size(1) // b_caches[0].size(1),
-        max_window=int(mixers[0].replayssm_buffer_len),
-        ring_buffer_len=x_cache.size(2),
-        rand_seed=rand_seed,
-        philox_rounds=philox_rounds,
-    )
 
 
 def initialize_mamba_ssu_backend(

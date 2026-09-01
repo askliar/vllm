@@ -1496,6 +1496,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
+        is_prefilling: torch.Tensor | None = None,
     ) -> None:
         # Update the number of computed tokens.
         if self.is_last_pp_rank:
@@ -1517,7 +1518,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self.model_state.postprocess_state(
-            idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
+            idx_mapping,
+            num_sampled,
+            self.req_states.num_computed_tokens.gpu,
+            query_start_loc,
+            is_prefilling,
         )
 
     def _merge_ec_connector_no_forward(

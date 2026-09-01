@@ -38,6 +38,7 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheConfig
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
+from vllm.config.mamba import MambaBackendEnum
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -1068,8 +1069,8 @@ class GPUModelRunner(
 
     def _get_mamba_bufs(self) -> mamba_utils.MambaBuffers:
         # Only reachable on the ``mamba_cache_mode == "align"`` path.
-        # The postprocess sub-object is additionally gated on spec
-        # decode + hybrid model.
+        # The postprocess sub-object is also the model-level owner of
+        # FlashInfer ReplaySSM trackers, including STP.
         assert self.cache_config.mamba_cache_mode == "align"
         if self._mamba_bufs is None:
             self._mamba_bufs = mamba_utils.MambaBuffers.create(
@@ -1080,6 +1081,11 @@ class GPUModelRunner(
                 device=self.device,
                 with_postprocess_align=(
                     self.speculative_config is not None and self.model_config.is_hybrid
+                )
+                or (
+                    self.cache_config.use_replayssm
+                    and self.vllm_config.mamba_config.backend
+                    == MambaBackendEnum.FLASHINFER
                 ),
             )
         return self._mamba_bufs
@@ -1588,7 +1594,14 @@ class GPUModelRunner(
         each sequence, and a shifting is done during the next iteration
         based on the number of accepted tokens.
         """
-        if not self.speculative_config or not self.model_config.is_hybrid:
+        modelwide_replayssm = (
+            self.cache_config.mamba_cache_mode == "align"
+            and self.cache_config.use_replayssm
+            and self.vllm_config.mamba_config.backend == MambaBackendEnum.FLASHINFER
+        )
+        if not modelwide_replayssm and (
+            not self.speculative_config or not self.model_config.is_hybrid
+        ):
             return
 
         # Count the number of accepted tokens for each sequence.
@@ -1615,8 +1628,8 @@ class GPUModelRunner(
                 mamba_state_copy_funcs=self._get_mamba_state_copy_funcs(),
             )
 
-            assert self.num_accepted_tokens_event is not None
-            self.num_accepted_tokens_event.record()
+            if self.num_accepted_tokens_event is not None:
+                self.num_accepted_tokens_event.record()
         else:
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
@@ -4430,11 +4443,9 @@ class GPUModelRunner(
                 )
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
-                # Stage per-request inputs for the fused postprocess kernel
-                # only when that kernel will actually run. The kernel is
-                # gated on spec-decode + hybrid (see MambaBuffers.create);
-                # without it, ``mamba_bufs.postprocess_align`` is None and
-                # the staging buffers don't exist.
+                # Stage inputs only when the fused postprocess will run. This
+                # includes spec-decode hybrid models and model-owned
+                # FlashInfer ReplaySSM lifecycle maintenance under STP.
                 if mamba_bufs.postprocess_align is not None:
                     mamba_utils.stage_postprocess_inputs_to_gpu(
                         mamba_bufs.postprocess_align,
