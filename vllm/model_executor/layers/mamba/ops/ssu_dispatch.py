@@ -10,9 +10,10 @@ the backend defaults to 'cpu'.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from functools import cache
 from inspect import signature
+from typing import Any
 
 import torch
 
@@ -567,6 +568,405 @@ def selective_state_update_replayssm_flashinfer(
             pad_slot_id=null_block_id,
         )
     return result
+
+
+def _reinterpret_u64_as_i64(value: int) -> int:
+    """Preserve a uint64 pointer bit pattern in a torch.int64 tensor."""
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
+def _cuda_i64_ptrs(tensors: list[torch.Tensor]) -> torch.Tensor:
+    return torch.tensor(
+        [_reinterpret_u64_as_i64(t.data_ptr()) for t in tensors],
+        dtype=torch.int64,
+        device=tensors[0].device,
+    )
+
+
+def _cuda_i64_slot_strides(tensors: list[torch.Tensor]) -> torch.Tensor:
+    return torch.tensor(
+        [t.stride(0) for t in tensors],
+        dtype=torch.int64,
+        device=tensors[0].device,
+    )
+
+
+def _flashinfer_replayssm_mixers_by_group(
+    kv_cache_config: KVCacheConfig,
+    mamba_group_ids: Sequence[int],
+    forward_context: Mapping[str, Any],
+) -> list[tuple[int, list[Any]]]:
+    grouped: list[tuple[int, list[Any]]] = []
+    for gid in mamba_group_ids:
+        mixers: list[Any] = []
+        for layer_name in kv_cache_config.kv_cache_groups[gid].layer_names:
+            layer = forward_context.get(layer_name)
+            if layer is None:
+                continue
+            kv_cache = getattr(layer, "kv_cache", ())
+            mamba_config = getattr(layer, "mamba_config", None)
+            backend = getattr(mamba_config, "backend", None)
+            if (
+                getattr(layer, "use_replayssm", False)
+                and backend == MambaBackendEnum.FLASHINFER
+                and len(kv_cache) >= 5
+            ):
+                mixers.append(layer)
+        if mixers:
+            grouped.append((gid, mixers))
+    return grouped
+
+
+@cache
+def _load_replayssm_materialize() -> Callable[..., None]:
+    try:
+        from flashinfer.mamba.replayssm_materialize import (
+            replayssm_materialize,
+        )
+    except ImportError as e:
+        raise ImportError(
+            "FlashInfer ReplaySSM prefix caching requires "
+            "flashinfer.mamba.replayssm_materialize"
+        ) from e
+    return replayssm_materialize
+
+
+def materialize_replayssm_prefix(
+    kv_cache_config: KVCacheConfig,
+    mamba_group_ids: Sequence[int],
+    forward_context: Mapping[str, Any],
+    req_ids: Sequence[str],
+    requests: Mapping[str, Any],
+    src_cols: Sequence[int],
+    dst_cols: Sequence[int],
+    num_reqs: int,
+) -> None:
+    """Materialize FlashInfer ReplaySSM SSM state for V1 align column copies.
+
+    Writes the exact checkpoint in-place on the hashed source slot, then
+    resets source and running-slot trackers. Convolution copy is left to
+    the caller.
+
+    The caller must invoke this only for FlashInfer ReplaySSM when STP
+    copies across a block column.
+    """
+    grouped = _flashinfer_replayssm_mixers_by_group(
+        kv_cache_config, mamba_group_ids, forward_context
+    )
+    if not grouped:
+        raise RuntimeError(
+            "materialize_replayssm_prefix requires FlashInfer ReplaySSM mixers"
+        )
+
+    replayssm_materialize = _load_replayssm_materialize()
+    batch_req_ids = req_ids[:num_reqs]
+    for gid, mixers in grouped:
+        _materialize_replayssm_prefix_group(
+            mixers,
+            gid,
+            batch_req_ids,
+            requests,
+            src_cols,
+            dst_cols,
+            num_reqs,
+            replayssm_materialize,
+        )
+
+
+def _materialize_replayssm_prefix_group(
+    mixers: list[Any],
+    gid: int,
+    req_ids: Sequence[str],
+    requests: Mapping[str, Any],
+    src_cols: Sequence[int],
+    dst_cols: Sequence[int],
+    num_reqs: int,
+    replayssm_materialize: Callable[..., None],
+) -> None:
+    if not _replayssm_materialize_ready(mixers):
+        return
+    src_phys = [0] * num_reqs
+    dst_phys = [0] * num_reqs
+    for i, req_id in enumerate(req_ids):
+        src_col = src_cols[i]
+        if src_col < 0:
+            continue
+        block_ids = requests[req_id].block_ids[gid]
+        src_phys[i] = int(block_ids[src_col])
+        dst_phys[i] = int(block_ids[dst_cols[i]])
+
+    device = mixers[0].kv_cache[1].device
+    src_row = torch.tensor(src_phys, dtype=torch.int32, device=device)
+    dst_row = torch.tensor(dst_phys, dtype=torch.int32, device=device)
+    copied = torch.tensor(
+        [col >= 0 for col in src_cols[:num_reqs]],
+        dtype=torch.bool,
+        device=device,
+    )
+    src_clamped = src_row.clamp(min=0, max=mixers[0]._replayssm_ring_start.numel() - 1)
+    flush_count = torch.where(
+        copied,
+        mixers[0]._replayssm_prev_num_accepted[src_clamped],
+        torch.tensor(-1, dtype=torch.int32, device=device),
+    )
+    _launch_replayssm_materialize(
+        mixers, src_row, src_row, flush_count, replayssm_materialize
+    )
+    reset_replayssm_ring_trackers(
+        mixers[0]._replayssm_ring_start,
+        mixers[0]._replayssm_prev_num_accepted,
+        mixers[0]._replayssm_prev_query_len,
+        src_row[copied],
+    )
+    reset_replayssm_ring_trackers(
+        mixers[0]._replayssm_ring_start,
+        mixers[0]._replayssm_prev_num_accepted,
+        mixers[0]._replayssm_prev_query_len,
+        dst_row[copied],
+    )
+
+
+def materialize_replayssm_prefix_gpu(
+    kv_cache_config: KVCacheConfig,
+    mamba_group_ids: Sequence[int],
+    forward_context: Mapping[str, Any],
+    block_tables: Sequence[torch.Tensor],
+    src_col_gpu: torch.Tensor,
+    dst_col_gpu: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    num_reqs: int,
+) -> None:
+    """V2 align materialize: gather physical slots from GPU block tables.
+
+    ``src_col_gpu`` / ``dst_col_gpu`` are request-state order. ``block_tables``
+    and ``idx_mapping`` are batch order. Writes the hashed source slot
+    in-place (``src_col != dst_col``), then resets source and running
+    trackers. Convolution copy is left to the caller.
+    """
+    grouped = _flashinfer_replayssm_mixers_by_group(
+        kv_cache_config, mamba_group_ids, forward_context
+    )
+    if not grouped:
+        raise RuntimeError(
+            "materialize_replayssm_prefix_gpu requires FlashInfer ReplaySSM mixers"
+        )
+
+    replayssm_materialize = _load_replayssm_materialize()
+    req_idx = idx_mapping[:num_reqs]
+    valid_req = req_idx >= 0
+    req_clamped = req_idx.clamp(min=0)
+    src_col = src_col_gpu[req_clamped]
+    dst_col = dst_col_gpu[req_clamped]
+    copied = valid_req & (src_col >= 0) & (src_col != dst_col)
+    batch = torch.arange(num_reqs, device=src_col.device, dtype=torch.int64)
+    for gid, mixers in grouped:
+        if not _replayssm_materialize_ready(mixers):
+            continue
+        block_table = block_tables[gid]
+        max_col = block_table.size(1) - 1
+        src_row = block_table[batch, src_col.clamp(min=0, max=max_col)]
+        dst_row = block_table[batch, dst_col.clamp(min=0, max=max_col)]
+        src_clamped = src_row.clamp(
+            min=0, max=mixers[0]._replayssm_ring_start.numel() - 1
+        )
+        flush_count = torch.where(
+            copied,
+            mixers[0]._replayssm_prev_num_accepted[src_clamped],
+            torch.tensor(-1, dtype=torch.int32, device=src_row.device),
+        )
+        _launch_replayssm_materialize(
+            mixers,
+            src_row.to(dtype=torch.int32),
+            src_row.to(dtype=torch.int32),
+            flush_count,
+            replayssm_materialize,
+        )
+        reset_replayssm_ring_trackers(
+            mixers[0]._replayssm_ring_start,
+            mixers[0]._replayssm_prev_num_accepted,
+            mixers[0]._replayssm_prev_query_len,
+            src_row[copied],
+        )
+        reset_replayssm_ring_trackers(
+            mixers[0]._replayssm_ring_start,
+            mixers[0]._replayssm_prev_num_accepted,
+            mixers[0]._replayssm_prev_query_len,
+            dst_row[copied],
+        )
+
+
+def materialize_replayssm_prefix_mtp_gpu(
+    kv_cache_config: KVCacheConfig,
+    mamba_group_ids: Sequence[int],
+    forward_context: Mapping[str, Any],
+    block_tables: Sequence[torch.Tensor],
+    src_cols: torch.Tensor,
+    dst_cols: torch.Tensor,
+    token_counts: torch.Tensor,
+    num_reqs: int,
+) -> None:
+    """Materialize committed MTP state into block-aligned prefix slots."""
+    grouped = _flashinfer_replayssm_mixers_by_group(
+        kv_cache_config, mamba_group_ids, forward_context
+    )
+    if not grouped:
+        return
+
+    replayssm_materialize = _load_replayssm_materialize()
+    src_col = src_cols[:num_reqs]
+    dst_col = dst_cols[:num_reqs]
+    copied = src_col >= 0
+    batch = torch.arange(num_reqs, device=src_col.device, dtype=torch.int64)
+    for gid, mixers in grouped:
+        if not _replayssm_materialize_ready(mixers):
+            continue
+        block_table = block_tables[gid]
+        max_col = block_table.size(1) - 1
+        src_row = block_table[batch, src_col.clamp(min=0, max=max_col)]
+        dst_row = block_table[batch, dst_col.clamp(min=0, max=max_col)]
+        src_clamped = src_row.clamp(
+            min=0, max=mixers[0]._replayssm_ring_start.numel() - 1
+        )
+        prev_count = mixers[0]._replayssm_prev_num_accepted[src_clamped]
+        query_count = mixers[0]._replayssm_prev_query_len[src_clamped]
+        boundary_count = token_counts[:num_reqs]
+        is_spec_decode = query_count > 0
+        # Spec-decode trackers describe the history before the current query.
+        # When that query forced a checkpoint, the source state already includes
+        # the old history and the current query starts after it in the ring.
+        checkpointed = (
+            copied
+            & is_spec_decode
+            & (prev_count + query_count > mixers[0].replayssm_buffer_len)
+        )
+
+        ring_start = mixers[0]._replayssm_ring_start[src_clamped]
+        ring_start = torch.where(
+            checkpointed,
+            (ring_start + prev_count) % mixers[0].kv_cache[2].size(2),
+            ring_start,
+        )
+        flush_count = torch.where(
+            is_spec_decode,
+            torch.where(checkpointed, boundary_count, prev_count + boundary_count),
+            # STP advances its tracker after the forward call, so prev_count
+            # already includes the current token.
+            prev_count,
+        )
+        flush_count = torch.where(
+            copied,
+            flush_count,
+            torch.tensor(-1, dtype=torch.int32, device=src_row.device),
+        )
+        _launch_replayssm_materialize(
+            mixers,
+            src_row.to(dtype=torch.int32),
+            dst_row.to(dtype=torch.int32),
+            flush_count,
+            replayssm_materialize,
+            ring_start=ring_start,
+        )
+        reset_replayssm_ring_trackers(
+            mixers[0]._replayssm_ring_start,
+            mixers[0]._replayssm_prev_num_accepted,
+            mixers[0]._replayssm_prev_query_len,
+            dst_row[copied],
+        )
+
+
+def _replayssm_materialize_ready(mixers: list[Any]) -> bool:
+    """False only before the caches are allocated; raises on a bad cache.
+
+    A skip here is not free: ``state_skip_postprocess`` has already told the
+    fused postprocess kernel not to copy this temporal state, so silently
+    doing nothing would leave the destination block holding stale SSM state.
+    The empty-cache case (profiling and other pre-allocation runs) is the one
+    legitimate no-op; anything else is a misconfiguration and must be loud.
+    """
+    ssm = mixers[0].kv_cache[1]
+    x_cache = mixers[0].kv_cache[2]
+    if ssm.numel() == 0:
+        return False
+    if not ssm.is_cuda:
+        raise RuntimeError(
+            "FlashInfer ReplaySSM prefix materialization requires a CUDA SSM "
+            f"state cache; got device {ssm.device}"
+        )
+    if x_cache.numel() == 0 or mixers[0]._replayssm_ring_start.numel() == 0:
+        raise RuntimeError(
+            "FlashInfer ReplaySSM prefix materialization requires allocated "
+            "replay ring buffers and ring trackers"
+        )
+    if not mixers[0].replayssm_buffer_len:
+        raise RuntimeError(
+            "FlashInfer ReplaySSM prefix materialization requires "
+            "--replayssm-buffer-len >= 1"
+        )
+    return True
+
+
+def _launch_replayssm_materialize(
+    mixers: list[Any],
+    src_row: torch.Tensor,
+    dst_row: torch.Tensor,
+    flush_count: torch.Tensor,
+    replayssm_materialize: Callable[..., None],
+    *,
+    ring_start: torch.Tensor | None = None,
+) -> None:
+    ssm = mixers[0].kv_cache[1]
+    x_cache = mixers[0].kv_cache[2]
+    ring_start_full = mixers[0]._replayssm_ring_start
+
+    slot_hi = ring_start_full.numel() - 1
+    src_clamped = src_row.clamp(min=0, max=slot_hi)
+    if ring_start is None:
+        ring_start = ring_start_full[src_clamped]
+    num_layers = len(mixers)
+    src_slots = src_row.unsqueeze(0).expand(num_layers, -1).contiguous()
+    dst_slots = dst_row.unsqueeze(0).expand(num_layers, -1).contiguous()
+
+    states = [m.kv_cache[1] for m in mixers]
+    x_caches = [m.kv_cache[2] for m in mixers]
+    dt_caches = [m.kv_cache[3] for m in mixers]
+    b_caches = [m.kv_cache[4] for m in mixers]
+    a_weights = [m.A for m in mixers]
+    zero_table = torch.zeros(num_layers, dtype=torch.int64, device=ssm.device)
+    mamba_config = mixers[0].mamba_config
+    rand_seed = None
+    philox_rounds = 0
+    if mamba_config.enable_stochastic_rounding:
+        rand_seed = torch.randint(0, 2**32, (1,), device=ssm.device, dtype=torch.int64)
+        philox_rounds = mamba_config.stochastic_rounding_philox_rounds or 10
+
+    replayssm_materialize(
+        _cuda_i64_ptrs(states),
+        _cuda_i64_slot_strides(states),
+        _cuda_i64_ptrs(x_caches),
+        _cuda_i64_slot_strides(x_caches),
+        _cuda_i64_ptrs(b_caches),
+        _cuda_i64_slot_strides(b_caches),
+        _cuda_i64_ptrs(dt_caches),
+        _cuda_i64_slot_strides(dt_caches),
+        _cuda_i64_ptrs(a_weights),
+        zero_table,
+        zero_table,
+        src_slots,
+        dst_slots,
+        ring_start,
+        flush_count,
+        state_dtype=ssm.dtype,
+        input_dtype=x_cache.dtype,
+        matrixA_dtype=mixers[0].A.dtype,
+        dim=ssm.size(2),
+        dstate=ssm.size(3),
+        num_heads=ssm.size(1),
+        heads_per_group=ssm.size(1) // b_caches[0].size(1),
+        max_window=int(mixers[0].replayssm_buffer_len),
+        ring_buffer_len=x_cache.size(2),
+        rand_seed=rand_seed,
+        philox_rounds=philox_rounds,
+    )
 
 
 def initialize_mamba_ssu_backend(

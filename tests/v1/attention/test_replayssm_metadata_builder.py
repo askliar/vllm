@@ -200,17 +200,17 @@ def _make_mamba_spec(
         if mamba_backend == MambaBackendEnum.FLASHINFER
         else 0
     )
-    shapes = (
-        (1, 1),
-        (1, 1, 1),
+    replayssm_shapes = (
         (1, ring_buffer_len, 1),
         (1, ring_buffer_len),
         (1, ring_buffer_len, 1),
     )
     return MambaSpec(
         block_size=BLOCK_SIZE,
-        shapes=shapes,
-        dtypes=(torch.float32,),
+        shapes=((1, 1), (1, 1, 1)),
+        dtypes=(torch.float32,) * 2,
+        replayssm_shapes=replayssm_shapes,
+        replayssm_dtypes=(torch.float32,) * 3,
     )
 
 
@@ -243,17 +243,13 @@ def _create_replayssm_builder(
     )
 
 
-def _build(
-    builder: MockMambaBuilder,
-    case: ReplaySSMBuildCase,
-    num_accepted_tokens: torch.Tensor | None = None,
-):
+def _build(builder: MockMambaBuilder, case: ReplaySSMBuildCase):
     batch = BatchSpec(seq_lens=case.seq_lens, query_lens=case.query_lens)
     common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
         is_prefilling=torch.tensor(case.is_prefilling, dtype=torch.bool),
         replayssm_decode_base_cpu=torch.tensor(case.decode_base, dtype=torch.int32),
     )
-    return builder.build(0, common, num_accepted_tokens=num_accepted_tokens)
+    return builder.build(0, common)
 
 
 @pytest.mark.parametrize(
@@ -338,3 +334,23 @@ def test_flashinfer_replayssm_state_indices_are_stable_for_full_cudagraph():
     assert second_indices is not None
     assert second_indices.data_ptr() == first_ptr
     assert torch.equal(second_indices, second.state_indices_tensor_d[:, 0])
+
+
+def test_flashinfer_replayssm_scratch_metadata_fresh_decode():
+    checkpointing_ssu = pytest.importorskip("flashinfer.mamba.checkpointing_ssu")
+    if not hasattr(checkpointing_ssu, "allocate_checkpointing_ssu_scratch"):
+        pytest.skip("FlashInfer does not expose ReplaySSM scratch allocation")
+
+    builder = _create_replayssm_builder(16, mamba_backend=MambaBackendEnum.FLASHINFER)
+    case = REPLAYSSM_BUILD_CASES["fresh_decode"]
+    meta = _build(builder, case)
+
+    assert meta.write_pos_d is None
+    assert meta.is_flush_d is None
+    assert meta.bc_pre_scratch is None
+    assert meta.replayssm_scratch is not None
+    assert [tensor.shape for tensor in meta.replayssm_scratch] == [
+        (1, 1, 32, 8),
+        (1, 1, 16),
+        (1, 1, 32, 8),
+    ]

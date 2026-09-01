@@ -245,6 +245,7 @@ from .utils import (
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
     allocate_kv_cache,
+    allocate_replayssm_caches,
     bind_kv_cache,
     copy_kv_cache_blocks_inplace,
     prepare_kernel_block_sizes,
@@ -7420,6 +7421,7 @@ class GPUModelRunner(
                 self.cache_config.get_resolved_kv_cache_layout(),
                 kernel_block_sizes,
             )
+            replayssm_caches = allocate_replayssm_caches(kv_cache_config, self.device)
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -7435,6 +7437,7 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
             kv_cache_groups=kv_cache_config.kv_cache_groups,
+            replayssm_caches=replayssm_caches,
         )
         return kv_caches
 
