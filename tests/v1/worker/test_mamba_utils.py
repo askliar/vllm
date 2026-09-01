@@ -170,14 +170,16 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
 
 
 @pytest.mark.parametrize(
-    ("with_replayssm", "expected_order"),
+    ("with_replayssm", "num_computed_tokens", "expected_order"),
     [
-        pytest.param(True, ["materialize", "copy"], id="replayssm"),
-        pytest.param(False, ["copy"], id="generic"),
+        pytest.param(True, 4, ["materialize", "copy"], id="replayssm-boundary"),
+        pytest.param(True, 3, ["copy"], id="replayssm-no-boundary"),
+        pytest.param(False, 4, ["copy"], id="generic"),
     ],
 )
 def test_preprocess_mamba_uses_modelwide_materializer_when_present(
     with_replayssm: bool,
+    num_computed_tokens: int,
     expected_order: list[str],
 ):
     spec = MagicMock(block_size=4, num_speculative_blocks=0)
@@ -186,7 +188,7 @@ def test_preprocess_mamba_uses_modelwide_materializer_when_present(
     input_batch.req_ids = ["r0"]
     input_batch.num_accepted_tokens_cpu = np.array([1], dtype=np.int32)
     copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
-    requests = {"r0": MagicMock(num_computed_tokens=4)}
+    requests = {"r0": MagicMock(num_computed_tokens=num_computed_tokens)}
     mamba_state_idx: dict[str, int] = {"r0": 0}
     sched = _make_scheduler_output(set(), None, set())
     sched.num_scheduled_tokens = {"r0": 1}
@@ -239,6 +241,7 @@ def test_postprocess_mamba_align_materializes_after_fused_copy(monkeypatch):
     ctx.replayssm.postprocess_and_materialize.side_effect = lambda **kwargs: (
         order.append("materialize")
     )
+    ctx.replayssm_materialize_possible = False
 
     block_table = MagicMock()
     block_table.get_device_tensor.return_value = torch.zeros((1, 4), dtype=torch.int32)
@@ -260,6 +263,12 @@ def test_postprocess_mamba_align_materializes_after_fused_copy(monkeypatch):
     )
 
     assert order == ["copy", "materialize"]
+    assert (
+        ctx.replayssm.postprocess_and_materialize.call_args.kwargs[
+            "materialize_possible"
+        ]
+        is False
+    )
     assert accepted_cpu.tolist() == [3]
 
 
@@ -797,6 +806,7 @@ def _make_staging_ctx(max_num_reqs: int, device: torch.device) -> MagicMock:
     """Build a MambaSpecDecodeGPUContext stand-in exposing only the five
     per-request staging buffers touched by stage_postprocess_inputs_to_gpu."""
     ctx = MagicMock()
+    ctx.block_size = 16
     ctx.mamba_state_idx_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
     ctx.num_scheduled_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
     ctx.num_computed_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
@@ -884,6 +894,35 @@ def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
         ctx.is_prefilling_buf.gpu[:num_reqs],
         torch.tensor([True, False, True]),
     )
+    assert ctx.replayssm_materialize_possible is True
+
+
+def test_stage_postprocess_inputs_skips_impossible_materialization():
+    device = torch.device("cpu")
+    ctx = _make_staging_ctx(max_num_reqs=4, device=device)
+    req_ids = ["req_a"]
+    scheduler_output = _make_postprocess_scheduler_output(
+        req_ids=req_ids,
+        num_scheduled_tokens={"req_a": 1},
+        scheduled_spec_decode_tokens={"req_a": [1, 2]},
+    )
+    requests = _make_requests(
+        req_ids=req_ids,
+        num_computed_tokens=[8],
+        block_ids_per_req=[[0]],
+        num_prompt_tokens=[8],
+    )
+
+    stage_postprocess_inputs_to_gpu(
+        ctx,
+        scheduler_output,
+        req_ids,
+        1,
+        requests,
+        {"req_a": 0},
+    )
+
+    assert ctx.replayssm_materialize_possible is False
 
 
 def test_stage_postprocess_inputs_to_gpu_asserts_on_missing_state_idx():

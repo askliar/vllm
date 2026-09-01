@@ -875,6 +875,10 @@ class MambaSpecDecodeGPUContext:
     # Persistent all-layer ReplaySSM descriptors, populated with the cache
     # addresses on first real forward. None for non-FlashInfer configurations.
     replayssm: ReplaySSMModelContext | None = None
+    # Host-side upper bound computed while staging the current batch. False
+    # means no acceptance outcome can cross an align boundary, so the native
+    # materializer launch can be skipped after tracker maintenance.
+    replayssm_materialize_possible: bool = False
 
     @classmethod
     def create(
@@ -1621,7 +1625,7 @@ def preprocess_mamba(
         fused.state_idx.copy_to_gpu(num_reqs)
         fused.src_col.copy_to_gpu(num_reqs)
         fused.token_bias.copy_to_gpu(num_reqs)
-        if fused.ctx.replayssm is not None:
+        if fused.ctx.replayssm is not None and any(col >= 0 for col in src_cols):
             fused.ctx.replayssm.preprocess_and_materialize(
                 idx_mapping=None,
                 src_cols=fused.src_col.gpu,
@@ -1745,6 +1749,7 @@ def postprocess_mamba_align_gpu(
             materialize_dst_cols=ctx.materialize_dst_cols,
             materialize_token_counts=ctx.materialize_token_counts,
             num_reqs=num_reqs,
+            materialize_possible=ctx.replayssm_materialize_possible,
         )
 
     # ``num_accepted_tokens_out`` is pre-initialized from
@@ -1788,6 +1793,7 @@ def stage_postprocess_inputs_to_gpu(
     computed_np = ctx.num_computed_tokens_buf.np
     draft_np = ctx.num_draft_tokens_buf.np
     prefill_np = ctx.is_prefilling_buf.np
+    materialize_possible = False
 
     for i in range(num_reqs):
         req_id = req_ids[i]
@@ -1797,12 +1803,28 @@ def stage_postprocess_inputs_to_gpu(
             "preprocess_mamba must run before stage_postprocess_inputs_to_gpu"
         )
         state_idx_np[i] = state_idx
-        scheduled_np[i] = num_scheduled[req_id]
-        computed_np[i] = requests[req_id].num_computed_tokens
-        draft_np[i] = len(scheduled_spec_tokens.get(req_id, []))
+        scheduled = num_scheduled[req_id]
+        computed = requests[req_id].num_computed_tokens
+        num_draft = len(scheduled_spec_tokens.get(req_id, []))
+        scheduled_np[i] = scheduled
+        computed_np[i] = computed
+        draft_np[i] = num_draft
         prefill_np[i] = (
             requests[req_id].num_computed_tokens < requests[req_id].num_prompt_tokens
         )
+
+        # The actual accepted length is only known on GPU after sampling, but
+        # it cannot exceed one target token plus every scheduled draft. Skip
+        # the native model-wide launch only when even that upper bound cannot
+        # reach the next aligned checkpoint.
+        running_state_tokens = computed + scheduled - num_draft
+        max_new_computed = running_state_tokens + num_draft
+        aligned_max_new_computed = (
+            max_new_computed // ctx.block_size
+        ) * ctx.block_size
+        materialize_possible |= aligned_max_new_computed >= running_state_tokens
+
+    ctx.replayssm_materialize_possible = materialize_possible
 
     ctx.mamba_state_idx_buf.copy_to_gpu(num_reqs)
     ctx.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)

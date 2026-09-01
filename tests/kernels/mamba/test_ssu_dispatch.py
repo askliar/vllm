@@ -548,10 +548,11 @@ def test_modelwide_replayssm_postprocess_resets_prefill_slot(monkeypatch):
         materialize_dst_cols=torch.zeros(2, dtype=torch.int32, device="cuda"),
         materialize_token_counts=torch.zeros(2, dtype=torch.int32, device="cuda"),
         num_reqs=1,
+        materialize_possible=False,
     )
     torch.cuda.synchronize()
 
-    assert kernel.call_count == 1
+    assert kernel.call_count == 0
     assert ctx.plan_flush_count.tolist() == [-1, -1]
     for mixers, source_slot in zip(groups, (1, 4)):
         assert mixers[0]._replayssm_ring_start[source_slot].item() == 0

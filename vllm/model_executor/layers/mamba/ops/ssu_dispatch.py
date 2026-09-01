@@ -495,6 +495,7 @@ class ReplaySSMModelContext:
         materialize_dst_cols: torch.Tensor,
         materialize_token_counts: torch.Tensor,
         num_reqs: int,
+        materialize_possible: bool = True,
     ) -> None:
         """Commit lifecycle metadata, then materialize all layers once."""
         if num_reqs == 0:
@@ -528,12 +529,13 @@ class ReplaySSMModelContext:
             HAS_IDX_MAPPING=idx_mapping is not None,
         )
 
-        self._materialize_planned(
-            self.src_slots,
-            self.dst_slots,
-            self.plan_ring_start,
-            self.plan_flush_count,
-        )
+        if materialize_possible:
+            self._materialize_planned(
+                self.src_slots,
+                self.dst_slots,
+                self.plan_ring_start,
+                self.plan_flush_count,
+            )
 
     def preprocess_and_materialize(
         self,
