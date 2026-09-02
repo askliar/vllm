@@ -248,9 +248,8 @@ def _copy_reassigned_replayssm_slots_kernel(
         mask=wants_copy,
         other=PAD_SLOT_ID,
     )
-    valid = (
+    valid_mapping = (
         wants_copy
-        & (src_slot != dst_slot)
         & (src_slot != PAD_SLOT_ID)
         & (dst_slot != PAD_SLOT_ID)
         & (src_slot >= 0)
@@ -258,10 +257,13 @@ def _copy_reassigned_replayssm_slots_kernel(
         & (src_slot < tracker_capacity)
         & (dst_slot < tracker_capacity)
     )
-    if valid & (group_idx == 0):
+    needs_copy = valid_mapping & (src_slot != dst_slot)
+    if valid_mapping & (group_idx == 0):
         # Snapshot the source cursor before resetting the distinct destination.
         # The materializer uses it to copy the exact live state, including any
-        # committed replay rows that have not reached a prefix boundary.
+        # committed replay rows that have not reached a prefix boundary. The
+        # logical migration activates the shared plan even when group 0 aliases;
+        # every group independently suppresses unchanged physical slots below.
         tl.store(plan_ring_start + batch_idx, tl.load(tracker_start + src_slot))
         tl.store(
             plan_flush_count + batch_idx,
@@ -276,16 +278,16 @@ def _copy_reassigned_replayssm_slots_kernel(
         table_offset = layer_idx * slot_table_stride_layer + batch_idx
         tl.store(
             src_slots + table_offset,
-            tl.where(valid, src_slot, PAD_SLOT_ID),
+            tl.where(needs_copy, src_slot, PAD_SLOT_ID),
             mask=layer_valid,
         )
         tl.store(
             dst_slots + table_offset,
-            tl.where(valid, dst_slot, PAD_SLOT_ID),
+            tl.where(needs_copy, dst_slot, PAD_SLOT_ID),
             mask=layer_valid,
         )
 
-    if valid:
+    if needs_copy:
         # The reassigned destination must not inherit its prior owner's cursor.
         tl.store(tracker_start + dst_slot, 0)
         tl.store(tracker_committed + dst_slot, 0)
