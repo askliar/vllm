@@ -235,7 +235,7 @@ class MambaHybridModelState(DefaultModelState):
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
         )
         if ctx.replayssm is not None:
-            ctx.replayssm.preprocess_and_materialize(
+            ctx.replayssm.copy_reassigned_slots(
                 idx_mapping=input_batch.idx_mapping,
                 src_cols=self._mamba_src_col_gpu,
                 dst_cols=self._mamba_state_idx_gpu,

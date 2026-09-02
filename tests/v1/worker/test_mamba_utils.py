@@ -201,7 +201,7 @@ def test_preprocess_mamba_uses_modelwide_materializer_when_present(
     align_ctx.precopy_token_bias_buf = _MockCpuGpuBuffer(1, torch.int32, device)
     align_ctx.replayssm = MagicMock() if with_replayssm else None
     if align_ctx.replayssm is not None:
-        align_ctx.replayssm.preprocess_and_materialize.side_effect = lambda **kwargs: (
+        align_ctx.replayssm.copy_reassigned_slots.side_effect = lambda **kwargs: (
             order.append("materialize")
         )
     align_ctx.run_fused_precopy.side_effect = lambda **kwargs: order.append("copy")

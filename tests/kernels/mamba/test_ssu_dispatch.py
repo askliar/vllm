@@ -560,8 +560,11 @@ def test_modelwide_replayssm_postprocess_resets_prefill_slot(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-def test_modelwide_replayssm_precopy_seeds_canonical_source_once(monkeypatch):
+def test_modelwide_replayssm_copies_reassigned_live_slot_once(monkeypatch):
     groups, config, forward_context, block_tables = _modelwide_replayssm_fixture()
+    for mixers, source_slot in zip(groups, (1, 4)):
+        mixers[0]._replayssm_ring_start[source_slot] = 2
+        mixers[0]._replayssm_prev_num_accepted[source_slot] = 4
     kernel = Mock()
     monkeypatch.setattr(ssu_dispatch, "_load_replayssm_materialize", lambda: kernel)
 
@@ -573,7 +576,7 @@ def test_modelwide_replayssm_precopy_seeds_canonical_source_once(monkeypatch):
         max_num_reqs=2,
     )
     assert ctx is not None
-    ctx.preprocess_and_materialize(
+    ctx.copy_reassigned_slots(
         idx_mapping=torch.tensor([0], dtype=torch.int32, device="cuda"),
         src_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
         dst_cols=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
@@ -582,12 +585,48 @@ def test_modelwide_replayssm_precopy_seeds_canonical_source_once(monkeypatch):
     torch.cuda.synchronize()
 
     assert kernel.call_count == 1
-    assert ctx.precopy_ring_start.tolist() == [0, 0]
-    assert ctx.precopy_flush_count.tolist() == [0, -1]
+    assert ctx.precopy_ring_start.tolist() == [2, 0]
+    assert ctx.precopy_flush_count.tolist() == [4, -1]
     assert ctx.precopy_src_slots[:, 0].tolist() == [1, 1, 4, 4]
     assert ctx.precopy_dst_slots[:, 0].tolist() == [2, 2, 5, 5]
     for mixers, source_slot, destination_slot in zip(groups, (1, 4), (2, 5)):
-        # The source belongs to the prefix cache; pre-copy does not mutate its
-        # ownership metadata. Postprocess guarantees it is canonical in real use.
-        assert mixers[0]._replayssm_prev_num_accepted[source_slot].item() == 0
+        assert mixers[0]._replayssm_ring_start[source_slot].item() == 2
+        assert mixers[0]._replayssm_prev_num_accepted[source_slot].item() == 4
+        assert mixers[0]._replayssm_ring_start[destination_slot].item() == 0
         assert mixers[0]._replayssm_prev_num_accepted[destination_slot].item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_modelwide_replayssm_skips_unchanged_physical_slot(monkeypatch):
+    groups, config, forward_context, block_tables = _modelwide_replayssm_fixture()
+    for block_table in block_tables:
+        block_table[0, 1] = block_table[0, 0]
+    for mixers, source_slot in zip(groups, (1, 4)):
+        mixers[0]._replayssm_ring_start[source_slot] = 2
+        mixers[0]._replayssm_prev_num_accepted[source_slot] = 4
+    kernel = Mock()
+    monkeypatch.setattr(ssu_dispatch, "_load_replayssm_materialize", lambda: kernel)
+
+    ctx = ReplaySSMModelContext.create(
+        config,
+        [0, 1],
+        forward_context,
+        block_tables,
+        max_num_reqs=2,
+    )
+    assert ctx is not None
+    ctx.copy_reassigned_slots(
+        idx_mapping=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        src_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
+        dst_cols=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
+        num_reqs=1,
+    )
+    torch.cuda.synchronize()
+
+    assert kernel.call_count == 1
+    assert ctx.precopy_flush_count.tolist() == [-1, -1]
+    assert ctx.precopy_src_slots[:, 0].tolist() == [NULL_BLOCK_ID] * 4
+    assert ctx.precopy_dst_slots[:, 0].tolist() == [NULL_BLOCK_ID] * 4
+    for mixers, source_slot in zip(groups, (1, 4)):
+        assert mixers[0]._replayssm_ring_start[source_slot].item() == 2
+        assert mixers[0]._replayssm_prev_num_accepted[source_slot].item() == 4

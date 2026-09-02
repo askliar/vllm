@@ -194,7 +194,7 @@ def _postprocess_replayssm_modelwide_kernel(
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
-def _preprocess_replayssm_modelwide_kernel(
+def _copy_reassigned_replayssm_slots_kernel(
     idx_mapping,
     src_cols,
     dst_cols,
@@ -214,7 +214,7 @@ def _preprocess_replayssm_modelwide_kernel(
     PAD_SLOT_ID: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr,
 ) -> None:
-    """Seed a new running slot from a canonical align source model-wide."""
+    """Plan an exact copy when align reassigns a request's writable slot."""
     batch_idx = tl.program_id(0)
     group_idx = tl.program_id(1)
     active = batch_idx < num_reqs
@@ -250,6 +250,7 @@ def _preprocess_replayssm_modelwide_kernel(
     )
     valid = (
         wants_copy
+        & (src_slot != dst_slot)
         & (src_slot != PAD_SLOT_ID)
         & (dst_slot != PAD_SLOT_ID)
         & (src_slot >= 0)
@@ -258,10 +259,14 @@ def _preprocess_replayssm_modelwide_kernel(
         & (dst_slot < tracker_capacity)
     )
     if valid & (group_idx == 0):
-        # Align sources are made canonical by the preceding postprocess (or by
-        # the prefix-cache producer), so this is an exact state copy.
-        tl.store(plan_ring_start + batch_idx, 0)
-        tl.store(plan_flush_count + batch_idx, 0)
+        # Snapshot the source cursor before resetting the distinct destination.
+        # The materializer uses it to copy the exact live state, including any
+        # committed replay rows that have not reached a prefix boundary.
+        tl.store(plan_ring_start + batch_idx, tl.load(tracker_start + src_slot))
+        tl.store(
+            plan_flush_count + batch_idx,
+            tl.load(tracker_committed + src_slot),
+        )
 
     layer_begin = tl.load(group_layer_offsets + group_idx)
     layer_end = tl.load(group_layer_offsets + group_idx + 1)
@@ -281,8 +286,7 @@ def _preprocess_replayssm_modelwide_kernel(
         )
 
     if valid:
-        # The new request must not inherit lifecycle metadata from a prior
-        # owner of the destination slot.
+        # The reassigned destination must not inherit its prior owner's cursor.
         tl.store(tracker_start + dst_slot, 0)
         tl.store(tracker_committed + dst_slot, 0)
 
@@ -537,7 +541,7 @@ class ReplaySSMModelContext:
                 self.plan_flush_count,
             )
 
-    def preprocess_and_materialize(
+    def copy_reassigned_slots(
         self,
         *,
         idx_mapping: torch.Tensor | None,
@@ -545,10 +549,12 @@ class ReplaySSMModelContext:
         dst_cols: torch.Tensor,
         num_reqs: int,
     ) -> None:
-        """Seed new running slots from canonical align sources once."""
+        """Copy exact live state when align assigns a new writable slot."""
         if num_reqs == 0:
             return
-        _preprocess_replayssm_modelwide_kernel[(self.max_num_reqs, self.num_groups)](
+        _copy_reassigned_replayssm_slots_kernel[
+            (self.max_num_reqs, self.num_groups)
+        ](
             idx_mapping,
             src_cols,
             dst_cols,

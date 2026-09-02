@@ -1626,7 +1626,7 @@ def preprocess_mamba(
         fused.src_col.copy_to_gpu(num_reqs)
         fused.token_bias.copy_to_gpu(num_reqs)
         if fused.ctx.replayssm is not None and any(col >= 0 for col in src_cols):
-            fused.ctx.replayssm.preprocess_and_materialize(
+            fused.ctx.replayssm.copy_reassigned_slots(
                 idx_mapping=None,
                 src_cols=fused.src_col.gpu,
                 dst_cols=fused.state_idx.gpu,
