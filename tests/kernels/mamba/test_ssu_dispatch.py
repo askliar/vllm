@@ -571,14 +571,14 @@ def test_modelwide_replayssm_postprocess_commits_checkpoint_boundary(monkeypatch
     )
     assert ctx is not None
     ctx.postprocess(
-        idx_mapping=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        idx_mapping=torch.tensor([1], dtype=torch.int32, device="cuda"),
         query_metadata=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
         query_metadata_is_cumulative=True,
-        num_computed_tokens=torch.tensor([4, 0], dtype=torch.int32, device="cuda"),
+        num_computed_tokens=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
         num_computed_is_post_step=True,
-        num_accepted_tokens=torch.tensor([3, 1], dtype=torch.int32, device="cuda"),
+        num_accepted_tokens=torch.tensor([1, 3], dtype=torch.int32, device="cuda"),
         is_prefilling=torch.tensor([False, False], device="cuda"),
-        live_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
+        live_cols=torch.tensor([-1, 0], dtype=torch.int32, device="cuda"),
         materialize_src_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
         materialize_dst_cols=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
         materialize_token_counts=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),

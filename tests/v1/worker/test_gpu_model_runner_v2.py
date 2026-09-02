@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from vllm.model_executor.models.diffusion_gemma import DiffusionGemmaModelState
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -17,6 +18,16 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+def test_diffusion_gemma_postprocess_accepts_model_state_protocol():
+    state = object.__new__(DiffusionGemmaModelState)
+
+    state.postprocess_state(
+        torch.empty(0, dtype=torch.int64),
+        torch.empty(0, dtype=torch.int32),
+        defer_after_drafting=True,
+    )
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):

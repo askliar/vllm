@@ -382,6 +382,7 @@ class MambaHybridModelState(DefaultModelState):
         num_computed_tokens: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
         is_prefilling: torch.Tensor | None = None,
+        defer_after_drafting: bool = False,
     ) -> None:
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
@@ -430,52 +431,106 @@ class MambaHybridModelState(DefaultModelState):
                 idx_mapping,
             )
 
-        if self._use_flashinfer_replayssm:
-            if num_computed_tokens is None:
-                raise RuntimeError(
-                    "ReplaySSM postprocess requires the post-step computed-token "
-                    "counts from the forward that produced this acceptance"
-                )
-            if query_start_loc is None:
-                raise RuntimeError(
-                    "ReplaySSM postprocess requires the query_start_loc from "
-                    "the forward that produced this acceptance"
-                )
-            ctx = self._mamba_ctx
-            if ctx is None or not ctx.is_initialized:
-                raise RuntimeError(
-                    "ReplaySSM postprocess context was not initialized before forward"
-                )
-            replayssm = ctx.replayssm
-            assert replayssm is not None
-            if is_prefilling is None:
-                is_prefilling = self._is_prefilling_gpu[:num_reqs]
-            replayssm.postprocess(
-                idx_mapping=idx_mapping,
-                query_metadata=query_start_loc,
-                query_metadata_is_cumulative=True,
-                num_computed_tokens=num_computed_tokens,
-                num_computed_is_post_step=True,
-                # Prefix migration can reset the live buffer to one for the
-                # next step; use its snapshot in that case. Mode none never
-                # runs the migration kernel, so the acceptance buffer is exact.
-                num_accepted_tokens=(
-                    ctx.num_accepted_tokens_out
-                    if self._needs_prefix_state_migration
-                    else self.num_accepted_tokens_gpu
-                ),
-                is_prefilling=is_prefilling,
-                live_cols=(
-                    self._mamba_state_idx_gpu
-                    if self._needs_prefix_state_migration
-                    else self._replayssm_live_cols_gpu
-                ),
-                materialize_src_cols=ctx.materialize_src_cols,
-                materialize_dst_cols=ctx.materialize_dst_cols,
-                materialize_token_counts=ctx.materialize_token_counts,
-                mamba_block_size=ctx.block_size,
-                num_reqs=num_reqs,
+        if not defer_after_drafting:
+            self._publish_flashinfer_replayssm(
+                idx_mapping,
+                num_computed_tokens,
+                query_start_loc,
+                is_prefilling,
             )
+
+    def postprocess_state_after_drafting(
+        self,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor | int,
+        num_computed_tokens: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        is_prefilling: torch.Tensor | None = None,
+    ) -> None:
+        """Publish ReplaySSM trackers after every forward in this step.
+
+        MTP drafting reuses the tracker view consumed by the target forward.
+        The newly accepted transition belongs to the next target step, so it
+        must not become visible until the current draft pass has completed.
+        """
+        num_reqs = idx_mapping.shape[0]
+        if (
+            num_reqs
+            and self._use_flashinfer_replayssm
+            and not self._needs_prefix_state_migration
+            and not isinstance(num_sampled, int)
+        ):
+            # The MTP drafter reuses this request-state buffer after target
+            # acceptance was first scattered. Restore it before publication.
+            _scatter_num_accepted_kernel[(num_reqs,)](
+                idx_mapping,
+                num_sampled,
+                self.num_accepted_tokens_gpu,
+            )
+        self._publish_flashinfer_replayssm(
+            idx_mapping,
+            num_computed_tokens,
+            query_start_loc,
+            is_prefilling,
+        )
+
+    def _publish_flashinfer_replayssm(
+        self,
+        idx_mapping: torch.Tensor,
+        num_computed_tokens: torch.Tensor | None,
+        query_start_loc: torch.Tensor | None,
+        is_prefilling: torch.Tensor | None,
+    ) -> None:
+        """Commit the accepted target transition to ReplaySSM trackers."""
+        num_reqs = idx_mapping.shape[0]
+        if not num_reqs or not self._use_flashinfer_replayssm:
+            return
+
+        if num_computed_tokens is None:
+            raise RuntimeError(
+                "ReplaySSM postprocess requires the post-step computed-token "
+                "counts from the forward that produced this acceptance"
+            )
+        if query_start_loc is None:
+            raise RuntimeError(
+                "ReplaySSM postprocess requires the query_start_loc from "
+                "the forward that produced this acceptance"
+            )
+        ctx = self._mamba_ctx
+        if ctx is None or not ctx.is_initialized:
+            raise RuntimeError(
+                "ReplaySSM postprocess context was not initialized before forward"
+            )
+        replayssm = ctx.replayssm
+        assert replayssm is not None
+        if is_prefilling is None:
+            is_prefilling = self._is_prefilling_gpu[:num_reqs]
+        replayssm.postprocess(
+            idx_mapping=idx_mapping,
+            query_metadata=query_start_loc,
+            query_metadata_is_cumulative=True,
+            num_computed_tokens=num_computed_tokens,
+            num_computed_is_post_step=True,
+            # Prefix migration can reset the live buffer to one for the
+            # next step; use its snapshot in that case. Mode none never
+            # runs the migration kernel, so the acceptance buffer is exact.
+            num_accepted_tokens=(
+                ctx.num_accepted_tokens_out
+                if self._needs_prefix_state_migration
+                else self.num_accepted_tokens_gpu
+            ),
+            is_prefilling=is_prefilling,
+            live_cols=(
+                self._mamba_state_idx_gpu
+                if self._needs_prefix_state_migration
+                else self._replayssm_live_cols_gpu
+            ),
+            materialize_src_cols=ctx.materialize_src_cols,
+            materialize_dst_cols=ctx.materialize_dst_cols,
+            materialize_token_counts=ctx.materialize_token_counts,
+            mamba_block_size=ctx.block_size,
+            num_reqs=num_reqs,
+        )
 
 
 @triton.jit

@@ -414,7 +414,8 @@ def test_flashinfer_replayssm_prefix_cache_tp1(
 
 @requires_flashinfer_replayssm_materialization
 @large_gpu_mark(min_gb=40)
-def test_flashinfer_replayssm_all_prefix_cache_v2(vllm_runner, monkeypatch):
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+def test_flashinfer_replayssm_all_prefix_cache(vllm_runner, monkeypatch, use_v2: bool):
     _check_flashinfer_replayssm_prefix_caching(
         vllm_runner,
         MAMBA2_PREFIX_MODEL,
@@ -422,7 +423,7 @@ def test_flashinfer_replayssm_all_prefix_cache_v2(vllm_runner, monkeypatch):
         mamba_cache_mode="all",
         moe_backend="triton",
         use_ngram=False,
-        use_v2=True,
+        use_v2=use_v2,
         tensor_parallel_size=1,
     )
 

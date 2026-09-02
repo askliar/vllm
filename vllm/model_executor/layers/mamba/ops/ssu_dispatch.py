@@ -78,8 +78,8 @@ def _postprocess_replayssm_modelwide_kernel(
     all-layer FlashInfer materializer call. Invalid and padded rows still write
     sentinels so fixed-capacity plans cannot retain stale work.
 
-    The two metadata flags specialize runner input representation only; they do
-    not change recurrence semantics. Prefill has already produced canonical SSM
+    Metadata flags specialize runner input representation only; they do not
+    change recurrence semantics. Prefill has already produced canonical SSM
     state, so this kernel only resets the affected ReplaySSM cursors and, when a
     prefix snapshot is requested, emits ``flush_count=0`` for an exact copy.
     """
