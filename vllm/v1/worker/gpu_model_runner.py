@@ -4470,8 +4470,21 @@ class GPUModelRunner(
             # ReplaySSM tracker postprocess will run. Mode none does not run
             # prefix preprocessing and always uses logical live column zero.
             if mamba_bufs is not None and mamba_bufs.postprocess_align is not None:
+                mamba_ctx = mamba_bufs.postprocess_align
+                if not mamba_ctx.is_initialized:
+                    mamba_ctx.initialize_from_forward_context(
+                        self.kv_cache_config,
+                        self.compilation_config.static_forward_context,
+                        self._get_mamba_state_copy_funcs(),
+                        [
+                            self.input_batch.block_table[gid].get_device_tensor(
+                                num_reqs
+                            )
+                            for gid in mamba_ctx.mamba_group_ids
+                        ],
+                    )
                 mamba_utils.stage_postprocess_inputs_to_gpu(
-                    mamba_bufs.postprocess_align,
+                    mamba_ctx,
                     scheduler_output,
                     self.input_batch.req_ids,
                     num_reqs,

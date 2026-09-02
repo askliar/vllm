@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -51,6 +52,7 @@ def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
     state._replayssm_live_cols_gpu = torch.zeros(4, dtype=torch.int32, device="cuda")
     state._is_prefilling_gpu = torch.zeros(4, dtype=torch.bool, device="cuda")
     replayssm = Mock()
+    replayssm.materialize_prefixes = False
     ctx = Mock(
         is_initialized=True,
         replayssm=replayssm,
@@ -76,6 +78,42 @@ def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
     kwargs = replayssm.postprocess.call_args.kwargs
     assert kwargs["num_accepted_tokens"] is state.num_accepted_tokens_gpu
     assert kwargs["live_cols"] is state._replayssm_live_cols_gpu
+
+
+def test_flashinfer_replayssm_preprocess_runs_before_v2_forward() -> None:
+    state = object.__new__(MambaHybridModelState)
+    state._needs_prefix_state_migration = False
+    state._use_flashinfer_replayssm = True
+    state._is_prefilling_gpu = torch.zeros(4, dtype=torch.bool)
+    state._replayssm_live_cols_gpu = torch.zeros(4, dtype=torch.int32)
+    state._get_mamba_group_info = Mock(return_value=([0], Mock()))
+    replayssm = Mock()
+    replayssm.materialize_prefixes = False
+    ctx = Mock(replayssm=replayssm, block_size=1024)
+    state._ensure_mamba_postprocess_ctx = Mock(return_value=ctx)
+    input_batch = Mock(
+        num_reqs=2,
+        is_prefilling_np=np.array([True, False, False, False]),
+        idx_mapping=torch.tensor([1, 3], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 8, 9], dtype=torch.int32),
+    )
+    num_computed = torch.tensor([0, 2, 0, 7], dtype=torch.int32)
+
+    state.preprocess_state(input_batch, (), Mock(), num_computed)
+
+    replayssm.preprocess.assert_called_once_with(
+        idx_mapping=input_batch.idx_mapping,
+        query_metadata=input_batch.query_start_loc,
+        query_metadata_is_cumulative=True,
+        num_computed_tokens=num_computed,
+        is_prefilling=state._is_prefilling_gpu,
+        src_cols=state._replayssm_live_cols_gpu,
+        dst_cols=state._replayssm_live_cols_gpu,
+        mamba_block_size=1024,
+        num_reqs=2,
+    )
+    replayssm.materialize.assert_not_called()
+    ctx.run_fused_precopy.assert_not_called()
 
 
 def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:

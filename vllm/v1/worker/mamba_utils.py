@@ -637,8 +637,8 @@ def precopy_mamba_align_fused_kernel(
     if src_col < 0 or src_col == dst_col:
         return
     if tl.load(state_skip_precopy_ptr + state_idx):
-        # FlashInfer ReplaySSM materializes this temporal destination before the
-        # generic pre-copy launch. Copy only conv/other model-owned states here.
+        # FlashInfer ReplaySSM owns this temporal state. Copy only conv/other
+        # model-owned states here.
         return
 
     token_bias = tl.load(token_bias_ptr + req_idx)
@@ -1616,13 +1616,6 @@ def preprocess_mamba(
         fused.state_idx.copy_to_gpu(num_reqs)
         fused.src_col.copy_to_gpu(num_reqs)
         fused.token_bias.copy_to_gpu(num_reqs)
-        if fused.ctx.replayssm is not None:
-            fused.ctx.replayssm.materialize_reassigned_slots(
-                idx_mapping=None,
-                src_cols=fused.src_col.gpu,
-                dst_cols=fused.state_idx.gpu,
-                num_reqs=num_reqs,
-            )
         fused.ctx.run_fused_precopy(
             num_reqs=num_reqs,
             state_idx_gpu=fused.state_idx.gpu,
@@ -1738,17 +1731,16 @@ def postprocess_mamba_align_gpu(
             idx_mapping=None,
             query_metadata=ctx.num_scheduled_tokens_buf.gpu,
             query_metadata_is_cumulative=False,
-            num_computed_tokens=ctx.num_computed_tokens_buf.gpu,
-            num_computed_is_post_step=False,
             num_accepted_tokens=accepted_tokens_for_postprocess,
             is_prefilling=ctx.is_prefilling_buf.gpu,
             live_cols=ctx.mamba_state_idx_buf.gpu,
             materialize_src_cols=ctx.materialize_src_cols,
             materialize_dst_cols=ctx.materialize_dst_cols,
             materialize_token_counts=ctx.materialize_token_counts,
-            mamba_block_size=ctx.block_size,
             num_reqs=num_reqs,
         )
+        if ctx.replayssm.materialize_prefixes:
+            ctx.replayssm.materialize()
 
     # ``num_accepted_tokens_out`` is pre-initialized from
     # ``num_accepted_tokens_gpu``; the kernel only overwrites entries to 1
@@ -1786,6 +1778,7 @@ def stage_postprocess_inputs_to_gpu(
     assert ctx.num_computed_tokens_buf is not None
     assert ctx.num_draft_tokens_buf is not None
     assert ctx.is_prefilling_buf is not None
+    assert ctx.precopy_src_col_buf is not None
 
     scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
     num_scheduled = scheduler_output.num_scheduled_tokens
@@ -1818,3 +1811,25 @@ def stage_postprocess_inputs_to_gpu(
     ctx.num_computed_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_draft_tokens_buf.copy_to_gpu(num_reqs)
     ctx.is_prefilling_buf.copy_to_gpu(num_reqs)
+    if ctx.replayssm is not None:
+        # Prefix modes use the source/destination columns prepared by
+        # preprocess_mamba. Mode none has no migration, so passing the live
+        # column as both endpoints makes that part of the kernel a no-op.
+        src_cols = (
+            ctx.precopy_src_col_buf.gpu
+            if ctx.replayssm.materialize_prefixes
+            else ctx.mamba_state_idx_buf.gpu
+        )
+        ctx.replayssm.preprocess(
+            idx_mapping=None,
+            query_metadata=ctx.num_scheduled_tokens_buf.gpu,
+            query_metadata_is_cumulative=False,
+            num_computed_tokens=ctx.num_computed_tokens_buf.gpu,
+            is_prefilling=ctx.is_prefilling_buf.gpu,
+            src_cols=src_cols,
+            dst_cols=ctx.mamba_state_idx_buf.gpu,
+            mamba_block_size=ctx.block_size,
+            num_reqs=num_reqs,
+        )
+        if ctx.replayssm.materialize_prefixes:
+            ctx.replayssm.materialize()

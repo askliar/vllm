@@ -170,18 +170,15 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
 
 
 @pytest.mark.parametrize(
-    ("with_replayssm", "num_computed_tokens", "expected_order"),
+    "num_computed_tokens",
     [
-        pytest.param(True, 4, ["materialize", "copy"], id="replayssm-boundary"),
-        pytest.param(True, 3, ["materialize", "copy"], id="replayssm-no-boundary"),
-        pytest.param(False, 4, ["copy"], id="generic"),
+        pytest.param(4, id="boundary"),
+        pytest.param(3, id="no-boundary"),
     ],
 )
-def test_preprocess_mamba_uses_modelwide_materializer_when_present(
-    with_replayssm: bool,
+def test_preprocess_mamba_leaves_replayssm_for_staging(
     num_computed_tokens: int,
-    expected_order: list[str],
-):
+) -> None:
     spec = MagicMock(block_size=4, num_speculative_blocks=0)
     cache_config = MagicMock(enable_prefix_caching=True, use_replayssm=True)
     input_batch = MagicMock()
@@ -199,11 +196,7 @@ def test_preprocess_mamba_uses_modelwide_materializer_when_present(
     align_ctx.mamba_state_idx_buf = _MockCpuGpuBuffer(1, torch.int32, device)
     align_ctx.precopy_src_col_buf = _MockCpuGpuBuffer(1, torch.int32, device)
     align_ctx.precopy_token_bias_buf = _MockCpuGpuBuffer(1, torch.int32, device)
-    align_ctx.replayssm = MagicMock() if with_replayssm else None
-    if align_ctx.replayssm is not None:
-        align_ctx.replayssm.materialize_reassigned_slots.side_effect = (
-            lambda **kwargs: order.append("materialize")
-        )
+    align_ctx.replayssm = MagicMock()
     align_ctx.run_fused_precopy.side_effect = lambda **kwargs: order.append("copy")
 
     preprocess_mamba(
@@ -219,10 +212,14 @@ def test_preprocess_mamba_uses_modelwide_materializer_when_present(
         align_ctx=align_ctx,
     )
 
-    assert order == expected_order
+    assert order == ["copy"]
+    align_ctx.replayssm.preprocess.assert_not_called()
+    align_ctx.replayssm.materialize.assert_not_called()
 
 
-def test_postprocess_mamba_align_materializes_after_fused_copy(monkeypatch):
+def test_postprocess_mamba_align_commits_then_materializes_after_fused_copy(
+    monkeypatch,
+):
     order: list[str] = []
     ctx = MagicMock()
     ctx.is_initialized = True
@@ -238,9 +235,9 @@ def test_postprocess_mamba_align_materializes_after_fused_copy(monkeypatch):
     ctx.materialize_token_counts = torch.tensor([2], dtype=torch.int32)
     ctx.run_fused_postprocess.side_effect = lambda **kwargs: order.append("copy")
     ctx.replayssm = MagicMock()
-    ctx.replayssm.postprocess.side_effect = lambda **kwargs: (
-        order.append("materialize")
-    )
+    ctx.replayssm.materialize_prefixes = True
+    ctx.replayssm.postprocess.side_effect = lambda **kwargs: order.append("postprocess")
+    ctx.replayssm.materialize.side_effect = lambda: order.append("materialize")
     block_table = MagicMock()
     block_table.get_device_tensor.return_value = torch.zeros((1, 4), dtype=torch.int32)
     input_batch = MagicMock()
@@ -261,7 +258,7 @@ def test_postprocess_mamba_align_materializes_after_fused_copy(monkeypatch):
         run_prefix_state_migration=True,
     )
 
-    assert order == ["copy", "materialize"]
+    assert order == ["copy", "postprocess", "materialize"]
     assert accepted_cpu.tolist() == [3]
 
 
@@ -279,6 +276,7 @@ def test_postprocess_mamba_none_skips_prefix_copy():
     ctx.materialize_token_counts = torch.zeros(1, dtype=torch.int32)
     ctx.block_size = 1024
     ctx.replayssm = MagicMock()
+    ctx.replayssm.materialize_prefixes = False
     input_batch = MagicMock()
     input_batch.block_table = []
     accepted = torch.tensor([2], dtype=torch.int32)
@@ -299,6 +297,7 @@ def test_postprocess_mamba_none_skips_prefix_copy():
     ctx.run_fused_postprocess.assert_not_called()
     assert ctx.replayssm.postprocess.call_count == 1
     assert ctx.replayssm.postprocess.call_args.kwargs["num_accepted_tokens"] is accepted
+    ctx.replayssm.materialize.assert_not_called()
     assert accepted_cpu.tolist() == [2]
 
 
@@ -868,6 +867,8 @@ def _make_staging_ctx(max_num_reqs: int, device: torch.device) -> MagicMock:
     ctx.num_computed_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
     ctx.num_draft_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
     ctx.is_prefilling_buf = _MockCpuGpuBuffer(max_num_reqs, torch.bool, device)
+    ctx.precopy_src_col_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
+    ctx.replayssm = None
     return ctx
 
 
@@ -878,6 +879,10 @@ def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
     device = torch.device("cpu")
     max_num_reqs = 8
     ctx = _make_staging_ctx(max_num_reqs, device)
+    ctx.block_size = 4
+    ctx.replayssm = MagicMock()
+    ctx.replayssm.materialize_prefixes = True
+    ctx.precopy_src_col_buf.gpu[:3] = torch.tensor([99, 199, 299], dtype=torch.int32)
 
     # Any negative int32 works as a sentinel: all staged values (state_idx,
     # scheduled/computed/draft token counts) are non-negative, so a negative
@@ -950,6 +955,18 @@ def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
         ctx.is_prefilling_buf.gpu[:num_reqs],
         torch.tensor([True, False, True]),
     )
+    ctx.replayssm.preprocess.assert_called_once_with(
+        idx_mapping=None,
+        query_metadata=ctx.num_scheduled_tokens_buf.gpu,
+        query_metadata_is_cumulative=False,
+        num_computed_tokens=ctx.num_computed_tokens_buf.gpu,
+        is_prefilling=ctx.is_prefilling_buf.gpu,
+        src_cols=ctx.precopy_src_col_buf.gpu,
+        dst_cols=ctx.mamba_state_idx_buf.gpu,
+        mamba_block_size=4,
+        num_reqs=num_reqs,
+    )
+    ctx.replayssm.materialize.assert_called_once_with()
 
 
 def test_stage_postprocess_inputs_to_gpu_asserts_on_missing_state_idx():
