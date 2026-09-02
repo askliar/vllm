@@ -734,6 +734,34 @@ def copy_kv_cache_blocks_inplace(
         blocks[dst] = blocks[src]
 
 
+def get_replayssm_block_copy_tensors(
+    forward_context: Mapping[str, Any],
+) -> list[torch.Tensor]:
+    """Return separately allocated ReplaySSM rings and shared cursors.
+
+    Scheduler block IDs come from one global pool. Applying every planned pair
+    to every returned cache is therefore group-correct: a pair owned by another
+    group only touches globally unavailable slots in this group. The generic
+    copy helper deduplicates the cursors shared by layers in one group.
+    """
+    tensors: list[torch.Tensor] = []
+    for layer in forward_context.values():
+        if not getattr(layer, "use_replayssm", False):
+            continue
+        kv_cache = getattr(layer, "kv_cache", ())
+        if len(kv_cache) < 5:
+            continue
+        tensors.extend(kv_cache[2:5])
+        for name in (
+            "_replayssm_ring_start",
+            "_replayssm_prev_num_accepted",
+        ):
+            tracker = getattr(layer, name, None)
+            if isinstance(tracker, torch.Tensor) and tracker.numel() > 0:
+                tensors.append(tracker)
+    return tensors
+
+
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
     """Whether every request in the batch has the same query length.
 

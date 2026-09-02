@@ -641,11 +641,11 @@ def test_modelwide_replayssm_postprocess_resets_prefill_slot(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-def test_modelwide_replayssm_copies_reassigned_live_slot_once(monkeypatch):
+def test_modelwide_replayssm_resets_only_fresh_slots(monkeypatch):
     groups, config, forward_context, block_tables = _modelwide_replayssm_fixture()
-    for mixers, source_slot in zip(groups, (1, 4)):
-        mixers[0]._replayssm_ring_start[source_slot] = 2
-        mixers[0]._replayssm_prev_num_accepted[source_slot] = 4
+    for mixers, destination_slot in zip(groups, (1, 4)):
+        mixers[0]._replayssm_ring_start[destination_slot] = 7
+        mixers[0]._replayssm_prev_num_accepted[destination_slot] = 9
     kernel = Mock()
     monkeypatch.setattr(ssu_dispatch, "_load_replayssm_materialize", lambda: kernel)
 
@@ -657,33 +657,26 @@ def test_modelwide_replayssm_copies_reassigned_live_slot_once(monkeypatch):
         max_num_reqs=2,
     )
     assert ctx is not None
-    ctx.materialize_reassigned_slots(
+    ctx.reset_new_slots(
         idx_mapping=torch.tensor([0], dtype=torch.int32, device="cuda"),
-        src_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
-        dst_cols=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
+        src_cols=torch.tensor([-1, -1], dtype=torch.int32, device="cuda"),
+        dst_cols=torch.tensor([0, 0], dtype=torch.int32, device="cuda"),
         num_reqs=1,
     )
     torch.accelerator.synchronize()
 
-    assert kernel.call_count == 1
-    assert ctx.precopy_ring_start.tolist() == [2, 0]
-    assert ctx.precopy_flush_count.tolist() == [4, -1]
-    assert ctx.precopy_src_slots[:, 0].tolist() == [1, 1, 4, 4]
-    assert ctx.precopy_dst_slots[:, 0].tolist() == [2, 2, 5, 5]
-    for mixers, source_slot, destination_slot in zip(groups, (1, 4), (2, 5)):
-        assert mixers[0]._replayssm_ring_start[source_slot].item() == 2
-        assert mixers[0]._replayssm_prev_num_accepted[source_slot].item() == 4
+    assert kernel.call_count == 0
+    for mixers, destination_slot in zip(groups, (1, 4)):
         assert mixers[0]._replayssm_ring_start[destination_slot].item() == 0
         assert mixers[0]._replayssm_prev_num_accepted[destination_slot].item() == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-def test_modelwide_replayssm_copies_only_reassigned_cache_group(monkeypatch):
+def test_modelwide_replayssm_preserves_slots_with_source(monkeypatch):
     groups, config, forward_context, block_tables = _modelwide_replayssm_fixture()
-    block_tables[0][0, 1] = block_tables[0][0, 0]
-    for mixers, source_slot in zip(groups, (1, 4)):
-        mixers[0]._replayssm_ring_start[source_slot] = 2
-        mixers[0]._replayssm_prev_num_accepted[source_slot] = 4
+    for mixers, destination_slot in zip(groups, (2, 5)):
+        mixers[0]._replayssm_ring_start[destination_slot] = 7
+        mixers[0]._replayssm_prev_num_accepted[destination_slot] = 9
     kernel = Mock()
     monkeypatch.setattr(ssu_dispatch, "_load_replayssm_materialize", lambda: kernel)
 
@@ -695,7 +688,7 @@ def test_modelwide_replayssm_copies_only_reassigned_cache_group(monkeypatch):
         max_num_reqs=2,
     )
     assert ctx is not None
-    ctx.materialize_reassigned_slots(
+    ctx.reset_new_slots(
         idx_mapping=torch.tensor([0], dtype=torch.int32, device="cuda"),
         src_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
         dst_cols=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
@@ -703,24 +696,7 @@ def test_modelwide_replayssm_copies_only_reassigned_cache_group(monkeypatch):
     )
     torch.accelerator.synchronize()
 
-    assert kernel.call_count == 1
-    assert ctx.precopy_ring_start.tolist() == [2, 0]
-    assert ctx.precopy_flush_count.tolist() == [4, -1]
-    assert ctx.precopy_src_slots[:, 0].tolist() == [
-        NULL_BLOCK_ID,
-        NULL_BLOCK_ID,
-        4,
-        4,
-    ]
-    assert ctx.precopy_dst_slots[:, 0].tolist() == [
-        NULL_BLOCK_ID,
-        NULL_BLOCK_ID,
-        5,
-        5,
-    ]
-    assert groups[0][0]._replayssm_ring_start[1].item() == 2
-    assert groups[0][0]._replayssm_prev_num_accepted[1].item() == 4
-    assert groups[1][0]._replayssm_ring_start[4].item() == 2
-    assert groups[1][0]._replayssm_prev_num_accepted[4].item() == 4
-    assert groups[1][0]._replayssm_ring_start[5].item() == 0
-    assert groups[1][0]._replayssm_prev_num_accepted[5].item() == 0
+    assert kernel.call_count == 0
+    for mixers, destination_slot in zip(groups, (2, 5)):
+        assert mixers[0]._replayssm_ring_start[destination_slot].item() == 7
+        assert mixers[0]._replayssm_prev_num_accepted[destination_slot].item() == 9

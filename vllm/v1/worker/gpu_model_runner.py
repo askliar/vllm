@@ -249,6 +249,7 @@ from .utils import (
     allocate_replayssm_caches,
     bind_kv_cache,
     copy_kv_cache_blocks_inplace,
+    get_replayssm_block_copy_tensors,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
@@ -1250,7 +1251,12 @@ class GPUModelRunner(
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
+                [
+                    *self.kv_caches,
+                    *get_replayssm_block_copy_tensors(
+                        self.compilation_config.static_forward_context
+                    ),
+                ],
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
@@ -4454,10 +4460,9 @@ class GPUModelRunner(
                     mamba_bufs.preprocess,
                     align_ctx=mamba_bufs.postprocess_align,
                 )
-                # preprocess_mamba resets num_accepted_tokens_cpu to 1
-                # for requests whose state was copied to a new block.
-                # Re-sync to GPU so the mamba kernel reads from the
-                # correct initial state slot (init_token_idx = 0).
+                # Baseline Mamba may reset an accepted-token offset after
+                # shifting state. ReplaySSM preserves it with the exact live
+                # block copy. Re-sync either result to GPU.
                 self.num_accepted_tokens.np[:num_reqs] = (
                     self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                 )

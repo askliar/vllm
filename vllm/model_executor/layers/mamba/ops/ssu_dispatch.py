@@ -236,7 +236,7 @@ def _postprocess_replayssm_modelwide_kernel(
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
-def _copy_reassigned_replayssm_slots_kernel(
+def _reset_new_replayssm_slots_kernel(
     idx_mapping,
     src_cols,
     dst_cols,
@@ -244,19 +244,12 @@ def _copy_reassigned_replayssm_slots_kernel(
     tracker_ring_start_ptrs,
     tracker_num_committed_ptrs,
     tracker_capacities,
-    group_layer_offsets,
-    src_slots,
-    dst_slots,
-    plan_ring_start,
-    plan_flush_count,
     block_table_stride_req: tl.int64,
-    slot_table_stride_layer: tl.int64,
     num_reqs,
-    MAX_LAYERS_PER_GROUP: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr,
 ) -> None:
-    """Plan an exact copy when align reassigns a request's writable slot."""
+    """Clear cursors for newly owned slots that have no source state."""
     batch_idx = tl.program_id(0)
     group_idx = tl.program_id(1)
     active = batch_idx < num_reqs
@@ -264,10 +257,6 @@ def _copy_reassigned_replayssm_slots_kernel(
     if HAS_IDX_MAPPING:
         req_idx = tl.load(idx_mapping + batch_idx, mask=active, other=-1)
     valid_req = active & (req_idx >= 0)
-
-    if group_idx == 0:
-        tl.store(plan_ring_start + batch_idx, 0)
-        tl.store(plan_flush_count + batch_idx, -1)
 
     block_table = tl.load(block_table_ptrs + group_idx).to(tl.pointer_type(tl.int32))
     tracker_start = tl.load(tracker_ring_start_ptrs + group_idx).to(
@@ -279,60 +268,20 @@ def _copy_reassigned_replayssm_slots_kernel(
     tracker_capacity = tl.load(tracker_capacities + group_idx)
     src_col = tl.load(src_cols + req_idx, mask=valid_req, other=-1)
     dst_col = tl.load(dst_cols + req_idx, mask=valid_req, other=-1)
-    wants_copy = valid_req & (src_col >= 0) & (dst_col >= 0) & (src_col != dst_col)
-    src_slot = tl.load(
-        block_table + batch_idx * block_table_stride_req + src_col,
-        mask=wants_copy,
-        other=PAD_SLOT_ID,
-    )
+    wants_reset = valid_req & (src_col < 0) & (dst_col >= 0)
     dst_slot = tl.load(
         block_table + batch_idx * block_table_stride_req + dst_col,
-        mask=wants_copy,
+        mask=wants_reset,
         other=PAD_SLOT_ID,
     )
-    valid_mapping = (
-        wants_copy
-        & (src_slot != PAD_SLOT_ID)
+    valid_slot = (
+        wants_reset
         & (dst_slot != PAD_SLOT_ID)
-        & (src_slot >= 0)
         & (dst_slot >= 0)
-        & (src_slot < tracker_capacity)
         & (dst_slot < tracker_capacity)
     )
-    needs_copy = valid_mapping & (src_slot != dst_slot)
-    if valid_mapping & (group_idx == 0):
-        # Snapshot the source cursor before resetting the distinct destination.
-        # The materializer uses it to copy the exact live state, including any
-        # committed replay rows that have not reached a prefix boundary. The
-        # logical migration activates the shared plan even when group 0 aliases;
-        # every group independently suppresses unchanged physical slots below.
-        tl.store(plan_ring_start + batch_idx, tl.load(tracker_start + src_slot))
-        tl.store(
-            plan_flush_count + batch_idx,
-            tl.load(tracker_committed + src_slot),
-        )
-
-    layer_begin = tl.load(group_layer_offsets + group_idx)
-    layer_end = tl.load(group_layer_offsets + group_idx + 1)
-    for layer_offset in tl.static_range(0, MAX_LAYERS_PER_GROUP):
-        layer_idx = layer_begin + layer_offset
-        layer_valid = layer_idx < layer_end
-        table_offset = layer_idx * slot_table_stride_layer + batch_idx
-        tl.store(
-            src_slots + table_offset,
-            tl.where(needs_copy, src_slot, PAD_SLOT_ID),
-            mask=layer_valid,
-        )
-        tl.store(
-            dst_slots + table_offset,
-            tl.where(needs_copy, dst_slot, PAD_SLOT_ID),
-            mask=layer_valid,
-        )
-
-    if needs_copy:
-        # The reassigned destination must not inherit its prior owner's cursor.
-        tl.store(tracker_start + dst_slot, 0)
-        tl.store(tracker_committed + dst_slot, 0)
+    tl.store(tracker_start + dst_slot, 0, mask=valid_slot)
+    tl.store(tracker_committed + dst_slot, 0, mask=valid_slot)
 
 
 def _replayssm_specialization_key(mixer: Any) -> tuple[Any, ...]:
@@ -384,10 +333,6 @@ class ReplaySSMModelContext:
     dst_slots: torch.Tensor
     plan_ring_start: torch.Tensor
     plan_flush_count: torch.Tensor
-    precopy_src_slots: torch.Tensor
-    precopy_dst_slots: torch.Tensor
-    precopy_ring_start: torch.Tensor
-    precopy_flush_count: torch.Tensor
     block_table_stride_req: int
     max_num_reqs: int
     num_groups: int
@@ -525,24 +470,6 @@ class ReplaySSMModelContext:
             plan_flush_count=torch.full(
                 (max_num_reqs,), -1, dtype=torch.int32, device=device
             ),
-            precopy_src_slots=torch.full(
-                (len(mixers), max_num_reqs),
-                NULL_BLOCK_ID,
-                dtype=torch.int32,
-                device=device,
-            ),
-            precopy_dst_slots=torch.full(
-                (len(mixers), max_num_reqs),
-                NULL_BLOCK_ID,
-                dtype=torch.int32,
-                device=device,
-            ),
-            precopy_ring_start=torch.zeros(
-                max_num_reqs, dtype=torch.int32, device=device
-            ),
-            precopy_flush_count=torch.full(
-                (max_num_reqs,), -1, dtype=torch.int32, device=device
-            ),
             block_table_stride_req=next(iter(strides)),
             max_num_reqs=max_num_reqs,
             num_groups=len(grouped),
@@ -612,7 +539,7 @@ class ReplaySSMModelContext:
                 self.plan_flush_count,
             )
 
-    def materialize_reassigned_slots(
+    def reset_new_slots(
         self,
         *,
         idx_mapping: torch.Tensor | None,
@@ -620,14 +547,10 @@ class ReplaySSMModelContext:
         dst_cols: torch.Tensor,
         num_reqs: int,
     ) -> None:
-        """Copy exact live state when align assigns a new writable slot."""
+        """Reset cursors for newly owned slots without a source state."""
         if num_reqs == 0:
             return
-        if not self.materialize_prefixes:
-            raise RuntimeError(
-                "ReplaySSM writable-slot materialization requires align or all mode"
-            )
-        _copy_reassigned_replayssm_slots_kernel[(self.max_num_reqs, self.num_groups)](
+        _reset_new_replayssm_slots_kernel[(self.max_num_reqs, self.num_groups)](
             idx_mapping,
             src_cols,
             dst_cols,
@@ -635,23 +558,10 @@ class ReplaySSMModelContext:
             self.tracker_ring_start_ptrs,
             self.tracker_num_committed_ptrs,
             self.tracker_capacities,
-            self.group_layer_offsets,
-            self.precopy_src_slots,
-            self.precopy_dst_slots,
-            self.precopy_ring_start,
-            self.precopy_flush_count,
             self.block_table_stride_req,
-            self.precopy_src_slots.stride(0),
             num_reqs,
-            MAX_LAYERS_PER_GROUP=self.max_layers_per_group,
             PAD_SLOT_ID=NULL_BLOCK_ID,
             HAS_IDX_MAPPING=idx_mapping is not None,
-        )
-        self._materialize_planned(
-            self.precopy_src_slots,
-            self.precopy_dst_slots,
-            self.precopy_ring_start,
-            self.precopy_flush_count,
         )
 
     def _materialize_planned(

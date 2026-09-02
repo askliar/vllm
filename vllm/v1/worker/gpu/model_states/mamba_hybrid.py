@@ -93,10 +93,10 @@ class MambaHybridModelState(DefaultModelState):
         self._is_prefilling_gpu = torch.zeros(
             self.max_num_reqs, dtype=torch.bool, device=self.device
         )
-        # Pre-copy prefix-cache state (V2). The migration of each request's
-        # mamba state across block boundaries runs as a fused GPU kernel reusing
-        # the postprocess copy machinery, so the per-step src columns and the
-        # running state_idx are kept GPU-resident.
+        # Prefix-cache lifecycle metadata (V2). ReplaySSM live state migrates
+        # through the scheduler block-copy path; the GPU-resident columns here
+        # identify fresh slots for cursor reset. Baseline Mamba still uses them
+        # for its fused state pre-copy.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
         self._use_flashinfer_replayssm = (
             self.cache_config.use_replayssm is True
@@ -212,11 +212,12 @@ class MambaHybridModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
     ) -> None:
-        """Migrate each request's mamba state across block boundaries before
-        the forward (V1 lifecycle semantics, done on GPU). Runs on real batches
-        only (dummy DP/profiling runs skip preprocess_state), and before
-        ``prepare_attn`` gathers ``num_accepted_tokens``, so the boundary reset
-        is visible to the forward kernels.
+        """Prepare each request's Mamba slot before the forward.
+
+        ReplaySSM only resets cursors for a fresh slot with no source; its live
+        state has already migrated through the scheduler block copy. Baseline
+        Mamba retains the fused pre-copy behavior. Dummy DP/profiling runs skip
+        this method.
         """
         if not self._needs_prefix_state_migration:
             return
@@ -228,12 +229,9 @@ class MambaHybridModelState(DefaultModelState):
             kv_cache_config, mamba_group_ids, block_tables
         )
 
-        # The state-advance + pre-copy kernels run every step; they fast-exit per
-        # request when src_col < 0 or src_col == dst_col, so no copy happens on
-        # steps that don't cross a block boundary. (Skipping the launch entirely
-        # would need a V1-style async-D2H of the actual num_computed, since
-        # num_computed_tokens_np is an optimistic mirror under async scheduling;
-        # the launch cost is ~0.3% of TPOT, so the GPU fast-exit suffices.)
+        # The state-advance + pre-copy kernels run every step. ReplaySSM state
+        # has already moved through the scheduler-driven block copy; this path
+        # only resets a fresh slot's cursors and maintains non-ReplaySSM states.
         block = 256
         grid = (triton.cdiv(num_reqs, block),)
         preprocess_mamba_align_fused_kernel[grid](
@@ -247,9 +245,10 @@ class MambaHybridModelState(DefaultModelState):
             num_reqs,
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
+            PRESERVE_ACCEPTED=ctx.replayssm is not None,
         )
         if ctx.replayssm is not None:
-            ctx.replayssm.materialize_reassigned_slots(
+            ctx.replayssm.reset_new_slots(
                 idx_mapping=input_batch.idx_mapping,
                 src_cols=self._mamba_src_col_gpu,
                 dst_cols=self._mamba_state_idx_gpu,
