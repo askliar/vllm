@@ -419,7 +419,7 @@ class _ReplaySSMGroupContext:
         """Reset cursors for fresh physical slots in this cache group."""
         if num_reqs == 0:
             return
-        _reset_new_replayssm_slots_kernel[(self.max_num_reqs,)](
+        _reset_new_replayssm_slots_kernel[(num_reqs,)](
             idx_mapping,
             src_cols,
             dst_cols,
