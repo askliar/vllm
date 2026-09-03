@@ -19,6 +19,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     ReplaySSMModelContext,
+    _mamba_state_copy_boundary,
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
@@ -387,22 +388,11 @@ def postprocess_mamba_fused_kernel(
     state_inner_sizes_ptr,  # number of elements in inner dimensions
     state_conv_widths_ptr,  # conv width for conv states (0 for temporal)
     state_group_indices_ptr,  # maps state_idx to group index in block table
-    # Nonzero for temporal states reconstructed by an external materializer.
-    # The kernel still emits the request-level decision below, but does not
-    # overwrite the checkpoint with the generic speculative-column copy.
-    state_skip_postprocess_ptr,
     # DS conv row metadata. Zero keeps the single-region copy path.
     state_dim_row_count_ptr,  # int32: per-block dim row count for DS conv
     state_dim_row_stride_ptr,  # int64: bytes between rows for DS conv
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
-    # Batch-ordered ReplaySSM materialization decision. The caller initializes
-    # dst_col to -1, which remains the no-op sentinel when no boundary is hit.
-    # The source is always mamba_state_idx_ptr.
-    materialize_dst_col_ptr,
-    # Current-query rows through that boundary: accept_token_bias + 1. The
-    # materializer adds older pending rows from the source slot's tracker.
-    materialize_token_count_ptr,
     # Optional: batch_idx -> req_idx mapping (V2 model runner / PP). The
     # per-request decision arrays are in req-state-slot order; the block table
     # is in batch order, so HAS_IDX_MAPPING splits the two indexings.
@@ -421,6 +411,9 @@ def postprocess_mamba_fused_kernel(
     # PRECOMPUTED_NEW_COMPUTED: when True, num_computed_tokens_ptr already holds
     # the post-step new_num_computed value (V2 supplies the advanced count).
     PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
+    # FlashInfer ReplaySSM owns temporal state, while this kernel continues to
+    # snapshot convolution state at the same block boundary.
+    SKIP_TEMPORAL_STATE_COPY: tl.constexpr = False,
     # TEMPORAL_TILES: when > 1, the temporal copy body is partitioned across
     # TEMPORAL_TILES CTAs along the u64 inner range. Callers must launch a
     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
@@ -468,23 +461,14 @@ def postprocess_mamba_fused_kernel(
         num_tokens_running_state = num_computed + num_scheduled - num_draft
         new_num_computed = num_tokens_running_state + num_accepted - 1
 
-    aligned_new_computed = (new_num_computed // block_size) * block_size
-
-    needs_copy = aligned_new_computed >= num_tokens_running_state
+    needs_copy, accept_token_bias, dest_block_idx = _mamba_state_copy_boundary(
+        num_tokens_running_state,
+        new_num_computed,
+        block_size,
+    )
 
     if not needs_copy:
         return
-
-    # Compute copy parameters
-    accept_token_bias = aligned_new_computed - num_tokens_running_state
-    dest_block_idx = aligned_new_computed // block_size - 1
-
-    if state_idx == 0 and tile_idx == 0:
-        tl.store(materialize_dst_col_ptr + batch_idx, dest_block_idx)
-        tl.store(
-            materialize_token_count_ptr + batch_idx,
-            accept_token_bias + 1,
-        )
 
     # Update accepted-token count before early exits (per-request, so only
     # state_idx == 0 writes). Also guard on tile_idx == 0 so tiles > 0
@@ -496,7 +480,8 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
-    if tl.load(state_skip_postprocess_ptr + state_idx):
+    conv_width = tl.load(state_conv_widths_ptr + state_idx)
+    if SKIP_TEMPORAL_STATE_COPY and conv_width == 0:
         return
 
     bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
@@ -587,7 +572,6 @@ def precopy_mamba_align_fused_kernel(
     state_inner_sizes_ptr,
     state_conv_widths_ptr,
     state_group_indices_ptr,
-    state_skip_precopy_ptr,
     state_dim_row_count_ptr,
     state_dim_row_stride_ptr,
     idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx (-1 to skip)
@@ -632,11 +616,6 @@ def precopy_mamba_align_fused_kernel(
     # so there is nothing to copy.
     if src_col < 0 or src_col == dst_col:
         return
-    if tl.load(state_skip_precopy_ptr + state_idx):
-        # FlashInfer ReplaySSM owns this temporal state. Copy only conv/other
-        # model-owned states here.
-        return
-
     token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
         state_idx,
@@ -822,8 +801,6 @@ class MambaSpecDecodeGPUContext:
     state_inner_sizes: torch.Tensor  # int64: elements in inner dimensions
     state_conv_widths: torch.Tensor  # int32: conv width (0 for temporal states)
     state_group_indices: torch.Tensor  # int32: maps state_idx to group index
-    state_skip_postprocess: torch.Tensor  # int32: materializer owns this state
-    state_skip_precopy: torch.Tensor  # int32: scheduler block copy owns this state
     # DS conv row metadata. Zero keeps the single-region copy path.
     state_dim_row_count: torch.Tensor  # int32: per-block dim row count
     state_dim_row_stride: torch.Tensor  # int64: bytes between rows
@@ -836,8 +813,6 @@ class MambaSpecDecodeGPUContext:
 
     # Output buffer for num_accepted_tokens updates
     num_accepted_tokens_out: torch.Tensor
-    materialize_dst_cols: torch.Tensor
-    materialize_token_counts: torch.Tensor
 
     # Per-group block-table base addresses: int64[num_groups]. Populated in
     # initialize_from_forward_context from the persistent per-group block
@@ -863,10 +838,8 @@ class MambaSpecDecodeGPUContext:
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
-    # True when any temporal state is owned by the FlashInfer ReplaySSM
-    # materializer (i.e. some state_skip_postprocess entry is set). Cached at
-    # populate time so the per-step postprocess can skip the layer scan for
-    # Triton / non-ReplaySSM configs.
+    # True when the model-wide FlashInfer ReplaySSM lifecycle owns temporal
+    # state. Mixed ReplaySSM/baseline Mamba layers are rejected at populate time.
     has_flashinfer_replayssm: bool = False
     # Persistent all-layer ReplaySSM descriptors, populated with the cache
     # addresses on first real forward. None for non-FlashInfer configurations.
@@ -928,12 +901,6 @@ class MambaSpecDecodeGPUContext:
             state_group_indices=torch.zeros(
                 total_states, dtype=torch.int32, device=device
             ),
-            state_skip_postprocess=torch.zeros(
-                total_states, dtype=torch.int32, device=device
-            ),
-            state_skip_precopy=torch.zeros(
-                total_states, dtype=torch.int32, device=device
-            ),
             state_dim_row_count=torch.zeros(
                 total_states, dtype=torch.int32, device=device
             ),
@@ -945,12 +912,6 @@ class MambaSpecDecodeGPUContext:
             mamba_group_ids=mamba_group_ids,
             num_groups=len(mamba_group_ids),
             num_accepted_tokens_out=torch.zeros(
-                max_num_reqs, dtype=torch.int32, device=device
-            ),
-            materialize_dst_cols=torch.full(
-                (max_num_reqs,), -1, dtype=torch.int32, device=device
-            ),
-            materialize_token_counts=torch.empty(
                 max_num_reqs, dtype=torch.int32, device=device
             ),
             block_table_ptrs=torch.zeros(
@@ -1059,7 +1020,6 @@ class MambaSpecDecodeGPUContext:
                     )
                 for state_type_idx, copy_func in enumerate(state_copy_funcs):
                     state = kv_caches[state_type_idx]
-                    self.state_skip_precopy[idx] = is_flashinfer_replayssm
                     # Base address
                     self.state_base_addrs[idx] = _reinterpret_u64_as_i64(
                         state.data_ptr()
@@ -1101,7 +1061,6 @@ class MambaSpecDecodeGPUContext:
                             self.state_conv_widths[idx] = state.size(1)
                             self.state_inner_sizes[idx] = state.stride(1)
                     else:
-                        self.state_skip_postprocess[idx] = is_flashinfer_replayssm
                         self.has_flashinfer_replayssm |= bool(is_flashinfer_replayssm)
                         # Temporal state: inner_size = natural elements per
                         # block (prod of inner dims).  The kernel uses this
@@ -1239,17 +1198,17 @@ class MambaSpecDecodeGPUContext:
         if num_reqs == 0 or not self.is_initialized:
             return
 
-        # Initialize output to current values (unchanged unless src==dst)
+        # Preserve the original acceptance counts for ReplaySSM. The generic
+        # state-copy kernel normalizes the live buffer for the next iteration.
         self.num_accepted_tokens_out[:num_reqs].copy_(
             num_accepted_tokens_gpu[:num_reqs]
         )
-        self.materialize_dst_cols[:num_reqs].fill_(-1)
 
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
 
         postprocess_mamba_fused_kernel[grid](
-            num_accepted_tokens_gpu,
+            self.num_accepted_tokens_out,
             mamba_state_idx_gpu,
             num_scheduled_tokens_gpu,
             num_computed_tokens_gpu,
@@ -1262,17 +1221,15 @@ class MambaSpecDecodeGPUContext:
             self.state_inner_sizes,
             self.state_conv_widths,
             self.state_group_indices,
-            self.state_skip_postprocess,
             self.state_dim_row_count,
             self.state_dim_row_stride,
-            self.num_accepted_tokens_out,
-            self.materialize_dst_cols,
-            self.materialize_token_counts,
+            num_accepted_tokens_gpu,
             None,  # idx_mapping: V1 decision arrays are already in req order
             num_reqs,
             block_size=self.block_size,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            SKIP_TEMPORAL_STATE_COPY=self.has_flashinfer_replayssm,
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
 
@@ -1311,7 +1268,6 @@ class MambaSpecDecodeGPUContext:
             self.state_inner_sizes,
             self.state_conv_widths,
             self.state_group_indices,
-            self.state_skip_precopy,
             self.state_dim_row_count,
             self.state_dim_row_stride,
             idx_mapping,
@@ -1347,7 +1303,6 @@ class MambaSpecDecodeGPUContext:
         # decision buffer rather than only [:num_reqs].
         num_accepted_tokens_snapshot = self.num_accepted_tokens_out
         num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
-        self.materialize_dst_cols[:num_reqs].fill_(-1)
 
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
@@ -1365,12 +1320,9 @@ class MambaSpecDecodeGPUContext:
             self.state_inner_sizes,
             self.state_conv_widths,
             self.state_group_indices,
-            self.state_skip_postprocess,
             self.state_dim_row_count,
             self.state_dim_row_stride,
             num_accepted_tokens_gpu,
-            self.materialize_dst_cols,
-            self.materialize_token_counts,
             idx_mapping,
             num_reqs,
             block_size=self.block_size,
@@ -1378,6 +1330,7 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
+            SKIP_TEMPORAL_STATE_COPY=self.has_flashinfer_replayssm,
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
 
@@ -1632,13 +1585,14 @@ def preprocess_mamba(
                 dst_cols=fused.state_idx.gpu,
                 num_reqs=num_reqs,
             )
-        fused.ctx.run_fused_precopy(
-            num_reqs=num_reqs,
-            state_idx_gpu=fused.state_idx.gpu,
-            src_col_gpu=fused.src_col.gpu,
-            token_bias_gpu=fused.token_bias.gpu,
-            idx_mapping=None,
-        )
+        if fused.ctx.replayssm is None:
+            fused.ctx.run_fused_precopy(
+                num_reqs=num_reqs,
+                state_idx_gpu=fused.state_idx.gpu,
+                src_col_gpu=fused.src_col.gpu,
+                token_bias_gpu=fused.token_bias.gpu,
+                idx_mapping=None,
+            )
     else:
         do_mamba_copy_block(copy_bufs)
 
@@ -1695,7 +1649,7 @@ def postprocess_mamba_align_gpu(
     bufs: "MambaBuffers",
     num_reqs: int,
     num_accepted_tokens_gpu: torch.Tensor,
-    num_accepted_tokens_cpu_tensor: torch.Tensor,
+    num_accepted_tokens_cpu_tensor: torch.Tensor | None,
     input_batch: GPUInputBatch,
     kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
@@ -1752,20 +1706,17 @@ def postprocess_mamba_align_gpu(
             num_accepted_tokens=accepted_tokens_for_postprocess,
             is_prefilling=ctx.is_prefilling_buf.gpu,
             live_cols=ctx.mamba_state_idx_buf.gpu,
-            materialize_dst_cols=ctx.materialize_dst_cols,
-            materialize_token_counts=ctx.materialize_token_counts,
             num_reqs=num_reqs,
         )
         if ctx.replayssm.materialize_prefixes:
             ctx.replayssm.materialize()
 
-    # ``num_accepted_tokens_out`` is pre-initialized from
-    # ``num_accepted_tokens_gpu``; the kernel only overwrites entries to 1
-    # when src_block_idx == dest_block_idx (copy within the same block), so
-    # the original count is preserved for everyone else.
-    num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-        accepted_tokens_for_postprocess[:num_reqs], non_blocking=True
-    )
+    if num_accepted_tokens_cpu_tensor is not None:
+        # CPU consumers need the normalized live counts for the next step, not
+        # the original snapshot retained for ReplaySSM.
+        num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+            num_accepted_tokens_gpu[:num_reqs], non_blocking=True
+        )
 
 
 def stage_postprocess_inputs_to_gpu(

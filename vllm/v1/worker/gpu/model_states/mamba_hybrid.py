@@ -255,13 +255,14 @@ class MambaHybridModelState(DefaultModelState):
                 dst_cols=self._mamba_state_idx_gpu,
                 num_reqs=num_reqs,
             )
-        ctx.run_fused_precopy(
-            num_reqs,
-            self._mamba_state_idx_gpu,
-            self._mamba_src_col_gpu,
-            self._mamba_src_off_gpu,
-            input_batch.idx_mapping,
-        )
+        if replayssm is None:
+            ctx.run_fused_precopy(
+                num_reqs,
+                self._mamba_state_idx_gpu,
+                self._mamba_src_col_gpu,
+                self._mamba_src_off_gpu,
+                input_batch.idx_mapping,
+            )
 
     def prepare_attn(
         self,
@@ -488,8 +489,6 @@ class MambaHybridModelState(DefaultModelState):
                 if self._needs_prefix_state_migration
                 else self._replayssm_live_cols_gpu
             ),
-            materialize_dst_cols=ctx.materialize_dst_cols,
-            materialize_token_counts=ctx.materialize_token_counts,
             num_reqs=num_reqs,
         )
         if replayssm.materialize_prefixes:

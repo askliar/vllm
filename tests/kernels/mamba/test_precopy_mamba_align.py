@@ -194,7 +194,6 @@ def test_precopy_matches_v1_copy_specs(
     base, blk_stride, elem, inner, width, group, drc, drs = _build_meta(
         convs, ssms, device, conv_state_dim_first
     )
-    state_skip_precopy = torch.zeros(NUM_LAYERS * 2, dtype=torch.int32, device=device)
     bt_ptrs = torch.tensor([bt.data_ptr()], dtype=torch.int64, device=device)
     idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
     grid = (num_reqs, NUM_LAYERS * 2, temporal_tiles)
@@ -210,7 +209,6 @@ def test_precopy_matches_v1_copy_specs(
         inner,
         width,
         group,
-        state_skip_precopy,
         drc,
         drs,
         idx_mapping if has_idx_mapping else None,

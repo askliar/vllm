@@ -1429,6 +1429,117 @@ def test_input_batch_reinitialized_after_late_interleave_adjustment(monkeypatch)
     assert input_batch_cls.call_args.kwargs["cp_kv_cache_interleave_size"] == 16
 
 
+def test_replayssm_stp_keeps_accepted_one_without_cpu_copy(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner._use_flashinfer_replayssm = True
+    runner._needs_prefix_state_migration = False
+    runner.num_spec_tokens = 0
+    runner.speculative_config = None
+    runner.model_config = SimpleNamespace(is_hybrid=True)
+    runner.num_accepted_tokens = SimpleNamespace(gpu=torch.ones(2, dtype=torch.int32))
+    accepted_cpu = torch.full((2,), 9, dtype=torch.int32)
+    runner.input_batch = SimpleNamespace(num_accepted_tokens_cpu_tensor=accepted_cpu)
+    runner.kv_cache_config = Mock()
+    runner.cache_config = SimpleNamespace(mamba_cache_mode="none")
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner._get_mamba_bufs = Mock(return_value=Mock())
+    runner._get_mamba_state_copy_funcs = Mock(return_value={})
+    runner.num_accepted_tokens_event = None
+    postprocess = Mock()
+    monkeypatch.setattr(
+        gpu_model_runner_module.mamba_utils,
+        "postprocess_mamba_align_gpu",
+        postprocess,
+    )
+
+    runner._update_states_after_model_execute(
+        torch.tensor([[42], [-1]], dtype=torch.int64), Mock()
+    )
+
+    assert runner.num_accepted_tokens.gpu.tolist() == [1, 1]
+    assert accepted_cpu.tolist() == [9, 9]
+    assert postprocess.call_args.kwargs["num_accepted_tokens_cpu_tensor"] is None
+
+
+def test_v1_caches_replayssm_block_copy_tensors_after_binding(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.cache_config = SimpleNamespace(get_resolved_kv_cache_layout=Mock())
+    runner.shared_kv_cache_layers = {}
+    runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="mamba"))
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.kv_caches = []
+    events = []
+    extra = torch.empty(1)
+    monkeypatch.setattr(
+        gpu_model_runner_module, "allocate_kv_cache", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "allocate_replayssm_caches",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "bind_kv_cache",
+        lambda *_args, **_kwargs: events.append("bind"),
+    )
+
+    def get_extra(_context):
+        assert events == ["bind"]
+        events.append("validate")
+        return [extra]
+
+    monkeypatch.setattr(
+        gpu_model_runner_module, "get_replayssm_block_copy_tensors", get_extra
+    )
+
+    runner.initialize_kv_cache_tensors(
+        SimpleNamespace(kv_cache_groups=[]), kernel_block_sizes=[]
+    )
+
+    assert events == ["bind", "validate"]
+    assert len(runner.replayssm_block_copy_tensors) == 1
+    assert runner.replayssm_block_copy_tensors[0] is extra
+
+
+def test_v2_block_copy_reuses_cached_replayssm_tensors(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as v2_model_runner_module
+
+    runner = object.__new__(v2_model_runner_module.GPUModelRunner)
+    runner.req_states = SimpleNamespace(
+        num_computed_tokens_np=np.zeros(1, dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.zeros(1, dtype=np.int32)),
+        num_computed_prefill_tokens=np.zeros(1, dtype=np.int32),
+    )
+    runner.block_tables = Mock()
+    runner.kv_block_zeroer = Mock()
+    canonical = torch.empty(1)
+    extra = torch.empty(1)
+    runner.kv_caches = [canonical]
+    runner.replayssm_block_copy_tensors = [extra]
+    runner.kv_cache_config = SimpleNamespace(num_blocks=4)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.kv_cache_block_copies = [Mock()]
+    copy_blocks = Mock()
+    monkeypatch.setattr(
+        v2_model_runner_module, "copy_kv_cache_blocks_inplace", copy_blocks
+    )
+    monkeypatch.setattr(
+        v2_model_runner_module,
+        "get_replayssm_block_copy_tensors",
+        Mock(side_effect=AssertionError("hot path must use cached tensors")),
+    )
+
+    runner.update_requests(scheduler_output)
+
+    assert copy_blocks.call_count == 1
+    copied_tensors = copy_blocks.call_args.args[0]
+    assert len(copied_tensors) == 2
+    assert copied_tensors[0] is canonical
+    assert copied_tensors[1] is extra
+
+
 def test_v2_runner_snapshots_late_interleave_adjustment(monkeypatch):
     from vllm.v1.worker.gpu import model_runner as v2_model_runner_module
 

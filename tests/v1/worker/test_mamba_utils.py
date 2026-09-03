@@ -215,8 +215,8 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
         "expected_accepted",
     ),
     [
-        pytest.param(True, 4, ["reset", "copy"], 3, id="replayssm-boundary"),
-        pytest.param(True, 3, ["reset", "copy"], 3, id="replayssm-no-boundary"),
+        pytest.param(True, 4, ["reset"], 3, id="replayssm-boundary"),
+        pytest.param(True, 3, ["reset"], 3, id="replayssm-no-boundary"),
         pytest.param(False, 4, ["copy"], 1, id="generic"),
     ],
 )
@@ -279,9 +279,13 @@ def test_postprocess_mamba_align_materializes_prefixes():
     ctx.num_draft_tokens_buf = MagicMock()
     ctx.is_prefilling_buf = MagicMock()
     ctx.num_accepted_tokens_out = torch.tensor([3], dtype=torch.int32)
-    ctx.materialize_dst_cols = torch.tensor([1], dtype=torch.int32)
-    ctx.materialize_token_counts = torch.tensor([2], dtype=torch.int32)
-    ctx.run_fused_postprocess.side_effect = lambda **kwargs: order.append("copy")
+    accepted = torch.tensor([3], dtype=torch.int32)
+
+    def run_fused_postprocess(**kwargs):
+        order.append("copy")
+        kwargs["num_accepted_tokens_gpu"].fill_(1)
+
+    ctx.run_fused_postprocess.side_effect = run_fused_postprocess
     ctx.replayssm = MagicMock()
     ctx.replayssm.materialize_prefixes = True
     ctx.replayssm.postprocess.side_effect = lambda **kwargs: order.append("postprocess")
@@ -297,7 +301,7 @@ def test_postprocess_mamba_align_materializes_prefixes():
     postprocess_mamba_align_gpu(
         bufs=MagicMock(postprocess_align=ctx),
         num_reqs=1,
-        num_accepted_tokens_gpu=torch.tensor([3], dtype=torch.int32),
+        num_accepted_tokens_gpu=accepted,
         num_accepted_tokens_cpu_tensor=accepted_cpu,
         input_batch=input_batch,
         kv_cache_config=kv_cache_config,
@@ -307,7 +311,10 @@ def test_postprocess_mamba_align_materializes_prefixes():
     )
 
     assert order == ["copy", "postprocess", "materialize"]
-    assert accepted_cpu.tolist() == [3]
+    assert ctx.replayssm.postprocess.call_args.kwargs["num_accepted_tokens"] is (
+        ctx.num_accepted_tokens_out
+    )
+    assert accepted_cpu.tolist() == [1]
 
 
 def test_postprocess_mamba_none_skips_prefix_copy():
@@ -319,8 +326,6 @@ def test_postprocess_mamba_none_skips_prefix_copy():
     ctx.num_computed_tokens_buf = MagicMock(gpu=torch.tensor([20], dtype=torch.int32))
     ctx.num_draft_tokens_buf = MagicMock(gpu=torch.tensor([3], dtype=torch.int32))
     ctx.is_prefilling_buf = MagicMock(gpu=torch.tensor([False]))
-    ctx.materialize_dst_cols = torch.full((1,), -1, dtype=torch.int32)
-    ctx.materialize_token_counts = torch.zeros(1, dtype=torch.int32)
     ctx.block_size = 1024
     ctx.replayssm = MagicMock()
     ctx.replayssm.materialize_prefixes = False
@@ -496,8 +501,7 @@ def test_gpu_context_initializes_flashinfer_replayssm_lifecycle():
             [torch.empty(1, 4, dtype=torch.int32)],
         )
 
-    assert gpu_ctx.state_skip_postprocess.tolist() == [0, 1]
-    assert gpu_ctx.state_skip_precopy.tolist() == [1, 1]
+    assert gpu_ctx.has_flashinfer_replayssm
     assert gpu_ctx.replayssm is model_ctx
     create.assert_called_once()
 
@@ -1175,15 +1179,20 @@ def _run_gpu_postprocess(
     gpu_ctx.initialize_from_forward_context(
         kv_cache_config, forward_context, copy_funcs, [block_table]
     )
+    accepted_gpu = t(num_accepted_tokens)
     gpu_ctx.run_fused_postprocess(
         num_reqs=len(req_ids),
-        num_accepted_tokens_gpu=t(num_accepted_tokens),
+        num_accepted_tokens_gpu=accepted_gpu,
         mamba_state_idx_gpu=t(mamba_state_idx),
         num_scheduled_tokens_gpu=t([num_scheduled_tokens[r] for r in req_ids]),
         num_computed_tokens_gpu=t(num_computed_tokens),
         num_draft_tokens_gpu=t([num_draft_tokens.get(r, 0) for r in req_ids]),
     )
     torch.accelerator.synchronize()
+    # Keep the normalized live buffer available to the assertions below. The
+    # context-owned buffer now intentionally preserves the original counts for
+    # ReplaySSM.
+    gpu_ctx._test_num_accepted_tokens = accepted_gpu
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1349,7 +1358,7 @@ class TestPostprocessMambaFusedKernel:
             device=device,
         )
         torch.testing.assert_close(
-            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            gpu_ctx._test_num_accepted_tokens[:num_reqs],
             expected_accepted,
             msg="num_accepted_tokens mismatch",
         )
@@ -1414,7 +1423,6 @@ class TestPostprocessMambaFusedKernel:
         # State should be unchanged
         torch.testing.assert_close(conv_state, conv_state_orig)
         torch.testing.assert_close(temporal_state, temporal_state_orig)
-        assert gpu_ctx.materialize_dst_cols[0].item() == -1
 
     @pytest.mark.parametrize("num_reqs", [1, 2, 8, 16])
     def test_various_batch_sizes(self, device, test_config, num_reqs):
@@ -1737,9 +1745,6 @@ class TestPostprocessMambaFusedKernel:
             device=device,
         )
 
-        assert gpu_ctx.materialize_dst_cols[0].item() == 1
-        assert gpu_ctx.materialize_token_counts[0].item() == 1
-
         # --- Verify Python behavior (ground truth) ---
         # State should be unchanged (no copy when src_addr == dst_addr)
         torch.testing.assert_close(
@@ -1775,7 +1780,7 @@ class TestPostprocessMambaFusedKernel:
             device=device,
         )
         torch.testing.assert_close(
-            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            gpu_ctx._test_num_accepted_tokens[:num_reqs],
             expected_accepted,
             msg="GPU num_accepted_tokens should match Python",
         )
@@ -1939,7 +1944,7 @@ class TestPostprocessMambaFusedKernel:
             device=device,
         )
         torch.testing.assert_close(
-            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            gpu_ctx._test_num_accepted_tokens[:num_reqs],
             expected_accepted,
             msg="GPU num_accepted_tokens should match Python",
         )
@@ -2072,7 +2077,7 @@ class TestPostprocessMambaFusedKernel:
             device=device,
         )
         torch.testing.assert_close(
-            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            gpu_ctx._test_num_accepted_tokens[:num_reqs],
             expected_accepted,
             msg="GPU num_accepted_tokens should match Python",
         )
@@ -2207,7 +2212,7 @@ class TestPostprocessMambaFusedKernel:
             device=device,
         )
         torch.testing.assert_close(
-            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            gpu_ctx._test_num_accepted_tokens[:num_reqs],
             expected_accepted,
             msg="GPU num_accepted_tokens should match Python (must NOT be 1)",
         )
@@ -2354,7 +2359,7 @@ class TestPostprocessMambaFusedKernel:
             device=device,
         )
         torch.testing.assert_close(
-            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            gpu_ctx._test_num_accepted_tokens[:num_reqs],
             expected_accepted,
             msg="num_accepted_tokens mismatch with non-sequential block IDs",
         )
@@ -2512,7 +2517,7 @@ class TestPostprocessMambaFusedKernel:
             device=device,
         )
         torch.testing.assert_close(
-            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            gpu_ctx._test_num_accepted_tokens[:num_reqs],
             expected_accepted,
             msg="num_accepted_tokens mismatch in mixed PC batch",
         )
@@ -2641,7 +2646,7 @@ class TestPostprocessMambaFusedKernel:
         # Old kernel (959ca0fd): `if src_addr == dst_addr` -> FAILS here (sets 1)
         # Fixed kernel (6466ce0d): `if src_block_idx == dest_block_idx and
         #   accept_token_bias == 0` -> PASSES (preserves 3)
-        kernel_accepted = gpu_ctx.num_accepted_tokens_out[0].item()
+        kernel_accepted = gpu_ctx._test_num_accepted_tokens[0].item()
         assert kernel_accepted == 3, (
             f"Kernel set num_accepted_tokens to {kernel_accepted} but expected 3. "
             f"The early-return guard likely compared physical addresses "
@@ -2816,7 +2821,7 @@ class TestPostprocessMambaFusedKernel:
             device=device,
         )
         torch.testing.assert_close(
-            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            gpu_ctx._test_num_accepted_tokens[:num_reqs],
             expected_accepted,
             msg="num_accepted_tokens mismatch",
         )
@@ -2962,7 +2967,7 @@ class TestPostprocessMambaFusedKernel:
             device=device,
         )
         torch.testing.assert_close(
-            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            gpu_ctx._test_num_accepted_tokens[:num_reqs],
             expected_accepted,
             msg="num_accepted_tokens mismatch at accept_token_bias=2",
         )
@@ -3132,14 +3137,14 @@ class TestPostprocessMambaFusedKernel:
             [expected_accepted], dtype=torch.int32, device=device
         )
         torch.testing.assert_close(
-            gpu_ctx_sd.num_accepted_tokens_out[:num_reqs],
+            gpu_ctx_sd._test_num_accepted_tokens[:num_reqs],
             expected_accepted_tensor,
             rtol=0,
             atol=0,
             msg="SD num_accepted_tokens result is wrong",
         )
         torch.testing.assert_close(
-            gpu_ctx_ds.num_accepted_tokens_out[:num_reqs],
+            gpu_ctx_ds._test_num_accepted_tokens[:num_reqs],
             expected_accepted_tensor,
             rtol=0,
             atol=0,

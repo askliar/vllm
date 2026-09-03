@@ -55,8 +55,6 @@ def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
     ctx = Mock(
         is_initialized=True,
         replayssm=replayssm,
-        materialize_dst_cols=torch.full((4,), -1, dtype=torch.int32, device="cuda"),
-        materialize_token_counts=torch.zeros(4, dtype=torch.int32, device="cuda"),
         block_size=1024,
     )
     state._mamba_ctx = ctx
@@ -78,6 +76,44 @@ def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
     assert state.num_accepted_tokens_gpu.tolist() == [1, 1, 2, 1]
     assert kwargs["num_accepted_tokens"] is state.num_accepted_tokens_gpu
     assert kwargs["live_cols"] is state._replayssm_live_cols_gpu
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = True
+    state._needs_prefix_state_migration = True
+    state._use_flashinfer_replayssm = True
+    state.recoverssm = None
+    state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32, device="cuda")
+    state._mamba_state_idx_gpu = torch.zeros(4, dtype=torch.int32, device="cuda")
+    state._is_prefilling_gpu = torch.zeros(4, dtype=torch.bool, device="cuda")
+    replayssm = Mock(materialize_prefixes=True)
+    accepted_snapshot = torch.zeros(4, dtype=torch.int32, device="cuda")
+    ctx = Mock(
+        is_initialized=True,
+        replayssm=replayssm,
+        num_accepted_tokens_out=accepted_snapshot,
+    )
+
+    def normalize_live(*_args) -> None:
+        accepted_snapshot.copy_(state.num_accepted_tokens_gpu)
+        state.num_accepted_tokens_gpu[2] = 1
+
+    ctx.run_fused_postprocess_align.side_effect = normalize_live
+    state._mamba_ctx = ctx
+
+    state.postprocess_state(
+        torch.tensor([2], dtype=torch.int32, device="cuda"),
+        torch.tensor([3], dtype=torch.int32, device="cuda"),
+        num_computed_tokens=torch.tensor([0, 0, 8, 0], device="cuda"),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
+    )
+
+    kwargs = replayssm.postprocess.call_args.kwargs
+    assert kwargs["num_accepted_tokens"] is accepted_snapshot
+    assert accepted_snapshot[2].item() == 3
+    assert state.num_accepted_tokens_gpu[2].item() == 1
 
 
 def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:

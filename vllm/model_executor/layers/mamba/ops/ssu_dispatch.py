@@ -28,6 +28,20 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 logger = init_logger(__name__)
 
 
+@triton.jit
+def _mamba_state_copy_boundary(
+    num_tokens_running_state,
+    new_num_computed,
+    block_size: tl.constexpr,
+):
+    """Return the canonical aligned Mamba state-copy decision."""
+    aligned_new_computed = (new_num_computed // block_size) * block_size
+    needs_copy = aligned_new_computed >= num_tokens_running_state
+    accept_token_bias = aligned_new_computed - num_tokens_running_state
+    dest_col = aligned_new_computed // block_size - 1
+    return needs_copy, accept_token_bias, dest_col
+
+
 @triton.jit(do_not_specialize=["num_reqs"])
 def _reset_new_replayssm_slots_kernel(
     idx_mapping,
@@ -91,8 +105,6 @@ def _postprocess_replayssm_kernel(
     num_accepted_tokens,
     is_prefilling,
     live_cols,
-    materialize_dst_cols,
-    materialize_token_counts,
     block_table,
     tracker_start,
     tracker_committed,
@@ -100,7 +112,6 @@ def _postprocess_replayssm_kernel(
     dst_slots,
     plan_ring_start,
     plan_flush_count,
-    active_request_indices,
     block_table_stride_req: tl.int64,
     slot_table_stride_layer: tl.int64,
     tracker_capacity,
@@ -114,59 +125,18 @@ def _postprocess_replayssm_kernel(
     NUM_COMPUTED_IS_POST_STEP: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr,
     MATERIALIZE_PREFIXES: tl.constexpr,
-    MAX_NUM_REQS: tl.constexpr,
 ) -> None:
     """Commit a completed step and prepare an optional prefix snapshot."""
     batch_idx = tl.program_id(0)
 
-    # FlashInfer requires active rows to be a compact prefix. Resolve physical
-    # validity per group so divergent group mappings remain independent.
-    if MATERIALIZE_PREFIXES & (batch_idx == 0):
-        active_count = 0
-        for candidate_idx in tl.range(0, num_reqs):
-            candidate_req_idx = candidate_idx
-            if HAS_IDX_MAPPING:
-                candidate_req_idx = tl.load(idx_mapping + candidate_idx)
-            valid_candidate = candidate_req_idx >= 0
-            live_col = tl.load(
-                live_cols + candidate_req_idx,
-                mask=valid_candidate,
-                other=-1,
-            )
-            dst_col = tl.load(
-                materialize_dst_cols + candidate_idx,
-                mask=valid_candidate,
-                other=-1,
-            )
-            wants_materialize = valid_candidate & (live_col >= 0) & (dst_col >= 0)
-            live_slot = tl.load(
-                block_table + candidate_idx * block_table_stride_req + live_col,
-                mask=wants_materialize,
-                other=PAD_SLOT_ID,
-            )
-            dst_slot = tl.load(
-                block_table + candidate_idx * block_table_stride_req + dst_col,
-                mask=wants_materialize,
-                other=PAD_SLOT_ID,
-            )
-            valid_materialize = (
-                wants_materialize
-                & (live_slot != PAD_SLOT_ID)
-                & (dst_slot != PAD_SLOT_ID)
-                & (live_slot >= 0)
-                & (dst_slot >= 0)
-                & (live_slot < tracker_capacity)
-                & (dst_slot < tracker_capacity)
-            )
-            if valid_materialize:
-                tl.store(active_request_indices + active_count, candidate_idx)
-                active_count += 1
-        if active_count < MAX_NUM_REQS:
-            tl.store(active_request_indices + active_count, -1)
-
-    # Clear the fixed-capacity plan row before any per-request early exit.
+    # Clear all fixed-capacity outputs before any per-request early exit. This
+    # prevents a shorter batch from reusing stale materialization slots.
     tl.store(plan_ring_start + batch_idx, 0)
     tl.store(plan_flush_count + batch_idx, -1)
+    for layer_idx in tl.static_range(0, NUM_LAYERS):
+        slot_offset = layer_idx * slot_table_stride_layer + batch_idx
+        tl.store(src_slots + slot_offset, PAD_SLOT_ID)
+        tl.store(dst_slots + slot_offset, PAD_SLOT_ID)
     if batch_idx >= num_reqs:
         return
 
@@ -175,6 +145,40 @@ def _postprocess_replayssm_kernel(
         req_idx = tl.load(idx_mapping + batch_idx)
         if req_idx < 0:
             return
+
+    if QUERY_METADATA_IS_CUMULATIVE:
+        query_len = tl.load(query_metadata + batch_idx + 1) - tl.load(
+            query_metadata + batch_idx
+        )
+    else:
+        query_len = tl.load(query_metadata + batch_idx)
+
+    computed = tl.load(num_computed_tokens + req_idx)
+    computed_before = tl.where(
+        NUM_COMPUTED_IS_POST_STEP, computed - query_len, computed
+    )
+    # Mamba attention runs a one-token final prefill chunk with prior state as
+    # decode. Commit the same transition here instead of resetting its cursors.
+    prefilling = tl.load(is_prefilling + batch_idx)
+    prefilling = prefilling & ((query_len != 1) | (computed_before <= 0))
+    accepted = tl.maximum(tl.load(num_accepted_tokens + req_idx), 1)
+
+    # Derive this request's pre/post-step positions from ReplaySSM metadata,
+    # then share the canonical copy-boundary calculation with the generic
+    # Mamba state-copy kernel.
+    computed_after = tl.where(
+        prefilling,
+        computed_before + query_len,
+        computed if NUM_COMPUTED_IS_POST_STEP else computed_before + accepted,
+    )
+    running_state_pos = tl.where(
+        prefilling, computed_after, computed_after - accepted + 1
+    )
+    boundary, accept_token_bias, dst_col = _mamba_state_copy_boundary(
+        running_state_pos,
+        computed_after,
+        MAMBA_BLOCK_SIZE,
+    )
 
     live_col = tl.load(live_cols + req_idx)
     valid_live_col = live_col >= 0
@@ -189,8 +193,7 @@ def _postprocess_replayssm_kernel(
         & (live_slot >= 0)
         & (live_slot < tracker_capacity)
     )
-    dst_col = tl.load(materialize_dst_cols + batch_idx)
-    wants_materialize = valid_live & (dst_col >= 0)
+    wants_materialize = MATERIALIZE_PREFIXES & valid_live & boundary & (dst_col >= 0)
     dst_slot = tl.load(
         block_table + batch_idx * block_table_stride_req + dst_col,
         mask=wants_materialize,
@@ -212,23 +215,6 @@ def _postprocess_replayssm_kernel(
             dst_slots + slot_offset,
             tl.where(materialize, dst_slot, PAD_SLOT_ID),
         )
-
-    prefilling = tl.load(is_prefilling + batch_idx)
-    if QUERY_METADATA_IS_CUMULATIVE:
-        query_len = tl.load(query_metadata + batch_idx + 1) - tl.load(
-            query_metadata + batch_idx
-        )
-    else:
-        query_len = tl.load(query_metadata + batch_idx)
-
-    computed = tl.load(num_computed_tokens + req_idx)
-    computed_before = tl.where(
-        NUM_COMPUTED_IS_POST_STEP, computed - query_len, computed
-    )
-    # Mamba attention runs a one-token final prefill chunk with prior state as
-    # decode. Commit the same transition here instead of resetting its cursors.
-    prefilling = prefilling & ((query_len != 1) | (computed_before <= 0))
-
     if prefilling:
         computed_after = computed_before + query_len
         first_col = tl.maximum(computed_before // MAMBA_BLOCK_SIZE, 0)
@@ -251,7 +237,6 @@ def _postprocess_replayssm_kernel(
             # Prefill produced canonical state, so publish an exact copy.
             tl.store(plan_flush_count + batch_idx, 0)
     elif valid_live:
-        accepted = tl.maximum(tl.load(num_accepted_tokens + req_idx), 1)
         old_start = tl.load(tracker_start + live_slot)
         old_committed = tl.load(tracker_committed + live_slot)
         checkpointed = old_committed + query_len > LOGICAL_WINDOW
@@ -265,16 +250,38 @@ def _postprocess_replayssm_kernel(
         tl.store(tracker_committed + live_slot, next_committed)
 
         if materialize:
-            boundary_count = tl.load(materialize_token_counts + batch_idx)
             tl.store(plan_ring_start + batch_idx, next_start)
             tl.store(
                 plan_flush_count + batch_idx,
-                boundary_count + tl.where(checkpointed, 0, old_committed),
+                accept_token_bias + 1 + tl.where(checkpointed, 0, old_committed),
             )
 
     # The published destination is canonical and therefore has no live replay.
     tl.store(tracker_start + dst_slot, 0, mask=materialize)
     tl.store(tracker_committed + dst_slot, 0, mask=materialize)
+
+
+@triton.jit
+def _compact_replayssm_requests_kernel(
+    plan_flush_count,
+    active_request_indices,
+    num_reqs,
+    MAX_NUM_REQS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    """Build FlashInfer's active-prefix request list in one parallel program."""
+    offsets = tl.arange(0, BLOCK_SIZE)
+    in_capacity = offsets < MAX_NUM_REQS
+    active = (offsets < num_reqs) & (
+        tl.load(plan_flush_count + offsets, mask=in_capacity, other=-1) >= 0
+    )
+    candidates = tl.where(active, offsets, MAX_NUM_REQS)
+    compacted = tl.sort(candidates, dim=0)
+    tl.store(
+        active_request_indices + offsets,
+        tl.where(compacted < MAX_NUM_REQS, compacted, -1),
+        mask=in_capacity,
+    )
 
 
 def _replayssm_specialization_key(mixer: Any) -> tuple[Any, ...]:
@@ -437,8 +444,6 @@ class _ReplaySSMGroupContext:
         num_accepted_tokens: torch.Tensor,
         is_prefilling: torch.Tensor,
         live_cols: torch.Tensor,
-        materialize_dst_cols: torch.Tensor,
-        materialize_token_counts: torch.Tensor,
         num_reqs: int,
     ) -> None:
         """Commit a completed step and prepare an optional prefix snapshot."""
@@ -451,8 +456,6 @@ class _ReplaySSMGroupContext:
             num_accepted_tokens,
             is_prefilling,
             live_cols,
-            materialize_dst_cols,
-            materialize_token_counts,
             self.block_table,
             self.ring_start,
             self.num_committed,
@@ -460,7 +463,6 @@ class _ReplaySSMGroupContext:
             self.dst_slots,
             self.plan_ring_start,
             self.plan_flush_count,
-            self.active_request_indices,
             self.block_table.stride(0),
             self.src_slots.stride(0),
             self.num_committed.numel(),
@@ -474,8 +476,15 @@ class _ReplaySSMGroupContext:
             NUM_COMPUTED_IS_POST_STEP=num_computed_is_post_step,
             HAS_IDX_MAPPING=idx_mapping is not None,
             MATERIALIZE_PREFIXES=self.materialize_prefixes,
-            MAX_NUM_REQS=self.max_num_reqs,
         )
+        if self.materialize_prefixes:
+            _compact_replayssm_requests_kernel[(1,)](
+                self.plan_flush_count,
+                self.active_request_indices,
+                num_reqs,
+                MAX_NUM_REQS=self.max_num_reqs,
+                BLOCK_SIZE=triton.next_power_of_2(self.max_num_reqs),
+            )
 
     def materialize(self) -> None:
         """Publish the canonical prefix snapshots prepared by ``postprocess``."""

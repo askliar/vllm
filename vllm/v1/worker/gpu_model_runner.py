@@ -617,6 +617,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.replayssm_block_copy_tensors: list[torch.Tensor] = []
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
@@ -1251,12 +1252,7 @@ class GPUModelRunner(
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                [
-                    *self.kv_caches,
-                    *get_replayssm_block_copy_tensors(
-                        self.compilation_config.static_forward_context
-                    ),
-                ],
+                [*self.kv_caches, *self.replayssm_block_copy_tensors],
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
@@ -1615,11 +1611,14 @@ class GPUModelRunner(
         ):
             return
 
-        # Count the number of accepted tokens for each sequence.
-        # Valid tokens are contiguous from position 0, so counting non-(-1)
-        # tokens gives us the first -1 position (i.e., number of accepted).
         num_reqs = output_token_ids.size(0)
-        self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+        if self.num_spec_tokens:
+            # Valid tokens are contiguous from position 0, so counting
+            # non-(-1) tokens gives the number accepted. STP is invariantly one
+            # and the input preparation already maintains that neutral value.
+            self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(
+                dim=1
+            )
 
         if self._needs_prefix_state_migration or self._use_flashinfer_replayssm:
             # Fused GPU postprocess: state copies + per-request accepted-token
@@ -1632,6 +1631,8 @@ class GPUModelRunner(
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
                 num_accepted_tokens_cpu_tensor=(
                     self.input_batch.num_accepted_tokens_cpu_tensor
+                    if self.num_spec_tokens
+                    else None
                 ),
                 input_batch=self.input_batch,
                 kv_cache_config=self.kv_cache_config,
@@ -6703,6 +6704,8 @@ class GPUModelRunner(
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
             self.kv_caches.clear()
+        if hasattr(self, "replayssm_block_copy_tensors"):
+            self.replayssm_block_copy_tensors.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
@@ -7491,6 +7494,11 @@ class GPUModelRunner(
             num_attn_module,
             kv_cache_groups=kv_cache_config.kv_cache_groups,
             replayssm_caches=replayssm_caches,
+        )
+        # Validate and cache optional ReplaySSM-owned state once cache binding
+        # has populated every layer. Block copies are a per-step hot path.
+        self.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
+            self.compilation_config.static_forward_context
         )
         return kv_caches
 
