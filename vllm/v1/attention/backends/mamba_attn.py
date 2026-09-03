@@ -181,11 +181,9 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
         self.decode_replayssm_state_indices_d: torch.Tensor | None = None
-        # ReplaySSM CUDA-graph buffers for the selected backend.
-        if self.use_replayssm:
-            assert len(kv_cache_spec.replayssm_shapes) == 3, (
-                "FlashInfer ReplaySSM requires x, dt, and B ring-state tensors"
-            )
+        # Canonical state is (conv, ssm). ReplaySSM auxiliaries are ordered as
+        # x=(nheads, ring, head_dim), dt=(nheads, ring),
+        # B=(ngroups, ring, dstate).
         if self.use_replayssm and not self.use_flashinfer_replayssm:
             self.decode_write_pos_d: torch.Tensor = torch.empty(
                 (self.decode_cudagraph_max_bs,),
@@ -197,7 +195,6 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 dtype=torch.int8,
                 device=device,
             )
-            # B_cache shape = (ngroups, replayssm_buffer_len, dstate).
             bc_ngroups = kv_cache_spec.replayssm_shapes[2][0]
             bc_scratch_bs = max(
                 self.decode_cudagraph_max_bs, scheduler_config.max_num_seqs

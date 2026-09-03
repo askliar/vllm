@@ -292,10 +292,10 @@ def test_replayssm_flashinfer_backend_init():
 def test_replayssm_physical_ring_shape(
     backend, num_speculative_tokens, expected_ring_len
 ):
-    base_shapes = ((64, 3), (8, 4, 16))
-
-    shapes = MambaStateShapeCalculator.append_replayssm_ring(
-        base_shapes,
+    shapes = MambaStateShapeCalculator.replayssm_ring_shapes(
+        num_heads=16,
+        head_dim=4,
+        state_size=16,
         n_groups=4,
         tp_world_size=2,
         logical_window=16,
@@ -303,7 +303,7 @@ def test_replayssm_physical_ring_shape(
         num_speculative_tokens=num_speculative_tokens,
     )
 
-    assert shapes[2:] == (
+    assert shapes == (
         (8, expected_ring_len, 4),
         (8, expected_ring_len),
         (2, expected_ring_len, 16),

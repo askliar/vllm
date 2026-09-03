@@ -56,7 +56,11 @@ def _reset_new_replayssm_slots_kernel(
     PAD_SLOT_ID: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr,
 ) -> None:
-    """Reset cursors only when this cache group has no physical source."""
+    """Reset a fresh destination in this cache group's physical slot space.
+
+    Source and destination are logical block-table columns. Their slot lookups
+    distinguish a missing group-local source from a continuation.
+    """
     batch_idx = tl.program_id(0)
     active = batch_idx < num_reqs
     req_idx = batch_idx

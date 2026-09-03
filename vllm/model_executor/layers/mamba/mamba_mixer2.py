@@ -1226,15 +1226,16 @@ class MambaMixer2(MambaBase, PluggableLayer):
             return ()
         assert self.replayssm_buffer_len is not None
         tp_world_size = get_tensor_model_parallel_world_size()
-        base_shape = self.get_state_shape()
-        return MambaStateShapeCalculator.append_replayssm_ring(
-            base_shapes=base_shape,
+        return MambaStateShapeCalculator.replayssm_ring_shapes(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            state_size=self.ssm_state_size,
             n_groups=self.n_groups,
             tp_world_size=tp_world_size,
             logical_window=self.replayssm_buffer_len,
             backend=self.mamba_config.backend,
             num_speculative_tokens=self.num_spec,
-        )[len(base_shape) :]
+        )
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:

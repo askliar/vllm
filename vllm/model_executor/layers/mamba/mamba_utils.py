@@ -215,28 +215,25 @@ class MambaStateShapeCalculator:
         return conv_state_shape, temporal_state_shape
 
     @classmethod
-    def append_replayssm_ring(
+    def replayssm_ring_shapes(
         cls,
-        base_shapes: tuple[tuple[int, ...], ...],
+        num_heads: int,
+        head_dim: int,
+        state_size: int,
         n_groups: int,
         tp_world_size: int,
         logical_window: int,
         backend: MambaBackendEnum,
         num_speculative_tokens: int = 0,
     ) -> tuple[tuple[int, ...], ...]:
-        """Append the physical ReplaySSM ring shapes.
-
-        ``base_shapes[1]`` is ``(nheads // tp, head_dim, state_size)``;
-        B_cache uses the un-extended ``n_groups``.
-        """
+        """Return the physical x, dt, and B ring shapes."""
         ring_buffer_len = logical_window
         if backend == MambaBackendEnum.FLASHINFER:
             # FlashInfer keeps the live window and current verify window together.
             ring_buffer_len += 1 + num_speculative_tokens
-        local_nheads, head_dim, state_size = base_shapes[1]
+        local_nheads = divide(num_heads, tp_world_size)
         local_ngroups = divide(n_groups, tp_world_size)
         return (
-            *base_shapes,
             (local_nheads, ring_buffer_len, head_dim),
             (local_nheads, ring_buffer_len),
             (local_ngroups, ring_buffer_len, state_size),
