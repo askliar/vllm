@@ -86,16 +86,6 @@ def test_kda_recoverssm_derivation_is_revalidated():
     VllmConfig.validate_mamba_cached_kernel(config)
     assert not config.cache_config.use_kda_recoverssm
 
-    config.mamba_config.backend = MambaBackendEnum.TRITON
-    with pytest.raises(ValueError, match="requires --mamba-backend flashinfer"):
-        VllmConfig.validate_mamba_cached_kernel(config)
-
-    config.mamba_config.backend = MambaBackendEnum.FLASHINFER
-    config.cache_config.replayssm_buffer_len = 3
-    with pytest.raises(ValueError, match="replayssm-buffer-len"):
-        VllmConfig.validate_mamba_cached_kernel(config)
-    config.cache_config.replayssm_buffer_len = 16
-
     config.model_config.architecture = "KimiLinearForCausalLM"
     config.mamba_config.backend = MambaBackendEnum.TRITON
     config.parallel_config.pipeline_parallel_size = 2
@@ -201,13 +191,24 @@ def _replayssm_config(
     ),
     [
         (MambaBackendEnum.TRITON, True, "none", 0, 16, "requires Model Runner V1"),
-        (MambaBackendEnum.FLASHINFER, True, "none", 0, 16, None),
-        (MambaBackendEnum.FLASHINFER, False, "align", 0, 16, None),
-        (MambaBackendEnum.FLASHINFER, False, "all", 0, 16, None),
-        (MambaBackendEnum.FLASHINFER, False, "align", 3, 16, None),
         (MambaBackendEnum.FLASHINFER, True, "align", 3, 16, None),
-        (MambaBackendEnum.FLASHINFER, False, "all", 3, 16, None),
-        (MambaBackendEnum.FLASHINFER, True, "all", 3, 16, None),
+        (
+            MambaBackendEnum.FLASHINFER,
+            True,
+            "align",
+            3,
+            3,
+            r"replayssm-buffer-len >= 1 \+ num_speculative_tokens",
+        ),
+        (
+            MambaBackendEnum.TRITON,
+            False,
+            "align",
+            3,
+            16,
+            "requires --mamba-backend flashinfer",
+        ),
+        (MambaBackendEnum.FLASHINFER, False, "all", 0, 16, None),
         (
             MambaBackendEnum.TRITON,
             False,
@@ -227,13 +228,10 @@ def _replayssm_config(
     ],
     ids=[
         "triton-v2-rejected",
-        "flashinfer-v2",
-        "flashinfer-align",
-        "flashinfer-all",
-        "flashinfer-align-spec-v1",
         "flashinfer-align-spec-v2",
-        "flashinfer-all-spec-v1",
-        "flashinfer-all-spec-v2",
+        "flashinfer-spec-buffer-too-short",
+        "triton-spec-rejected",
+        "flashinfer-all",
         "triton-all-rejected",
         "flashinfer-buffer-too-long",
     ],

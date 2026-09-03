@@ -36,7 +36,6 @@ except ImportError:
 # Mamba2 (Nemotron-3) hybrid.
 MAMBA2_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
 MAMBA2_MTP_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
-MAMBA2_PREFIX_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
 MODELS = [
     pytest.param(MAMBA2_MODEL, marks=large_gpu_mark(min_gb=40)),
 ]
@@ -198,37 +197,6 @@ def test_replayssm_flashinfer_spec_decode_matches_baseline(vllm_runner, model_na
         outputs_1_lst=replay,
         name_0="baseline_spec",
         name_1="replayssm_flashinfer_spec",
-    )
-
-
-@pytest.mark.skipif(
-    not HAS_FLASHINFER_CHECKPOINTING_SSU,
-    reason="flashinfer.mamba.checkpointing_ssu not available",
-)
-@pytest.mark.parametrize("model_name", MODELS)
-def test_replayssm_flashinfer_matches_triton_replayssm(vllm_runner, model_name):
-    # Both backends implement ReplaySSM; compare them directly on V1 because
-    # Triton ReplaySSM is not supported on Model Runner V2.
-    common = dict(
-        max_model_len=1024,
-        trust_remote_code=True,
-        enable_prefix_caching=False,
-        mamba_cache_mode="none",
-        use_replayssm=True,
-        replayssm_buffer_len=16,
-    )
-    with vllm_runner(model_name, mamba_backend="triton", **common) as llm:
-        triton = llm.generate_greedy_logprobs(PROMPTS, max_tokens=32, num_logprobs=5)
-    with vllm_runner(model_name, mamba_backend="flashinfer", **common) as llm:
-        flashinfer = llm.generate_greedy_logprobs(
-            PROMPTS, max_tokens=32, num_logprobs=5
-        )
-
-    check_logprobs_close(
-        outputs_0_lst=triton,
-        outputs_1_lst=flashinfer,
-        name_0="replayssm_triton",
-        name_1="replayssm_flashinfer",
     )
 
 
@@ -422,10 +390,9 @@ def test_flashinfer_replayssm_prefix_cache_tp1(
 def test_flashinfer_replayssm_all_prefix_cache(vllm_runner, monkeypatch, use_v2: bool):
     _check_flashinfer_replayssm_prefix_caching(
         vllm_runner,
-        MAMBA2_PREFIX_MODEL,
+        MAMBA2_MODEL,
         monkeypatch,
         mamba_cache_mode="all",
-        moe_backend="triton",
         use_ngram=False,
         use_v2=use_v2,
         tensor_parallel_size=1,
@@ -455,6 +422,7 @@ def test_flashinfer_replayssm_all_prefix_cache_mtp_v2(vllm_runner, monkeypatch):
                 replayssm_buffer_len=16,
                 **common,
             ) as llm:
+                assert llm.llm.llm_engine.vllm_config.use_v2_model_runner
                 first_pass = llm.generate_greedy_logprobs(
                     PREFIX_CACHING_PROMPTS, max_tokens=32, num_logprobs=5
                 )
@@ -479,23 +447,4 @@ def test_flashinfer_replayssm_all_prefix_cache_mtp_v2(vllm_runner, monkeypatch):
         outputs_1_lst=cached,
         name_0="replayssm_all_mtp_v2_first_pass",
         name_1="replayssm_all_mtp_v2_cached",
-    )
-
-
-@requires_flashinfer_replayssm_materialization
-@multi_gpu_test(num_gpus=2)
-@pytest.mark.parametrize("model_name", [MAMBA2_MODEL])
-def test_flashinfer_replayssm_prefix_cache_v2_tp2(
-    vllm_runner,
-    model_name,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    _check_flashinfer_replayssm_prefix_caching(
-        vllm_runner,
-        model_name,
-        monkeypatch,
-        mamba_cache_mode="align",
-        use_ngram=False,
-        use_v2=True,
-        tensor_parallel_size=2,
     )

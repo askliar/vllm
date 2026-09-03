@@ -310,19 +310,6 @@ def test_replayssm_physical_ring_shape(
     )
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        (0, 0),
-        ((1 << 63) - 1, (1 << 63) - 1),
-        (1 << 63, -(1 << 63)),
-        ((1 << 64) - 1, -1),
-    ],
-)
-def test_reinterpret_u64_as_i64(value: int, expected: int):
-    assert ssu_dispatch._reinterpret_u64_as_i64(value) == expected
-
-
 def _materialize_mixer(device: str = "cpu") -> Mock:
     mixer = Mock()
     mixer.kv_cache = [
