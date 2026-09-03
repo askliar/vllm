@@ -206,7 +206,7 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
     assert events == ["receive", "postprocess_num_computed_tokens", "eplb"]
 
 
-def test_v2_sample_tokens_publishes_state_after_drafting(monkeypatch):
+def test_v2_sample_tokens_postprocesses_state_before_drafting(monkeypatch):
     events: list[Any] = []
     runner = _make_runner()
     input_batch = SimpleNamespace(
@@ -262,8 +262,8 @@ def test_v2_sample_tokens_publishes_state_after_drafting(monkeypatch):
         draft_tokens=torch.zeros((1, 1), dtype=torch.int64),
     )
 
-    def postprocess_state(*_, defer_after_drafting=False):
-        events.append(("postprocess", defer_after_drafting))
+    def postprocess_state(*_):
+        events.append("postprocess")
 
     def propose(*_, **__):
         events.append("draft")
@@ -272,7 +272,6 @@ def test_v2_sample_tokens_publishes_state_after_drafting(monkeypatch):
     runner.speculator = SimpleNamespace(supports_mm_inputs=False, propose=propose)
     runner.model_state = SimpleNamespace(
         postprocess_state=postprocess_state,
-        postprocess_state_after_drafting=lambda *_: events.append("publish"),
     )
     monkeypatch.setattr(mrv2, "AsyncOutput", lambda **_: object())
     monkeypatch.setattr(mrv2, "post_update", lambda *_: None)
@@ -280,7 +279,7 @@ def test_v2_sample_tokens_publishes_state_after_drafting(monkeypatch):
 
     mrv2.GPUModelRunner.sample_tokens(runner, None)
 
-    assert events == [("postprocess", True), "draft", "publish"]
+    assert events == ["postprocess", "draft"]
 
 
 def test_v2_sample_tokens_pp_mixed_batch_only_postprocesses_prefill_rows(

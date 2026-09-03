@@ -1503,7 +1503,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
         is_prefilling: torch.Tensor | None = None,
-        defer_after_drafting: bool = False,
     ) -> None:
         # Update the number of computed tokens.
         if self.is_last_pp_rank:
@@ -1530,7 +1529,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.num_computed_tokens.gpu,
             query_start_loc,
             is_prefilling,
-            defer_after_drafting=defer_after_drafting,
         )
 
     def _merge_ec_connector_no_forward(
@@ -1970,7 +1968,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_sampled,
             num_rejected,
             input_batch.query_start_loc,
-            defer_after_drafting=self.speculator is not None,
         )
 
         if self.speculator is not None:
@@ -2004,13 +2001,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
-
-            self.model_state.postprocess_state_after_drafting(
-                input_batch.idx_mapping,
-                num_sampled,
-                self.req_states.num_computed_tokens.gpu,
-                input_batch.query_start_loc,
-            )
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

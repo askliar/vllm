@@ -738,12 +738,13 @@ def copy_kv_cache_blocks_inplace(
 def get_replayssm_block_copy_tensors(
     forward_context: Mapping[str, Any],
 ) -> list[torch.Tensor]:
-    """Return FlashInfer-owned ReplaySSM rings and shared cursors.
+    """Return ReplaySSM rings and any backend-owned shared cursors.
 
     The runner's ordinary cache list already covers the two canonical Mamba
     roles. This validates the complete five-cache contract per ReplaySSM layer
-    and returns the three backend-owned rings plus the two group-shared cursor
-    tensors. ``copy_kv_cache_blocks_inplace`` deduplicates shared storage.
+    and returns the three backend-owned rings. FlashInfer additionally owns two
+    group-shared cursor tensors. ``copy_kv_cache_blocks_inplace`` deduplicates
+    shared storage.
     """
     extra_tensors: list[torch.Tensor] = []
     cache_roles = (
@@ -761,31 +762,31 @@ def get_replayssm_block_copy_tensors(
         if not getattr(layer, "use_replayssm", False):
             continue
         mamba_config = getattr(layer, "mamba_config", None)
-        if getattr(mamba_config, "backend", None) != MambaBackendEnum.FLASHINFER:
-            continue
+        backend = getattr(mamba_config, "backend", None)
 
         kv_cache = getattr(layer, "kv_cache", ())
         if not isinstance(kv_cache, (list, tuple)) or len(kv_cache) != len(cache_roles):
             raise ValueError(
-                f"FlashInfer ReplaySSM layer {layer_name!r} must expose exactly "
+                f"ReplaySSM layer {layer_name!r} must expose exactly "
                 f"{len(cache_roles)} cache roles {cache_roles}; got "
                 f"{len(kv_cache) if isinstance(kv_cache, (list, tuple)) else 0}"
             )
         for role, tensor in zip(cache_roles, kv_cache, strict=True):
             if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
                 raise ValueError(
-                    f"FlashInfer ReplaySSM layer {layer_name!r} has invalid "
-                    f"{role} cache"
+                    f"ReplaySSM layer {layer_name!r} has invalid {role} cache"
                 )
         capacity = kv_cache[0].shape[0]
         for role, tensor in zip(cache_roles[1:], kv_cache[1:], strict=True):
             if tensor.shape[0] != capacity:
                 raise ValueError(
-                    f"FlashInfer ReplaySSM layer {layer_name!r} {role} capacity "
+                    f"ReplaySSM layer {layer_name!r} {role} capacity "
                     f"{tensor.shape[0]} does not match canonical capacity {capacity}"
                 )
 
         extra_tensors.extend(kv_cache[2:5])
+        if backend != MambaBackendEnum.FLASHINFER:
+            continue
         for role, attr in cursor_roles:
             cursor = getattr(layer, attr, None)
             if (

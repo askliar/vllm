@@ -154,19 +154,7 @@ class ModelState(ABC):
         num_computed_tokens: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
         is_prefilling: torch.Tensor | None = None,
-        defer_after_drafting: bool = False,
     ) -> None:
-        return None
-
-    def postprocess_state_after_drafting(
-        self,
-        idx_mapping: torch.Tensor,
-        num_sampled: torch.Tensor,
-        num_computed_tokens: torch.Tensor | None = None,
-        query_start_loc: torch.Tensor | None = None,
-        is_prefilling: torch.Tensor | None = None,
-    ) -> None:
-        """Publish state that must remain hidden from the current draft pass."""
         return None
 
     @abstractmethod

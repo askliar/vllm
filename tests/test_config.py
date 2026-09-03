@@ -175,6 +175,7 @@ def _replayssm_config(
         model_config=None,
         num_speculative_tokens=0,
         mamba_config=SimpleNamespace(backend=backend),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
         use_v2_model_runner=use_v2_model_runner,
         kv_transfer_config=None,
     )
@@ -257,6 +258,14 @@ def test_replayssm_config_matrix(
     else:
         with pytest.raises(ValueError, match=error_match):
             VllmConfig.validate_mamba_cached_kernel(config)
+
+
+def test_replayssm_rejects_pipeline_parallelism():
+    config = _replayssm_config(backend=MambaBackendEnum.FLASHINFER)
+    config.parallel_config.pipeline_parallel_size = 2
+
+    with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
+        VllmConfig.validate_mamba_cached_kernel(config)
 
 
 def test_rocm_keeps_compiled_deepseek_defaults(monkeypatch):

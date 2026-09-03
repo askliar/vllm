@@ -741,10 +741,10 @@ def validate_mamba_state_copy_funcs(
             f"missing state copy funcs for {mamba_spec.mamba_type}"
         )
         state_copy_funcs = copy_funcs[mamba_spec.mamba_type]
-        assert len(state_copy_funcs) == len(mamba_spec.shapes), (
+        assert 0 < len(state_copy_funcs) <= len(mamba_spec.shapes), (
             f"{mamba_spec.mamba_type} expects {len(mamba_spec.shapes)} state copy "
             "funcs for its canonical state tensors, but provides "
-            f"{len(state_copy_funcs)}"
+            f"{len(state_copy_funcs)}; expected a non-empty copyable prefix"
         )
 
 
@@ -871,9 +871,6 @@ class MambaSpecDecodeGPUContext:
     # Persistent all-layer ReplaySSM descriptors, populated with the cache
     # addresses on first real forward. None for non-FlashInfer configurations.
     replayssm: ReplaySSMModelContext | None = None
-    # V1 can prove on the host that no accepted-token outcome reaches a
-    # boundary. V2 leaves this true because its sampled count is GPU-resident.
-    replayssm_materialize_possible: bool = True
 
     @classmethod
     def create(
@@ -1759,7 +1756,7 @@ def postprocess_mamba_align_gpu(
             materialize_token_counts=ctx.materialize_token_counts,
             num_reqs=num_reqs,
         )
-        if ctx.replayssm.materialize_prefixes and ctx.replayssm_materialize_possible:
+        if ctx.replayssm.materialize_prefixes:
             ctx.replayssm.materialize()
 
     # ``num_accepted_tokens_out`` is pre-initialized from
@@ -1806,9 +1803,6 @@ def stage_postprocess_inputs_to_gpu(
     computed_np = ctx.num_computed_tokens_buf.np
     draft_np = ctx.num_draft_tokens_buf.np
     prefill_np = ctx.is_prefilling_buf.np
-    materialize_possible = not (
-        ctx.replayssm is not None and ctx.replayssm.materialize_prefixes
-    )
     for i in range(num_reqs):
         req_id = req_ids[i]
         state_idx = fixed_live_col
@@ -1828,16 +1822,8 @@ def stage_postprocess_inputs_to_gpu(
         prefill_np[i] = (
             requests[req_id].num_computed_tokens < requests[req_id].num_prompt_tokens
         )
-        if not materialize_possible:
-            running_state_tokens = computed + scheduled - num_draft
-            max_new_computed = running_state_tokens + num_draft
-            aligned_max_new_computed = (
-                max_new_computed // ctx.block_size
-            ) * ctx.block_size
-            materialize_possible = aligned_max_new_computed >= running_state_tokens
     ctx.mamba_state_idx_buf.copy_to_gpu(num_reqs)
     ctx.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_computed_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_draft_tokens_buf.copy_to_gpu(num_reqs)
     ctx.is_prefilling_buf.copy_to_gpu(num_reqs)
-    ctx.replayssm_materialize_possible = materialize_possible

@@ -268,17 +268,7 @@ def test_preprocess_mamba_preserves_live_replayssm_state(
     assert align_ctx.precopy_src_col_buf.np[0] == 0
 
 
-@pytest.mark.parametrize(
-    ("materialize_possible", "expected_order"),
-    [
-        (True, ["copy", "postprocess", "materialize"]),
-        (False, ["copy", "postprocess"]),
-    ],
-)
-def test_postprocess_mamba_align_gates_materialization(
-    materialize_possible: bool,
-    expected_order: list[str],
-):
+def test_postprocess_mamba_align_materializes_prefixes():
     order: list[str] = []
     ctx = MagicMock()
     ctx.is_initialized = True
@@ -294,7 +284,6 @@ def test_postprocess_mamba_align_gates_materialization(
     ctx.run_fused_postprocess.side_effect = lambda **kwargs: order.append("copy")
     ctx.replayssm = MagicMock()
     ctx.replayssm.materialize_prefixes = True
-    ctx.replayssm_materialize_possible = materialize_possible
     ctx.replayssm.postprocess.side_effect = lambda **kwargs: order.append("postprocess")
     ctx.replayssm.materialize.side_effect = lambda: order.append("materialize")
     block_table = MagicMock()
@@ -317,7 +306,7 @@ def test_postprocess_mamba_align_gates_materialization(
         run_prefix_state_migration=True,
     )
 
-    assert order == expected_order
+    assert order == ["copy", "postprocess", "materialize"]
     assert accepted_cpu.tolist() == [3]
 
 
@@ -837,7 +826,7 @@ def test_mamba_groups_support_different_state_specs():
     assert ctx.state_conv_widths.tolist() == [4, 0, 4, 0, 12]
 
 
-def test_mamba_copy_funcs_ignore_replayssm_state_tensors():
+def test_mamba_copy_funcs_accept_nonempty_canonical_prefix():
     replayssm_spec = MambaSpec(
         block_size=16,
         shapes=((4, 4), (2, 4, 4)),
@@ -848,18 +837,35 @@ def test_mamba_copy_funcs_ignore_replayssm_state_tensors():
         mamba_cache_mode="align",
     )
 
-    validate_mamba_state_copy_funcs({replayssm_spec: [0]}, _COPY_FUNCS)
+    for valid_funcs in ((get_conv_copy_spec,), _DEFAULT_COPY_FUNCS):
+        copy_funcs = {
+            **_COPY_FUNCS,
+            MambaAttentionBackendEnum.MAMBA2: valid_funcs,
+        }
+        validate_mamba_state_copy_funcs({replayssm_spec: [0]}, copy_funcs)
 
     for invalid_funcs in (
-        (get_conv_copy_spec,),
+        (),
         (*_DEFAULT_COPY_FUNCS, get_temporal_copy_spec),
     ):
         invalid_copy_funcs = {
             **_COPY_FUNCS,
             MambaAttentionBackendEnum.MAMBA2: invalid_funcs,
         }
-        with pytest.raises(AssertionError, match="expects 2 state copy funcs"):
+        with pytest.raises(AssertionError, match="non-empty copyable prefix"):
             validate_mamba_state_copy_funcs({replayssm_spec: [0]}, invalid_copy_funcs)
+
+
+def test_gdn_copy_funcs_cover_copyable_prefix_only():
+    gdn_spec = MambaSpec(
+        block_size=16,
+        shapes=((4, 4), (2, 4, 4), (2, 4), (2, 4)),
+        dtypes=(torch.float16,) * 4,
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        mamba_cache_mode="none",
+    )
+
+    validate_mamba_state_copy_funcs({gdn_spec: [0]}, _COPY_FUNCS)
 
 
 def test_mamba_groups_support_mixed_specs_in_uniform_group():
@@ -1050,35 +1056,6 @@ def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
     )
     ctx.replayssm.reset_new_slots.assert_not_called()
     ctx.replayssm.materialize.assert_not_called()
-    assert ctx.replayssm_materialize_possible
-
-
-def test_stage_postprocess_inputs_skips_impossible_materialization():
-    device = torch.device("cpu")
-    ctx = _make_staging_ctx(max_num_reqs=2, device=device)
-    ctx.block_size = 4
-    ctx.replayssm = MagicMock(materialize_prefixes=True)
-    scheduler_output = _make_postprocess_scheduler_output(
-        req_ids=["req_a"],
-        num_scheduled_tokens={"req_a": 1},
-    )
-    requests = _make_requests(
-        ["req_a"],
-        [10],
-        [[0]],
-        num_prompt_tokens=[10],
-    )
-
-    stage_postprocess_inputs_to_gpu(
-        ctx,
-        scheduler_output,
-        ["req_a"],
-        1,
-        requests,
-        {"req_a": 2},
-    )
-
-    assert not ctx.replayssm_materialize_possible
 
 
 def test_stage_postprocess_inputs_to_gpu_asserts_on_missing_state_idx():

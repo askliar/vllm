@@ -757,6 +757,58 @@ def test_modelwide_replayssm_postprocess_resets_prefill_slots(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize(
+    (
+        "query_metadata",
+        "query_metadata_is_cumulative",
+        "num_computed_is_post_step",
+        "num_computed",
+    ),
+    [([1, 0], False, False, 7), ([0, 1], True, True, 8)],
+    ids=["v1", "v2"],
+)
+def test_modelwide_replayssm_single_token_final_prefill_commits_as_decode(
+    query_metadata: list[int],
+    query_metadata_is_cumulative: bool,
+    num_computed_is_post_step: bool,
+    num_computed: int,
+):
+    groups, config, forward_context, block_tables = _modelwide_replayssm_fixture()
+    for mixers, source_slot in zip(groups, (1, 4)):
+        mixers[0]._replayssm_ring_start[source_slot] = 7
+        mixers[0]._replayssm_prev_num_accepted[source_slot] = 4
+
+    ctx = ReplaySSMModelContext.create(
+        config,
+        [0, 1],
+        forward_context,
+        block_tables,
+        max_num_reqs=2,
+    )
+    assert ctx is not None
+    ctx.postprocess(
+        idx_mapping=None,
+        query_metadata=torch.tensor(query_metadata, dtype=torch.int32, device="cuda"),
+        query_metadata_is_cumulative=query_metadata_is_cumulative,
+        num_computed_tokens=torch.tensor(
+            [num_computed, 0], dtype=torch.int32, device="cuda"
+        ),
+        num_computed_is_post_step=num_computed_is_post_step,
+        num_accepted_tokens=torch.tensor([2, 1], dtype=torch.int32, device="cuda"),
+        is_prefilling=torch.tensor([True, False], device="cuda"),
+        live_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
+        materialize_dst_cols=torch.full((2,), -1, dtype=torch.int32, device="cuda"),
+        materialize_token_counts=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        num_reqs=1,
+    )
+    torch.accelerator.synchronize()
+
+    for mixers, source_slot in zip(groups, (1, 4)):
+        assert mixers[0]._replayssm_ring_start[source_slot].item() == 7
+        assert mixers[0]._replayssm_prev_num_accepted[source_slot].item() == 6
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_modelwide_replayssm_prefill_commit_publishes_exact_copy(monkeypatch):
     groups, config, forward_context, block_tables = _modelwide_replayssm_fixture()
     for mixers, destination_slot in zip(groups, (2, 5)):

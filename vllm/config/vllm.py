@@ -2876,6 +2876,8 @@ class VllmConfig:
                 "--use-replayssm is not supported for architecture "
                 f"{self.model_config.architecture!r}"
             )
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError("ReplaySSM currently requires pipeline_parallel_size=1")
         if (
             self.mamba_config.backend == MambaBackendEnum.FLASHINFER
             and self.cache_config.replayssm_buffer_len > 16
@@ -2900,10 +2902,6 @@ class VllmConfig:
             ):
                 raise ValueError(
                     "RecoverSSM with align mode requires VLLM_USE_V2_MODEL_RUNNER=1"
-                )
-            if self.parallel_config.pipeline_parallel_size > 1:
-                raise ValueError(
-                    "RecoverSSM currently requires pipeline_parallel_size=1"
                 )
             if self.mamba_config.backend != MambaBackendEnum.TRITON:
                 raise ValueError("RecoverSSM requires --mamba-backend triton")

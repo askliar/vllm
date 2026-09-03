@@ -20,10 +20,10 @@ class _TestReplaySSMMixer(MambaMixer2):
     _state_shapes = ((2,), (3,))
     _state_dtypes = (torch.float32, torch.float32)
 
-    def __init__(self):
+    def __init__(self, backend: MambaBackendEnum = MambaBackendEnum.FLASHINFER) -> None:
         torch.nn.Module.__init__(self)
         self.use_replayssm = True
-        self.mamba_config = MambaConfig(backend=MambaBackendEnum.FLASHINFER)
+        self.mamba_config = MambaConfig(backend=backend)
         self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
         self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
 
@@ -150,6 +150,19 @@ def test_replayssm_block_copy_validates_exact_cache_roles():
 
     with pytest.raises(ValueError, match="exactly 5 cache roles"):
         get_replayssm_block_copy_tensors({"layers.0.mixer": mixer})
+
+
+def test_replayssm_block_copy_includes_triton_rings_without_trackers():
+    mixer = _TestReplaySSMMixer(MambaBackendEnum.TRITON)
+    mixer.kv_cache = tuple(torch.zeros(4, 1) for _ in range(5))
+
+    tensors = get_replayssm_block_copy_tensors({"layers.0.mixer": mixer})
+
+    assert len(tensors) == 3
+    assert all(
+        actual is expected
+        for actual, expected in zip(tensors, mixer.kv_cache[2:5], strict=True)
+    )
 
 
 def test_bind_kv_cache(default_vllm_config):

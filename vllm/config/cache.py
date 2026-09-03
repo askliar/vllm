@@ -205,7 +205,8 @@ class CacheConfig:
     Triton supports 'none' and 'align' on Model Runner V1. FlashInfer supports
     'none', 'align', and 'all' on Model Runner V1 and V2. Mamba2 speculative
     decoding requires FlashInfer. With prefix caching enabled, Triton supports
-    'align'; FlashInfer supports 'align' and 'all'."""
+    'align'; FlashInfer supports 'align' and 'all'. Pipeline parallelism is not
+    supported."""
     use_kda_recoverssm: bool = field(default=False, init=False)
     """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
 

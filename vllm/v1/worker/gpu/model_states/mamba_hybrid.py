@@ -382,7 +382,6 @@ class MambaHybridModelState(DefaultModelState):
         num_computed_tokens: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
         is_prefilling: torch.Tensor | None = None,
-        defer_after_drafting: bool = False,
     ) -> None:
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
@@ -431,42 +430,6 @@ class MambaHybridModelState(DefaultModelState):
                 idx_mapping,
             )
 
-        if not defer_after_drafting:
-            self._publish_flashinfer_replayssm(
-                idx_mapping,
-                num_computed_tokens,
-                query_start_loc,
-                is_prefilling,
-            )
-
-    def postprocess_state_after_drafting(
-        self,
-        idx_mapping: torch.Tensor,
-        num_sampled: torch.Tensor | int,
-        num_computed_tokens: torch.Tensor | None = None,
-        query_start_loc: torch.Tensor | None = None,
-        is_prefilling: torch.Tensor | None = None,
-    ) -> None:
-        """Publish ReplaySSM trackers after every forward in this step.
-
-        MTP drafting reuses the tracker view consumed by the target forward.
-        The newly accepted transition belongs to the next target step, so it
-        must not become visible until the current draft pass has completed.
-        """
-        num_reqs = idx_mapping.shape[0]
-        if (
-            num_reqs
-            and self._use_flashinfer_replayssm
-            and not self._needs_prefix_state_migration
-            and not isinstance(num_sampled, int)
-        ):
-            # The MTP drafter reuses this request-state buffer after target
-            # acceptance was first scattered. Restore it before publication.
-            _scatter_num_accepted_kernel[(num_reqs,)](
-                idx_mapping,
-                num_sampled,
-                self.num_accepted_tokens_gpu,
-            )
         self._publish_flashinfer_replayssm(
             idx_mapping,
             num_computed_tokens,

@@ -221,11 +221,15 @@ def _postprocess_replayssm_kernel(
     else:
         query_len = tl.load(query_metadata + batch_idx)
 
+    computed = tl.load(num_computed_tokens + req_idx)
+    computed_before = tl.where(
+        NUM_COMPUTED_IS_POST_STEP, computed - query_len, computed
+    )
+    # Mamba attention runs a one-token final prefill chunk with prior state as
+    # decode. Commit the same transition here instead of resetting its cursors.
+    prefilling = prefilling & ((query_len != 1) | (computed_before <= 0))
+
     if prefilling:
-        computed = tl.load(num_computed_tokens + req_idx)
-        computed_before = tl.where(
-            NUM_COMPUTED_IS_POST_STEP, computed - query_len, computed
-        )
         computed_after = computed_before + query_len
         first_col = tl.maximum(computed_before // MAMBA_BLOCK_SIZE, 0)
         last_col = tl.maximum(
