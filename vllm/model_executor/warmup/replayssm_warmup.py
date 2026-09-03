@@ -85,6 +85,7 @@ def _temporary_replayssm_autotune_state(
         prev_num_accepted = module._replayssm_prev_num_accepted
         tensors = (
             *module.kv_cache,
+            *module.replayssm_cache,
             ring_start,
             prev_num_accepted,
         )

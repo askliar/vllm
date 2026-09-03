@@ -42,7 +42,7 @@ def _mamba_state_copy_boundary(
     return needs_copy, accept_token_bias, dest_col
 
 
-@triton.jit(do_not_specialize=["num_reqs"])
+@triton.jit
 def _reset_new_replayssm_slots_kernel(
     idx_mapping,
     src_cols,
@@ -51,8 +51,6 @@ def _reset_new_replayssm_slots_kernel(
     tracker_start,
     tracker_committed,
     block_table_stride_req: tl.int64,
-    tracker_capacity,
-    num_reqs,
     PAD_SLOT_ID: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr,
 ) -> None:
@@ -62,11 +60,10 @@ def _reset_new_replayssm_slots_kernel(
     distinguish a missing group-local source from a continuation.
     """
     batch_idx = tl.program_id(0)
-    active = batch_idx < num_reqs
     req_idx = batch_idx
     if HAS_IDX_MAPPING:
-        req_idx = tl.load(idx_mapping + batch_idx, mask=active, other=-1)
-    valid_req = active & (req_idx >= 0)
+        req_idx = tl.load(idx_mapping + batch_idx)
+    valid_req = req_idx >= 0
 
     dst_col = tl.load(dst_cols + req_idx, mask=valid_req, other=-1)
     valid_dst_col = valid_req & (dst_col >= 0)
@@ -75,12 +72,7 @@ def _reset_new_replayssm_slots_kernel(
         mask=valid_dst_col,
         other=PAD_SLOT_ID,
     )
-    valid_dst = (
-        valid_dst_col
-        & (dst_slot != PAD_SLOT_ID)
-        & (dst_slot >= 0)
-        & (dst_slot < tracker_capacity)
-    )
+    valid_dst = valid_dst_col & (dst_slot != PAD_SLOT_ID)
 
     src_col = tl.load(src_cols + req_idx, mask=valid_req, other=-1)
     valid_src_col = valid_req & (src_col >= 0)
@@ -89,19 +81,14 @@ def _reset_new_replayssm_slots_kernel(
         mask=valid_src_col,
         other=PAD_SLOT_ID,
     )
-    valid_src = (
-        valid_src_col
-        & (src_slot != PAD_SLOT_ID)
-        & (src_slot >= 0)
-        & (src_slot < tracker_capacity)
-    )
+    valid_src = valid_src_col & (src_slot != PAD_SLOT_ID)
 
     fresh = valid_dst & ~valid_src
     tl.store(tracker_start + dst_slot, 0, mask=fresh)
     tl.store(tracker_committed + dst_slot, 0, mask=fresh)
 
 
-@triton.jit(do_not_specialize=["num_reqs"])
+@triton.jit
 def _postprocess_replayssm_kernel(
     idx_mapping,
     query_metadata,
@@ -118,8 +105,6 @@ def _postprocess_replayssm_kernel(
     plan_flush_count,
     block_table_stride_req: tl.int64,
     slot_table_stride_layer: tl.int64,
-    tracker_capacity,
-    num_reqs,
     MAMBA_BLOCK_SIZE: tl.constexpr,
     LOGICAL_WINDOW: tl.constexpr,
     RING_BUFFER_LEN: tl.constexpr,
@@ -129,20 +114,13 @@ def _postprocess_replayssm_kernel(
     NUM_COMPUTED_IS_POST_STEP: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr,
     MATERIALIZE_PREFIXES: tl.constexpr,
+    LIVE_COL_IS_ZERO: tl.constexpr,
 ) -> None:
     """Commit a completed step and prepare an optional prefix snapshot."""
     batch_idx = tl.program_id(0)
 
-    # Clear all fixed-capacity outputs before any per-request early exit. This
-    # prevents a shorter batch from reusing stale materialization slots.
     tl.store(plan_ring_start + batch_idx, 0)
     tl.store(plan_flush_count + batch_idx, -1)
-    for layer_idx in tl.static_range(0, NUM_LAYERS):
-        slot_offset = layer_idx * slot_table_stride_layer + batch_idx
-        tl.store(src_slots + slot_offset, PAD_SLOT_ID)
-        tl.store(dst_slots + slot_offset, PAD_SLOT_ID)
-    if batch_idx >= num_reqs:
-        return
 
     req_idx = batch_idx
     if HAS_IDX_MAPPING:
@@ -184,41 +162,35 @@ def _postprocess_replayssm_kernel(
         MAMBA_BLOCK_SIZE,
     )
 
-    live_col = tl.load(live_cols + req_idx)
+    live_col = 0 if LIVE_COL_IS_ZERO else tl.load(live_cols + req_idx)
     valid_live_col = live_col >= 0
     live_slot = tl.load(
         block_table + batch_idx * block_table_stride_req + live_col,
         mask=valid_live_col,
         other=PAD_SLOT_ID,
     )
-    valid_live = (
-        valid_live_col
-        & (live_slot != PAD_SLOT_ID)
-        & (live_slot >= 0)
-        & (live_slot < tracker_capacity)
-    )
+    valid_live = valid_live_col & (live_slot != PAD_SLOT_ID)
     wants_materialize = MATERIALIZE_PREFIXES & valid_live & boundary & (dst_col >= 0)
     dst_slot = tl.load(
         block_table + batch_idx * block_table_stride_req + dst_col,
         mask=wants_materialize,
         other=PAD_SLOT_ID,
     )
-    materialize = (
-        wants_materialize
-        & (dst_slot != PAD_SLOT_ID)
-        & (dst_slot >= 0)
-        & (dst_slot < tracker_capacity)
-    )
-    for layer_idx in tl.static_range(0, NUM_LAYERS):
-        slot_offset = layer_idx * slot_table_stride_layer + batch_idx
-        tl.store(
-            src_slots + slot_offset,
-            tl.where(materialize, live_slot, PAD_SLOT_ID),
-        )
-        tl.store(
-            dst_slots + slot_offset,
-            tl.where(materialize, dst_slot, PAD_SLOT_ID),
-        )
+    # Block-table writers emit either the null sentinel or an in-capacity ID.
+    materialize = wants_materialize & (dst_slot != PAD_SLOT_ID)
+    if MATERIALIZE_PREFIXES:
+        # FlashInfer's ABI requires packed [layer, batch] tables even though all
+        # layers in this cache group share the same physical slot namespace.
+        for layer_idx in tl.static_range(0, NUM_LAYERS):
+            slot_offset = layer_idx * slot_table_stride_layer + batch_idx
+            tl.store(
+                src_slots + slot_offset,
+                tl.where(materialize, live_slot, PAD_SLOT_ID),
+            )
+            tl.store(
+                dst_slots + slot_offset,
+                tl.where(materialize, dst_slot, PAD_SLOT_ID),
+            )
     if prefilling:
         computed_after = computed_before + query_len
         first_col = tl.maximum(computed_before // MAMBA_BLOCK_SIZE, 0)
@@ -230,11 +202,7 @@ def _postprocess_replayssm_kernel(
             prefill_slot = tl.load(
                 block_table + batch_idx * block_table_stride_req + col
             )
-            valid_prefill_slot = (
-                (prefill_slot != PAD_SLOT_ID)
-                & (prefill_slot >= 0)
-                & (prefill_slot < tracker_capacity)
-            )
+            valid_prefill_slot = prefill_slot != PAD_SLOT_ID
             tl.store(tracker_start + prefill_slot, 0, mask=valid_prefill_slot)
             tl.store(tracker_committed + prefill_slot, 0, mask=valid_prefill_slot)
         if materialize:
@@ -279,19 +247,25 @@ def _compact_replayssm_requests_kernel(
     active = (offsets < num_reqs) & (
         tl.load(plan_flush_count + offsets, mask=in_capacity, other=-1) >= 0
     )
-    candidates = tl.where(active, offsets, MAX_NUM_REQS)
-    compacted = tl.sort(candidates, dim=0)
+    active_i32 = active.to(tl.int32)
+    output_offsets = tl.cumsum(active_i32, axis=0) - 1
+    num_active = tl.sum(active_i32, axis=0)
+    tl.store(
+        active_request_indices + output_offsets,
+        offsets,
+        mask=in_capacity & active,
+    )
     tl.store(
         active_request_indices + offsets,
-        tl.where(compacted < MAX_NUM_REQS, compacted, -1),
-        mask=in_capacity,
+        -1,
+        mask=in_capacity & (offsets >= num_active),
     )
 
 
 def _replayssm_specialization_key(mixer: Any) -> tuple[Any, ...]:
     ssm = mixer.kv_cache[1]
-    x_cache = mixer.kv_cache[2]
-    b_cache = mixer.kv_cache[4]
+    x_cache = mixer.replayssm_cache[0]
+    b_cache = mixer.replayssm_cache[2]
     return (
         ssm.dtype,
         x_cache.dtype,
@@ -343,10 +317,9 @@ class _ReplaySSMGroupContext:
             or block_table.numel() == 0
         ):
             raise ValueError("ReplaySSM requires a non-empty 2D CUDA int32 block table")
-        _validate_replayssm_cache(mixers)
         first = mixers[0]
         first_ssm = first.kv_cache[1]
-        first_x = first.kv_cache[2]
+        first_x = first.replayssm_cache[0]
         compatibility = _replayssm_specialization_key(first)
         for mixer in mixers[1:]:
             current = _replayssm_specialization_key(mixer)
@@ -376,12 +349,12 @@ class _ReplaySSMGroupContext:
             materialize_tables=(
                 _cuda_i64_ptrs([m.kv_cache[1] for m in mixers]),
                 _cuda_i64_slot_strides([m.kv_cache[1] for m in mixers]),
-                _cuda_i64_ptrs([m.kv_cache[2] for m in mixers]),
-                _cuda_i64_slot_strides([m.kv_cache[2] for m in mixers]),
-                _cuda_i64_ptrs([m.kv_cache[4] for m in mixers]),
-                _cuda_i64_slot_strides([m.kv_cache[4] for m in mixers]),
-                _cuda_i64_ptrs([m.kv_cache[3] for m in mixers]),
-                _cuda_i64_slot_strides([m.kv_cache[3] for m in mixers]),
+                _cuda_i64_ptrs([m.replayssm_cache[0] for m in mixers]),
+                _cuda_i64_slot_strides([m.replayssm_cache[0] for m in mixers]),
+                _cuda_i64_ptrs([m.replayssm_cache[2] for m in mixers]),
+                _cuda_i64_slot_strides([m.replayssm_cache[2] for m in mixers]),
+                _cuda_i64_ptrs([m.replayssm_cache[1] for m in mixers]),
+                _cuda_i64_slot_strides([m.replayssm_cache[1] for m in mixers]),
                 _cuda_i64_ptrs([m.A for m in mixers]),
                 zero_table,
                 zero_table.clone(),
@@ -431,8 +404,6 @@ class _ReplaySSMGroupContext:
             self.ring_start,
             self.num_committed,
             self.block_table.stride(0),
-            self.num_committed.numel(),
-            num_reqs,
             PAD_SLOT_ID=NULL_BLOCK_ID,
             HAS_IDX_MAPPING=idx_mapping is not None,
         )
@@ -447,13 +418,13 @@ class _ReplaySSMGroupContext:
         num_computed_is_post_step: bool,
         num_accepted_tokens: torch.Tensor,
         is_prefilling: torch.Tensor,
-        live_cols: torch.Tensor,
+        live_cols: torch.Tensor | None,
         num_reqs: int,
     ) -> None:
         """Commit a completed step and prepare an optional prefix snapshot."""
         if num_reqs == 0:
             return
-        _postprocess_replayssm_kernel[(self.max_num_reqs,)](
+        _postprocess_replayssm_kernel[(num_reqs,)](
             idx_mapping,
             query_metadata,
             num_computed_tokens,
@@ -469,8 +440,6 @@ class _ReplaySSMGroupContext:
             self.plan_flush_count,
             self.block_table.stride(0),
             self.src_slots.stride(0),
-            self.num_committed.numel(),
-            num_reqs,
             MAMBA_BLOCK_SIZE=self.mamba_block_size,
             LOGICAL_WINDOW=self.logical_window,
             RING_BUFFER_LEN=self.ring_buffer_len,
@@ -480,6 +449,7 @@ class _ReplaySSMGroupContext:
             NUM_COMPUTED_IS_POST_STEP=num_computed_is_post_step,
             HAS_IDX_MAPPING=idx_mapping is not None,
             MATERIALIZE_PREFIXES=self.materialize_prefixes,
+            LIVE_COL_IS_ZERO=live_cols is None,
         )
         if self.materialize_prefixes:
             _compact_replayssm_requests_kernel[(1,)](
@@ -511,12 +481,14 @@ class _ReplaySSMGroupContext:
             self.plan_flush_count,
             self.active_request_indices,
             state_dtype=first.kv_cache[1].dtype,
-            input_dtype=first.kv_cache[2].dtype,
+            input_dtype=first.replayssm_cache[0].dtype,
             matrixA_dtype=first.A.dtype,
             dim=first.kv_cache[1].size(2),
             dstate=first.kv_cache[1].size(3),
             num_heads=first.kv_cache[1].size(1),
-            heads_per_group=(first.kv_cache[1].size(1) // first.kv_cache[4].size(1)),
+            heads_per_group=(
+                first.kv_cache[1].size(1) // first.replayssm_cache[2].size(1)
+            ),
             max_window=self.logical_window,
             ring_buffer_len=self.ring_buffer_len,
             rand_seed=rand_seed,
@@ -964,13 +936,11 @@ def _flashinfer_replayssm_mixers_by_group(
             layer = forward_context.get(layer_name)
             if layer is None:
                 continue
-            kv_cache = getattr(layer, "kv_cache", ())
             mamba_config = getattr(layer, "mamba_config", None)
             backend = getattr(mamba_config, "backend", None)
             if (
                 getattr(layer, "use_replayssm", False)
                 and backend == MambaBackendEnum.FLASHINFER
-                and len(kv_cache) >= 5
             ):
                 mixers.append(layer)
         if mixers:
@@ -990,47 +960,6 @@ def _load_replayssm_materialize() -> Callable[..., None]:
             "flashinfer.mamba.replayssm_materialize"
         ) from e
     return replayssm_materialize
-
-
-def _validate_replayssm_cache(mixers: list[Any]) -> None:
-    """Validate the cache tensors required by model-wide tracker ownership."""
-    for layer_idx, mixer in enumerate(mixers):
-        cache_tensors = mixer.kv_cache[1:5]
-        if any(tensor.numel() == 0 for tensor in cache_tensors):
-            raise RuntimeError(
-                "FlashInfer ReplaySSM requires allocated SSM and replay-ring "
-                f"cache tensors for every layer; layer {layer_idx} is empty"
-            )
-        if any(not tensor.is_cuda for tensor in cache_tensors):
-            devices = [str(tensor.device) for tensor in cache_tensors]
-            raise RuntimeError(
-                "FlashInfer ReplaySSM requires CUDA cache tensors for every "
-                f"layer; layer {layer_idx} uses {devices}"
-            )
-
-        ring_start = mixer._replayssm_ring_start
-        num_committed = mixer._replayssm_prev_num_accepted
-        if ring_start.numel() == 0 or num_committed.numel() == 0:
-            raise RuntimeError(
-                "FlashInfer ReplaySSM requires allocated ring trackers for "
-                f"every layer; layer {layer_idx} is empty"
-            )
-        if not ring_start.is_cuda or not num_committed.is_cuda:
-            raise RuntimeError(
-                "FlashInfer ReplaySSM requires CUDA ring trackers for every layer"
-            )
-        if (
-            ring_start.ndim != 1
-            or num_committed.ndim != 1
-            or ring_start.dtype != torch.int32
-            or num_committed.dtype != torch.int32
-        ):
-            raise ValueError("ReplaySSM ring trackers must be 1D int32 tensors")
-        if ring_start.numel() != num_committed.numel():
-            raise ValueError(
-                "ReplaySSM ring trackers must have equal capacities; got "
-                f"{ring_start.numel()} and {num_committed.numel()}"
-            )
 
 
 def initialize_mamba_ssu_backend(

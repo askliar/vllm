@@ -48,7 +48,6 @@ def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
     state._use_flashinfer_replayssm = True
     state.recoverssm = None
     state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32, device="cuda")
-    state._replayssm_live_cols_gpu = torch.zeros(4, dtype=torch.int32, device="cuda")
     state._is_prefilling_gpu = torch.zeros(4, dtype=torch.bool, device="cuda")
     replayssm = Mock()
     replayssm.materialize_prefixes = False
@@ -62,12 +61,12 @@ def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
     num_sampled = torch.tensor([2], dtype=torch.int32, device="cuda")
     num_computed = torch.tensor([0, 0, 20, 0], dtype=torch.int32, device="cuda")
     query_start_loc = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+    state._replayssm_query_start_loc = query_start_loc
 
     state.postprocess_state(
         idx_mapping,
         num_sampled,
         num_computed_tokens=num_computed,
-        query_start_loc=query_start_loc,
     )
 
     ctx.run_fused_postprocess_align.assert_not_called()
@@ -75,7 +74,7 @@ def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
     kwargs = replayssm.postprocess.call_args.kwargs
     assert state.num_accepted_tokens_gpu.tolist() == [1, 1, 2, 1]
     assert kwargs["num_accepted_tokens"] is state.num_accepted_tokens_gpu
-    assert kwargs["live_cols"] is state._replayssm_live_cols_gpu
+    assert kwargs["live_cols"] is None
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
@@ -88,6 +87,9 @@ def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
     state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32, device="cuda")
     state._mamba_state_idx_gpu = torch.zeros(4, dtype=torch.int32, device="cuda")
     state._is_prefilling_gpu = torch.zeros(4, dtype=torch.bool, device="cuda")
+    state._replayssm_query_start_loc = torch.tensor(
+        [0, 4], dtype=torch.int32, device="cuda"
+    )
     replayssm = Mock(materialize_prefixes=True)
     accepted_snapshot = torch.zeros(4, dtype=torch.int32, device="cuda")
     ctx = Mock(
@@ -107,7 +109,6 @@ def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
         torch.tensor([2], dtype=torch.int32, device="cuda"),
         torch.tensor([3], dtype=torch.int32, device="cuda"),
         num_computed_tokens=torch.tensor([0, 0, 8, 0], device="cuda"),
-        query_start_loc=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
     )
 
     kwargs = replayssm.postprocess.call_args.kwargs

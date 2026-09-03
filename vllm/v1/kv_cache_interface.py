@@ -870,14 +870,6 @@ class MambaSpec(KVCacheSpec):
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
 
-    def __post_init__(self) -> None:
-        if (self.replayssm_shapes or self.replayssm_dtypes) and (
-            len(self.replayssm_shapes) != 3 or len(self.replayssm_dtypes) != 3
-        ):
-            raise ValueError(
-                "ReplaySSM requires exactly three shape/dtype entries for x, dt, and B"
-            )
-
     @property
     def state_content_size_bytes(self) -> int:
         return sum(

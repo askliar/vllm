@@ -1668,6 +1668,14 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> list[KVCacheBlock]:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if self.mamba_cache_mode != "align":
+            # Allocate extra `num_speculative_blocks` blocks for
+            # speculative decoding (MTP/EAGLE) with linear attention.
+            if self.num_speculative_blocks > 0:
+                num_tokens += self.block_size * self.num_speculative_blocks
+            if not self._copy_replayssm_live_state:
+                return super().allocate_new_blocks(
+                    request_id, num_tokens, num_tokens_main_model
+                )
             req_blocks = self.req_to_blocks[request_id]
             prev_block_len = len(req_blocks)
             partial_hit = self._partial_hit_reqs.get(request_id)
@@ -1676,10 +1684,6 @@ class MambaManager(SingleTypeKVCacheManager):
                 if partial_hit is not None
                 else (req_blocks[-1] if req_blocks else None)
             )
-            # Allocate extra `num_speculative_blocks` blocks for
-            # speculative decoding (MTP/EAGLE) with linear attention.
-            if self.num_speculative_blocks > 0:
-                num_tokens += self.block_size * self.num_speculative_blocks
             new_blocks = super().allocate_new_blocks(
                 request_id, num_tokens, num_tokens_main_model
             )
@@ -1704,15 +1708,16 @@ class MambaManager(SingleTypeKVCacheManager):
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
             live_source = None
-            if partial_hit is not None:
-                live_source = partial_hit[1]
-            elif prev_block_len > 0:
-                live_source_idx = (
-                    prev_block_len - 1 - self.num_speculative_blocks
-                    if request_id in self._allocated_block_reqs
-                    else prev_block_len - 1
-                )
-                live_source = req_blocks[live_source_idx]
+            if self._copy_replayssm_live_state:
+                if partial_hit is not None:
+                    live_source = partial_hit[1]
+                elif prev_block_len > 0:
+                    live_source_idx = (
+                        prev_block_len - 1 - self.num_speculative_blocks
+                        if request_id in self._allocated_block_reqs
+                        else prev_block_len - 1
+                    )
+                    live_source = req_blocks[live_source_idx]
             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
             # over-allocated at last round.
             if num_required_blocks <= len(req_blocks) and not has_partial_hit:
@@ -1799,10 +1804,11 @@ class MambaManager(SingleTypeKVCacheManager):
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
                 req_blocks.extend(new_blocks)
-                live_dest_idx = len(req_blocks) - 1 - self.num_speculative_blocks
-                live_dest = req_blocks[live_dest_idx]
-                if any(live_dest is block for block in new_blocks):
-                    self._queue_replayssm_live_copy(live_source, live_dest)
+                if self._copy_replayssm_live_state:
+                    live_dest_idx = len(req_blocks) - 1 - self.num_speculative_blocks
+                    live_dest = req_blocks[live_dest_idx]
+                    if any(live_dest is block for block in new_blocks):
+                        self._queue_replayssm_live_copy(live_source, live_dest)
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
                 returned_blocks.extend(new_blocks)
@@ -1815,8 +1821,7 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         """Queue and retain one complete live ReplaySSM slot migration."""
         if (
-            not self._copy_replayssm_live_state
-            or source_block is None
+            source_block is None
             or source_block.is_null
             or destination_block.is_null
             or source_block is destination_block

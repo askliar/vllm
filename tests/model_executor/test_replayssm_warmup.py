@@ -128,12 +128,13 @@ def test_replayssm_autotune_slots_restore_state_and_trackers():
     mixer.kv_cache = (
         torch.full((4, 2), 3.0),
         torch.full((4, 2), 3.0),
-        *(torch.full((4, 2, 17), 3.0) for _ in range(3)),
     )
+    mixer.replayssm_cache = tuple(torch.full((4, 2, 17), 3.0) for _ in range(3))
     mixer._replayssm_ring_start = torch.full((4,), 3, dtype=torch.int32)
     mixer._replayssm_prev_num_accepted = torch.full((4,), 3, dtype=torch.int32)
     tracked = (
         *mixer.kv_cache,
+        *mixer.replayssm_cache,
         mixer._replayssm_ring_start,
         mixer._replayssm_prev_num_accepted,
     )

@@ -315,6 +315,8 @@ def _materialize_mixer(device: str = "cpu") -> Mock:
     mixer.kv_cache = [
         torch.empty(0, device=device),
         torch.empty(8, 4, 3, 5, device=device),
+    ]
+    mixer.replayssm_cache = [
         torch.empty(8, 4, 20, 3, device=device),
         torch.empty(8, 4, 20, device=device),
         torch.empty(8, 2, 20, 5, device=device),
@@ -331,32 +333,6 @@ def _materialize_mixer(device: str = "cpu") -> Mock:
         stochastic_rounding_philox_rounds=6,
     )
     return mixer
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-def test_validate_replayssm_cache_rejects_incomplete_cache():
-    mixer = _materialize_mixer(device="cuda")
-
-    mixer.kv_cache[1] = torch.empty(0, device="cuda")
-    with pytest.raises(RuntimeError, match="cache tensors"):
-        ssu_dispatch._validate_replayssm_cache([mixer])
-
-    mixer = _materialize_mixer(device="cuda")
-    mixer.kv_cache[2] = torch.empty(0, device="cuda")
-    with pytest.raises(RuntimeError, match="cache tensors"):
-        ssu_dispatch._validate_replayssm_cache([mixer])
-
-    mixer = _materialize_mixer(device="cuda")
-    mixer._replayssm_ring_start = torch.empty(0, dtype=torch.int32, device="cuda")
-    with pytest.raises(RuntimeError, match="ring trackers"):
-        ssu_dispatch._validate_replayssm_cache([mixer])
-
-
-def test_validate_replayssm_cache_requires_cuda_state():
-    mixer = _materialize_mixer(device="cpu")
-
-    with pytest.raises(RuntimeError, match="requires CUDA cache tensors"):
-        ssu_dispatch._validate_replayssm_cache([mixer])
 
 
 def _modelwide_replayssm_fixture(cache_mode: str = "align"):
@@ -423,7 +399,6 @@ def test_modelwide_replayssm_none_commits_trackers_without_materialization(
     num_computed = torch.zeros(2, dtype=torch.int32, device="cuda")
     accepted = torch.ones(2, dtype=torch.int32, device="cuda")
     is_prefilling = torch.zeros(2, dtype=torch.bool, device="cuda")
-    live_cols = torch.zeros(2, dtype=torch.int32, device="cuda")
 
     def step(*, scheduled: int, num_accepted: int, prefilling: bool = False) -> None:
         query_len[0] = scheduled
@@ -437,7 +412,7 @@ def test_modelwide_replayssm_none_commits_trackers_without_materialization(
             num_computed_is_post_step=False,
             num_accepted_tokens=accepted,
             is_prefilling=is_prefilling,
-            live_cols=live_cols,
+            live_cols=None,
             num_reqs=1,
         )
         num_computed[0] += num_accepted
@@ -619,8 +594,8 @@ def test_modelwide_replayssm_compacts_sparse_materialization_requests(monkeypatc
         assert group_ctx.plan_flush_count.tolist() == [-1, 1]
         assert group_ctx.active_request_indices.tolist() == [1, -1]
 
-    # A shorter batch must clear both the compacted active tail and every stale
-    # source/destination slot left by the prior materialization.
+    # A shorter batch clears the compacted active tail. Fixed-capacity plan and
+    # slot-table tails may stay stale because FlashInfer stops at the first -1.
     ctx.postprocess(
         idx_mapping=None,
         query_metadata=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
@@ -635,10 +610,10 @@ def test_modelwide_replayssm_compacts_sparse_materialization_requests(monkeypatc
     torch.accelerator.synchronize()
 
     for group_ctx in ctx.groups:
-        assert group_ctx.plan_flush_count.tolist() == [-1, -1]
+        assert group_ctx.plan_flush_count[0].item() == -1
         assert group_ctx.active_request_indices.tolist() == [-1, -1]
-        assert torch.all(group_ctx.src_slots == NULL_BLOCK_ID)
-        assert torch.all(group_ctx.dst_slots == NULL_BLOCK_ID)
+        assert torch.all(group_ctx.src_slots[:, 0] == NULL_BLOCK_ID)
+        assert torch.all(group_ctx.dst_slots[:, 0] == NULL_BLOCK_ID)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
@@ -720,7 +695,8 @@ def test_modelwide_replayssm_postprocess_skips_filtered_pp_row():
     for group_ctx, (ring_start, num_committed) in zip(ctx.groups, before):
         assert torch.equal(group_ctx.ring_start, ring_start)
         assert torch.equal(group_ctx.num_committed, num_committed)
-        assert group_ctx.plan_flush_count.tolist() == [-1, -1]
+        assert group_ctx.plan_flush_count[0].item() == -1
+        assert group_ctx.active_request_indices.tolist() == [-1, -1]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")

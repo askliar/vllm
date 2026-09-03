@@ -93,6 +93,7 @@ class MambaHybridModelState(DefaultModelState):
         self._is_prefilling_gpu = torch.zeros(
             self.max_num_reqs, dtype=torch.bool, device=self.device
         )
+        self._replayssm_query_start_loc: torch.Tensor | None = None
         # Pre-copy prefix-cache state (V2). The migration of each request's
         # mamba state across block boundaries runs as a fused GPU kernel reusing
         # the postprocess copy machinery, so the per-step src columns and the
@@ -110,15 +111,10 @@ class MambaHybridModelState(DefaultModelState):
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
         if self._needs_prefix_state_migration or self._use_flashinfer_replayssm:
-            self._replayssm_live_cols_gpu = torch.zeros(
-                self.max_num_reqs, dtype=torch.int32, device=self.device
-            )
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
-            self._mamba_kv_cache_config: KVCacheConfig | None = None
-            self._mamba_block_tables: tuple[torch.Tensor, ...] | None = None
         if self._needs_prefix_state_migration:
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -167,8 +163,6 @@ class MambaHybridModelState(DefaultModelState):
         mamba_group_ids: list[int],
         block_tables: tuple[torch.Tensor, ...],
     ) -> MambaSpecDecodeGPUContext:
-        self._mamba_kv_cache_config = kv_cache_config
-        self._mamba_block_tables = block_tables
         if self._mamba_state_copy_funcs is None:
             mamba_groups = get_mamba_groups(kv_cache_config)
             mamba_types = {spec.mamba_type for spec in mamba_groups}
@@ -322,6 +316,7 @@ class MambaHybridModelState(DefaultModelState):
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
         if self._use_flashinfer_replayssm:
+            self._replayssm_query_start_loc = input_batch.query_start_loc
             mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
             self._ensure_mamba_postprocess_ctx(
                 kv_cache_config, mamba_group_ids, block_tables
@@ -381,8 +376,6 @@ class MambaHybridModelState(DefaultModelState):
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
-        query_start_loc: torch.Tensor | None = None,
-        is_prefilling: torch.Tensor | None = None,
     ) -> None:
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
@@ -434,16 +427,12 @@ class MambaHybridModelState(DefaultModelState):
         self._publish_flashinfer_replayssm(
             idx_mapping,
             num_computed_tokens,
-            query_start_loc,
-            is_prefilling,
         )
 
     def _publish_flashinfer_replayssm(
         self,
         idx_mapping: torch.Tensor,
         num_computed_tokens: torch.Tensor | None,
-        query_start_loc: torch.Tensor | None,
-        is_prefilling: torch.Tensor | None,
     ) -> None:
         """Commit the accepted target transition to ReplaySSM trackers."""
         num_reqs = idx_mapping.shape[0]
@@ -455,6 +444,7 @@ class MambaHybridModelState(DefaultModelState):
                 "ReplaySSM postprocess requires the post-step computed-token "
                 "counts from the forward that produced this acceptance"
             )
+        query_start_loc = self._replayssm_query_start_loc
         if query_start_loc is None:
             raise RuntimeError(
                 "ReplaySSM postprocess requires the query_start_loc from "
@@ -467,8 +457,6 @@ class MambaHybridModelState(DefaultModelState):
             )
         replayssm = ctx.replayssm
         assert replayssm is not None
-        if is_prefilling is None:
-            is_prefilling = self._is_prefilling_gpu[:num_reqs]
         replayssm.postprocess(
             idx_mapping=idx_mapping,
             query_metadata=query_start_loc,
@@ -483,11 +471,11 @@ class MambaHybridModelState(DefaultModelState):
                 if self._needs_prefix_state_migration
                 else self.num_accepted_tokens_gpu
             ),
-            is_prefilling=is_prefilling,
+            is_prefilling=self._is_prefilling_gpu[:num_reqs],
             live_cols=(
                 self._mamba_state_idx_gpu
                 if self._needs_prefix_state_migration
-                else self._replayssm_live_cols_gpu
+                else None
             ),
             num_reqs=num_reqs,
         )

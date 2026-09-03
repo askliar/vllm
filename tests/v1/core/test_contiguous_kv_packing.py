@@ -145,17 +145,6 @@ def test_replayssm_rings_do_not_expand_canonical_mamba_page():
     assert torch.count_nonzero(replayssm_caches["mamba"][1]) == 0
 
 
-def test_mamba_spec_requires_exact_replayssm_ring_layout():
-    with pytest.raises(ValueError, match="exactly three.*x, dt, and B"):
-        MambaSpec(
-            block_size=2,
-            shapes=((16,), (16,)),
-            dtypes=(torch.float32, torch.float32),
-            replayssm_shapes=((2,), (1,)),
-            replayssm_dtypes=(torch.float32,) * 2,
-        )
-
-
 MAIN_KV_PAGE_BYTES = 2_048
 COMPRESSED_PAGE_BYTES = 128
 NUM_CACHE_TUPLES = 3

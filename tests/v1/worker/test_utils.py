@@ -3,7 +3,6 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from vllm.config.mamba import MambaBackendEnum, MambaConfig
@@ -76,7 +75,8 @@ def test_bind_kv_cache_shares_replayssm_trackers_by_cache_group():
         },
     )
 
-    assert all(len(mixer.kv_cache) == 5 for mixer in mixers)
+    assert all(len(mixer.kv_cache) == 2 for mixer in mixers)
+    assert all(len(mixer.replayssm_cache) == 3 for mixer in mixers)
 
     tracker_names = (
         "_replayssm_ring_start",
@@ -122,7 +122,7 @@ def test_replayssm_block_copy_includes_rings_and_group_trackers(monkeypatch):
 
     src, dst = 1, 2
     for layer_idx, mixer in enumerate(mixers):
-        for state_idx, state in enumerate(mixer.kv_cache):
+        for state_idx, state in enumerate((*mixer.kv_cache, *mixer.replayssm_cache)):
             state[src].fill_(10 * layer_idx + state_idx + 1)
             state[dst].fill_(-1)
     for group_idx, mixer in enumerate(mixers[:2]):
@@ -136,7 +136,7 @@ def test_replayssm_block_copy_includes_rings_and_group_trackers(monkeypatch):
     )
 
     for mixer in mixers:
-        for state in mixer.kv_cache:
+        for state in (*mixer.kv_cache, *mixer.replayssm_cache):
             torch.testing.assert_close(state[dst], state[src])
     assert mixers[0]._replayssm_ring_start[dst].item() == 20
     assert mixers[0]._replayssm_prev_num_accepted[dst].item() == 30
@@ -144,24 +144,17 @@ def test_replayssm_block_copy_includes_rings_and_group_trackers(monkeypatch):
     assert mixers[1]._replayssm_prev_num_accepted[dst].item() == 31
 
 
-def test_replayssm_block_copy_validates_exact_cache_roles():
-    mixer = _TestReplaySSMMixer()
-    mixer.kv_cache = tuple(torch.zeros(4, 1) for _ in range(4))
-
-    with pytest.raises(ValueError, match="exactly 5 cache roles"):
-        get_replayssm_block_copy_tensors({"layers.0.mixer": mixer})
-
-
 def test_replayssm_block_copy_includes_triton_rings_without_trackers():
     mixer = _TestReplaySSMMixer(MambaBackendEnum.TRITON)
-    mixer.kv_cache = tuple(torch.zeros(4, 1) for _ in range(5))
+    mixer.kv_cache = tuple(torch.zeros(4, 1) for _ in range(2))
+    mixer.replayssm_cache = tuple(torch.zeros(4, 1) for _ in range(3))
 
     tensors = get_replayssm_block_copy_tensors({"layers.0.mixer": mixer})
 
     assert len(tensors) == 3
     assert all(
         actual is expected
-        for actual, expected in zip(tensors, mixer.kv_cache[2:5], strict=True)
+        for actual, expected in zip(tensors, mixer.replayssm_cache, strict=True)
     )
 
 

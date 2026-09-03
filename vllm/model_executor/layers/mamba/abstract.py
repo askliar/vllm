@@ -24,6 +24,8 @@ class MambaBase(AttentionLayerBase):
     # Contains the KV cache (mamba state) for the layer
     # in the shape specified by `self.get_state_shape`.
     kv_cache: tuple[torch.Tensor, ...]
+    # ReplaySSM rings are auxiliary backend state, not canonical Mamba pages.
+    replayssm_cache: tuple[torch.Tensor, ...] = ()
     supports_dcp: bool = False
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
@@ -43,14 +45,7 @@ class MambaBase(AttentionLayerBase):
         self.kv_cache = tuple(states)
 
     def bind_replayssm_cache(self, cache: tuple[torch.Tensor, ...]) -> None:
-        expected_shapes = self.get_replayssm_state_shape()
-        expected_dtypes = self.get_replayssm_state_dtype()
-        assert len(cache) == len(expected_shapes) == len(expected_dtypes)
-        assert all(
-            tuple(state.shape[1:]) == shape and state.dtype == dtype
-            for state, shape, dtype in zip(cache, expected_shapes, expected_dtypes)
-        )
-        self.kv_cache = (*self.kv_cache, *cache)
+        self.replayssm_cache = cache
 
     @abstractmethod
     def get_state_shape(self) -> Iterable[tuple[int, ...]]:

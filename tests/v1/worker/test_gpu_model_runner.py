@@ -1487,7 +1487,7 @@ def test_v1_caches_replayssm_block_copy_tensors_after_binding(monkeypatch):
 
     def get_extra(_context):
         assert events == ["bind"]
-        events.append("validate")
+        events.append("collect")
         return [extra]
 
     monkeypatch.setattr(
@@ -1498,7 +1498,7 @@ def test_v1_caches_replayssm_block_copy_tensors_after_binding(monkeypatch):
         SimpleNamespace(kv_cache_groups=[]), kernel_block_sizes=[]
     )
 
-    assert events == ["bind", "validate"]
+    assert events == ["bind", "collect"]
     assert len(runner.replayssm_block_copy_tensors) == 1
     assert runner.replayssm_block_copy_tensors[0] is extra
 
