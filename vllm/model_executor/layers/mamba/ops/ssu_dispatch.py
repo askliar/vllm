@@ -19,6 +19,7 @@ import torch
 
 from vllm.config.mamba import MambaBackendEnum, MambaConfig, MambaSSUAlgorithm
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.mamba_utils import _reinterpret_u64_as_i64
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -916,11 +917,6 @@ def selective_state_update_replayssm_flashinfer(
         cumAdt_vec=cumAdt_vec,
         cb_old=cb_old,
     )
-
-
-def _reinterpret_u64_as_i64(value: int) -> int:
-    """Preserve a uint64 pointer bit pattern in a torch.int64 tensor."""
-    return value if value < (1 << 63) else value - (1 << 64)
 
 
 def _cuda_i64_ptrs(tensors: list[torch.Tensor]) -> torch.Tensor:

@@ -50,6 +50,11 @@ def is_conv_state_dim_first() -> bool:
     return get_conv_state_layout() == "DS"
 
 
+def _reinterpret_u64_as_i64(value: int) -> int:
+    """Preserve a uint64 pointer bit pattern in a torch.int64 tensor."""
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
 class MambaStateDtypeCalculator:
     @classmethod
     def linear_attention_state_dtype(

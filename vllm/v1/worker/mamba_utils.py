@@ -12,6 +12,7 @@ from vllm.config.mamba import MambaBackendEnum
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncsByType,
+    _reinterpret_u64_as_i64,
     get_conv_copy_spec,
     get_temporal_copy_spec,
     is_conv_state_dim_first,
@@ -185,11 +186,6 @@ def _memcpy_u64_tiled(
             mask = (i + offsets) < tile_end
             data = tl.load(src_u8 + i + offsets, mask=mask)
             tl.store(dst_u8 + i + offsets, data, mask=mask)
-
-
-def _reinterpret_u64_as_i64(value: int) -> int:
-    """Preserve a uint64 pointer bit pattern in a torch.int64 tensor."""
-    return value if value < (1 << 63) else value - (1 << 64)
 
 
 @triton.jit

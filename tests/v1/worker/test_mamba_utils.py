@@ -12,6 +12,7 @@ from vllm.config.mamba import MambaBackendEnum
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncsByType,
+    _reinterpret_u64_as_i64,
     get_conv_copy_spec,
     get_temporal_copy_spec,
 )
@@ -27,7 +28,6 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.mamba_utils import (
     MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
-    _reinterpret_u64_as_i64,
     batch_memcpy,
     collect_mamba_copy_meta,
     do_mamba_copy_block,
@@ -426,7 +426,14 @@ class _FakeDataPtrTensor:
 
 
 def test_reinterpret_u64_as_i64_preserves_pointer_bits():
-    ptrs = [1 << 63, (1 << 64) - 1]
+    ptrs = [
+        0,
+        1,
+        (1 << 63) - 1,
+        1 << 63,
+        (1 << 63) + 1234,
+        (1 << 64) - 1,
+    ]
     ptr_tensor = torch.zeros(len(ptrs), dtype=torch.int64)
 
     for idx, ptr in enumerate(ptrs):
