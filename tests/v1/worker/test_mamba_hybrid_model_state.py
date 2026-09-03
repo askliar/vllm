@@ -42,7 +42,10 @@ def test_postprocess_state_scalar_with_int32_mapping(
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
-def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
+@pytest.mark.parametrize("defer_after_drafting", [False, True])
+def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration(
+    defer_after_drafting: bool,
+) -> None:
     state = object.__new__(MambaHybridModelState)
     state._align_mode = False
     state._needs_prefix_state_migration = False
@@ -62,19 +65,34 @@ def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
     )
     state._mamba_ctx = ctx
     idx_mapping = torch.tensor([2], dtype=torch.int32, device="cuda")
+    num_sampled = torch.tensor([2], dtype=torch.int32, device="cuda")
     num_computed = torch.tensor([0, 0, 20, 0], dtype=torch.int32, device="cuda")
     query_start_loc = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
 
     state.postprocess_state(
         idx_mapping,
-        2,
+        num_sampled,
         num_computed_tokens=num_computed,
         query_start_loc=query_start_loc,
+        defer_after_drafting=defer_after_drafting,
     )
 
     ctx.run_fused_postprocess_align.assert_not_called()
+    if defer_after_drafting:
+        replayssm.postprocess.assert_not_called()
+        # The drafter reuses this request-state buffer. The post-draft commit
+        # must consume the sampler-owned batch tensor instead of the clobbered
+        # request-state value.
+        state.num_accepted_tokens_gpu[2] = 1
+        state.postprocess_state_after_drafting(
+            idx_mapping,
+            num_sampled,
+            num_computed_tokens=num_computed,
+            query_start_loc=query_start_loc,
+        )
     assert replayssm.postprocess.call_count == 1
     kwargs = replayssm.postprocess.call_args.kwargs
+    assert state.num_accepted_tokens_gpu.tolist() == [1, 1, 2, 1]
     assert kwargs["num_accepted_tokens"] is state.num_accepted_tokens_gpu
     assert kwargs["live_cols"] is state._replayssm_live_cols_gpu
 

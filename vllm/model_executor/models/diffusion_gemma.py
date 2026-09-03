@@ -981,6 +981,7 @@ class DiffusionGemmaModelState(ModelState):
         num_computed_tokens=None,
         query_start_loc=None,
         is_prefilling=None,
+        defer_after_drafting=False,
     ) -> None:
         return None
 
