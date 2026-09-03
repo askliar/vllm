@@ -401,9 +401,8 @@ def postprocess_mamba_fused_kernel(
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
     # Batch-ordered ReplaySSM materialization decision. The caller initializes
-    # src_col to -1, which remains the no-op sentinel when no boundary is hit.
-    materialize_src_col_ptr,
-    # Logical column holding the block-aligned prefix checkpoint.
+    # dst_col to -1, which remains the no-op sentinel when no boundary is hit.
+    # The source is always mamba_state_idx_ptr.
     materialize_dst_col_ptr,
     # Current-query rows through that boundary: accept_token_bias + 1. The
     # materializer adds older pending rows from the source slot's tracker.
@@ -485,7 +484,6 @@ def postprocess_mamba_fused_kernel(
     dest_block_idx = aligned_new_computed // block_size - 1
 
     if state_idx == 0 and tile_idx == 0:
-        tl.store(materialize_src_col_ptr + batch_idx, src_block_idx)
         tl.store(materialize_dst_col_ptr + batch_idx, dest_block_idx)
         tl.store(
             materialize_token_count_ptr + batch_idx,
@@ -839,7 +837,6 @@ class MambaSpecDecodeGPUContext:
 
     # Output buffer for num_accepted_tokens updates
     num_accepted_tokens_out: torch.Tensor
-    materialize_src_cols: torch.Tensor
     materialize_dst_cols: torch.Tensor
     materialize_token_counts: torch.Tensor
 
@@ -948,11 +945,8 @@ class MambaSpecDecodeGPUContext:
             num_accepted_tokens_out=torch.zeros(
                 max_num_reqs, dtype=torch.int32, device=device
             ),
-            materialize_src_cols=torch.full(
+            materialize_dst_cols=torch.full(
                 (max_num_reqs,), -1, dtype=torch.int32, device=device
-            ),
-            materialize_dst_cols=torch.empty(
-                max_num_reqs, dtype=torch.int32, device=device
             ),
             materialize_token_counts=torch.empty(
                 max_num_reqs, dtype=torch.int32, device=device
@@ -1238,7 +1232,7 @@ class MambaSpecDecodeGPUContext:
         self.num_accepted_tokens_out[:num_reqs].copy_(
             num_accepted_tokens_gpu[:num_reqs]
         )
-        self.materialize_src_cols[:num_reqs].fill_(-1)
+        self.materialize_dst_cols[:num_reqs].fill_(-1)
 
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
@@ -1261,7 +1255,6 @@ class MambaSpecDecodeGPUContext:
             self.state_dim_row_count,
             self.state_dim_row_stride,
             self.num_accepted_tokens_out,
-            self.materialize_src_cols,
             self.materialize_dst_cols,
             self.materialize_token_counts,
             None,  # idx_mapping: V1 decision arrays are already in req order
@@ -1343,7 +1336,7 @@ class MambaSpecDecodeGPUContext:
         # decision buffer rather than only [:num_reqs].
         num_accepted_tokens_snapshot = self.num_accepted_tokens_out
         num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
-        self.materialize_src_cols[:num_reqs].fill_(-1)
+        self.materialize_dst_cols[:num_reqs].fill_(-1)
 
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
@@ -1365,7 +1358,6 @@ class MambaSpecDecodeGPUContext:
             self.state_dim_row_count,
             self.state_dim_row_stride,
             num_accepted_tokens_gpu,
-            self.materialize_src_cols,
             self.materialize_dst_cols,
             self.materialize_token_counts,
             idx_mapping,
@@ -1734,7 +1726,6 @@ def postprocess_mamba_align_gpu(
             num_accepted_tokens=accepted_tokens_for_postprocess,
             is_prefilling=ctx.is_prefilling_buf.gpu,
             live_cols=ctx.mamba_state_idx_buf.gpu,
-            materialize_src_cols=ctx.materialize_src_cols,
             materialize_dst_cols=ctx.materialize_dst_cols,
             materialize_token_counts=ctx.materialize_token_counts,
             num_reqs=num_reqs,

@@ -462,7 +462,6 @@ def test_modelwide_replayssm_none_commits_trackers_without_materialization(
             num_accepted_tokens=accepted,
             is_prefilling=is_prefilling,
             live_cols=live_cols,
-            materialize_src_cols=no_materialize,
             materialize_dst_cols=no_materialize,
             materialize_token_counts=materialize_counts,
             num_reqs=1,
@@ -528,7 +527,6 @@ def test_modelwide_replayssm_materializes_each_cache_group(monkeypatch):
         num_accepted_tokens=torch.tensor([2, 1], dtype=torch.int32, device="cuda"),
         is_prefilling=torch.tensor([False, False], device="cuda"),
         live_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
-        materialize_src_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
         materialize_dst_cols=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
         materialize_token_counts=torch.tensor([2, 0], dtype=torch.int32, device="cuda"),
         num_reqs=1,
@@ -565,6 +563,44 @@ def test_modelwide_replayssm_materializes_each_cache_group(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_modelwide_replayssm_compacts_sparse_materialization_requests(monkeypatch):
+    _, config, forward_context, block_tables = _modelwide_replayssm_fixture()
+    block_tables[0][1] = torch.tensor([3, 2, 1], device="cuda")
+    block_tables[1][1] = torch.tensor([7, 6, 5], device="cuda")
+    materializer = Mock()
+    monkeypatch.setattr(
+        ssu_dispatch, "_load_replayssm_materialize", lambda: materializer
+    )
+    ctx = ReplaySSMModelContext.create(
+        config,
+        [0, 1],
+        forward_context,
+        block_tables,
+        max_num_reqs=2,
+    )
+    assert ctx is not None
+
+    ctx.postprocess(
+        idx_mapping=None,
+        query_metadata=torch.tensor([1, 4], dtype=torch.int32, device="cuda"),
+        query_metadata_is_cumulative=False,
+        num_accepted_tokens=torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
+        is_prefilling=torch.tensor([False, False], device="cuda"),
+        live_cols=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        materialize_dst_cols=torch.tensor([-1, 1], dtype=torch.int32, device="cuda"),
+        materialize_token_counts=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        num_reqs=2,
+    )
+    ctx.materialize()
+    torch.accelerator.synchronize()
+
+    assert materializer.call_count == 2
+    for group_ctx in ctx.groups:
+        assert group_ctx.plan_flush_count.tolist() == [-1, 1]
+        assert group_ctx.active_request_indices.tolist() == [1, -1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_modelwide_replayssm_postprocess_commits_checkpoint_boundary(monkeypatch):
     groups, config, forward_context, block_tables = _modelwide_replayssm_fixture()
     for mixers, source_slot in zip(groups, (1, 4)):
@@ -588,7 +624,6 @@ def test_modelwide_replayssm_postprocess_commits_checkpoint_boundary(monkeypatch
         num_accepted_tokens=torch.tensor([1, 3], dtype=torch.int32, device="cuda"),
         is_prefilling=torch.tensor([False, False], device="cuda"),
         live_cols=torch.tensor([-1, 0], dtype=torch.int32, device="cuda"),
-        materialize_src_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
         materialize_dst_cols=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
         materialize_token_counts=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
         num_reqs=1,
@@ -626,9 +661,6 @@ def test_modelwide_replayssm_postprocess_skips_filtered_pp_row():
         )
         group_ctx.num_committed.fill_(7)
         before.append((group_ctx.ring_start.clone(), group_ctx.num_committed.clone()))
-        group_ctx.src_slots.fill_(3)
-        group_ctx.dst_slots.fill_(4)
-        group_ctx.plan_ring_start.fill_(5)
         group_ctx.plan_flush_count.fill_(6)
 
     ctx.postprocess(
@@ -638,7 +670,6 @@ def test_modelwide_replayssm_postprocess_skips_filtered_pp_row():
         num_accepted_tokens=torch.ones(2, dtype=torch.int32, device="cuda"),
         is_prefilling=torch.zeros(2, dtype=torch.bool, device="cuda"),
         live_cols=torch.zeros(2, dtype=torch.int32, device="cuda"),
-        materialize_src_cols=torch.zeros(2, dtype=torch.int32, device="cuda"),
         materialize_dst_cols=torch.ones(2, dtype=torch.int32, device="cuda"),
         materialize_token_counts=torch.ones(2, dtype=torch.int32, device="cuda"),
         num_reqs=1,
@@ -648,9 +679,6 @@ def test_modelwide_replayssm_postprocess_skips_filtered_pp_row():
     for group_ctx, (ring_start, num_committed) in zip(ctx.groups, before):
         assert torch.equal(group_ctx.ring_start, ring_start)
         assert torch.equal(group_ctx.num_committed, num_committed)
-        assert torch.all(group_ctx.src_slots == NULL_BLOCK_ID)
-        assert torch.all(group_ctx.dst_slots == NULL_BLOCK_ID)
-        assert group_ctx.plan_ring_start.tolist() == [0, 0]
         assert group_ctx.plan_flush_count.tolist() == [-1, -1]
 
 
@@ -719,7 +747,6 @@ def test_modelwide_replayssm_prefill_commit_publishes_exact_copy(monkeypatch):
         num_accepted_tokens=torch.ones(2, dtype=torch.int32, device="cuda"),
         is_prefilling=torch.tensor([True, False], device="cuda"),
         live_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
-        materialize_src_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
         materialize_dst_cols=torch.tensor([1, -1], dtype=torch.int32, device="cuda"),
         materialize_token_counts=torch.zeros(2, dtype=torch.int32, device="cuda"),
         num_reqs=1,
@@ -805,7 +832,6 @@ def test_modelwide_replayssm_postprocess_materializes_in_place(monkeypatch):
         num_accepted_tokens=torch.tensor([2, 1], dtype=torch.int32, device="cuda"),
         is_prefilling=torch.zeros(2, dtype=torch.bool, device="cuda"),
         live_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
-        materialize_src_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
         materialize_dst_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
         materialize_token_counts=torch.tensor([2, 0], dtype=torch.int32, device="cuda"),
         num_reqs=1,

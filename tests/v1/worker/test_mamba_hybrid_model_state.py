@@ -56,7 +56,6 @@ def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
     ctx = Mock(
         is_initialized=True,
         replayssm=replayssm,
-        materialize_src_cols=torch.full((4,), -1, dtype=torch.int32, device="cuda"),
         materialize_dst_cols=torch.full((4,), -1, dtype=torch.int32, device="cuda"),
         materialize_token_counts=torch.zeros(4, dtype=torch.int32, device="cuda"),
         block_size=1024,

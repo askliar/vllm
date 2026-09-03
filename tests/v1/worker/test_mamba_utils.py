@@ -230,7 +230,6 @@ def test_postprocess_mamba_align_commits_then_materializes_after_fused_copy(
     ctx.num_draft_tokens_buf = MagicMock()
     ctx.is_prefilling_buf = MagicMock()
     ctx.num_accepted_tokens_out = torch.tensor([3], dtype=torch.int32)
-    ctx.materialize_src_cols = torch.tensor([2], dtype=torch.int32)
     ctx.materialize_dst_cols = torch.tensor([1], dtype=torch.int32)
     ctx.materialize_token_counts = torch.tensor([2], dtype=torch.int32)
     ctx.run_fused_postprocess.side_effect = lambda **kwargs: order.append("copy")
@@ -271,7 +270,6 @@ def test_postprocess_mamba_none_skips_prefix_copy():
     ctx.num_computed_tokens_buf = MagicMock(gpu=torch.tensor([20], dtype=torch.int32))
     ctx.num_draft_tokens_buf = MagicMock(gpu=torch.tensor([3], dtype=torch.int32))
     ctx.is_prefilling_buf = MagicMock(gpu=torch.tensor([False]))
-    ctx.materialize_src_cols = torch.full((1,), -1, dtype=torch.int32)
     ctx.materialize_dst_cols = torch.full((1,), -1, dtype=torch.int32)
     ctx.materialize_token_counts = torch.zeros(1, dtype=torch.int32)
     ctx.block_size = 1024
@@ -1325,7 +1323,7 @@ class TestPostprocessMambaFusedKernel:
         # State should be unchanged
         torch.testing.assert_close(conv_state, conv_state_orig)
         torch.testing.assert_close(temporal_state, temporal_state_orig)
-        assert gpu_ctx.materialize_src_cols[0].item() == -1
+        assert gpu_ctx.materialize_dst_cols[0].item() == -1
 
     @pytest.mark.parametrize("num_reqs", [1, 2, 8, 16])
     def test_various_batch_sizes(self, device, test_config, num_reqs):
@@ -1648,7 +1646,6 @@ class TestPostprocessMambaFusedKernel:
             device=device,
         )
 
-        assert gpu_ctx.materialize_src_cols[0].item() == 1
         assert gpu_ctx.materialize_dst_cols[0].item() == 1
         assert gpu_ctx.materialize_token_counts[0].item() == 1
 

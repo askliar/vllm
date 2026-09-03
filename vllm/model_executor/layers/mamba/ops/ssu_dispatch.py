@@ -80,8 +80,8 @@ def _preprocess_replayssm_kernel(
         tl.store(src_slots + slot_offset, src_slot)
         tl.store(dst_slots + slot_offset, dst_slot)
 
-    # Always clear the fixed-capacity plan row before deciding whether this
-    # request has work. FlashInfer treats flush_count < 0 as a no-op.
+    # Clear the fixed-capacity plan row before deciding whether this request
+    # belongs in the compact materialization list.
     tl.store(plan_ring_start + batch_idx, 0)
     tl.store(plan_flush_count + batch_idx, -1)
     if changed:
@@ -146,7 +146,6 @@ def _postprocess_replayssm_kernel(
     num_accepted_tokens,
     is_prefilling,
     live_cols,
-    materialize_src_cols,
     materialize_dst_cols,
     materialize_token_counts,
     block_table,
@@ -163,7 +162,6 @@ def _postprocess_replayssm_kernel(
     LOGICAL_WINDOW: tl.constexpr,
     RING_BUFFER_LEN: tl.constexpr,
     NUM_LAYERS: tl.constexpr,
-    PAD_SLOT_ID: tl.constexpr,
     QUERY_METADATA_IS_CUMULATIVE: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr,
     MATERIALIZE_PREFIXES: tl.constexpr,
@@ -171,93 +169,83 @@ def _postprocess_replayssm_kernel(
 ) -> None:
     """Commit a completed step and prepare an optional prefix snapshot."""
     batch_idx = tl.program_id(0)
-    active = batch_idx < num_reqs
-    req_idx = batch_idx
-    if HAS_IDX_MAPPING:
-        req_idx = tl.load(idx_mapping + batch_idx, mask=active, other=-1)
-    valid_req = active & (req_idx >= 0)
 
-    src_col = tl.load(materialize_src_cols + batch_idx, mask=valid_req, other=-1)
-    materialize = valid_req & (src_col >= 0)
-    dst_col = tl.load(materialize_dst_cols + batch_idx, mask=materialize, other=-1)
-    src_slot = tl.load(
-        block_table + batch_idx * block_table_stride_req + src_col,
-        mask=materialize,
-        other=PAD_SLOT_ID,
-    )
-    dst_slot = tl.load(
-        block_table + batch_idx * block_table_stride_req + dst_col,
-        mask=materialize,
-        other=PAD_SLOT_ID,
-    )
-    for layer_idx in tl.static_range(0, NUM_LAYERS):
-        slot_offset = layer_idx * slot_table_stride_layer + batch_idx
-        tl.store(src_slots + slot_offset, src_slot)
-        tl.store(dst_slots + slot_offset, dst_slot)
-
-    tl.store(plan_ring_start + batch_idx, 0)
-    tl.store(plan_flush_count + batch_idx, -1)
-
-    if valid_req:
-        # The live column and any materialization destination are allocated by
-        # BlockManager. A bad mapping is an upstream lifecycle bug, not a
-        # recoverable per-request condition for this kernel to hide.
-        live_col = tl.load(live_cols + req_idx)
-        live_slot = tl.load(block_table + batch_idx * block_table_stride_req + live_col)
-        prefilling = tl.load(is_prefilling + batch_idx)
-        if prefilling:
-            if materialize:
-                # Prefill produced canonical state, so publish an exact copy.
-                tl.store(plan_flush_count + batch_idx, 0)
-        else:
-            if QUERY_METADATA_IS_CUMULATIVE:
-                query_len = tl.load(query_metadata + batch_idx + 1) - tl.load(
-                    query_metadata + batch_idx
-                )
-            else:
-                query_len = tl.load(query_metadata + batch_idx)
-            accepted = tl.maximum(tl.load(num_accepted_tokens + req_idx), 1)
-            old_start = tl.load(tracker_start + live_slot)
-            old_committed = tl.load(tracker_committed + live_slot)
-            checkpointed = old_committed + query_len > LOGICAL_WINDOW
-            next_start = tl.where(
-                checkpointed,
-                (old_start + old_committed) % RING_BUFFER_LEN,
-                old_start,
-            )
-            next_committed = tl.where(checkpointed, accepted, old_committed + accepted)
-            tl.store(tracker_start + live_slot, next_start)
-            tl.store(tracker_committed + live_slot, next_committed)
-
-            if materialize:
-                boundary_count = tl.load(materialize_token_counts + batch_idx)
-                tl.store(plan_ring_start + batch_idx, next_start)
-                tl.store(
-                    plan_flush_count + batch_idx,
-                    next_committed - (accepted - boundary_count),
-                )
-
-        if materialize:
-            # src_slot == dst_slot is a valid in-place checkpoint.
-            tl.store(tracker_start + dst_slot, 0)
-            tl.store(tracker_committed + dst_slot, 0)
-
+    # FlashInfer requires active rows to be a compact prefix. The generic
+    # planner's destination is the sole materialization work sentinel.
     if MATERIALIZE_PREFIXES & (batch_idx == 0):
         active_count = 0
         for candidate_idx in tl.range(0, num_reqs):
             candidate_req_idx = candidate_idx
             if HAS_IDX_MAPPING:
                 candidate_req_idx = tl.load(idx_mapping + candidate_idx)
-            src_col = tl.load(
-                materialize_src_cols + candidate_idx,
-                mask=candidate_req_idx >= 0,
-                other=-1,
-            )
-            if (candidate_req_idx >= 0) & (src_col >= 0):
+            dst_col = tl.load(materialize_dst_cols + candidate_idx)
+            if (candidate_req_idx >= 0) & (dst_col >= 0):
                 tl.store(active_request_indices + active_count, candidate_idx)
                 active_count += 1
         if active_count < MAX_NUM_REQS:
             tl.store(active_request_indices + active_count, -1)
+
+    # Clear the fixed-capacity plan row before any per-request early exit.
+    tl.store(plan_flush_count + batch_idx, -1)
+    if batch_idx >= num_reqs:
+        return
+
+    req_idx = batch_idx
+    if HAS_IDX_MAPPING:
+        req_idx = tl.load(idx_mapping + batch_idx)
+        if req_idx < 0:
+            return
+
+    # BlockManager supplies allocated live/destination columns. The generic
+    # Mamba planner always materializes from this same live column.
+    live_col = tl.load(live_cols + req_idx)
+    live_slot = tl.load(block_table + batch_idx * block_table_stride_req + live_col)
+    dst_col = tl.load(materialize_dst_cols + batch_idx)
+    materialize = dst_col >= 0
+    prefilling = tl.load(is_prefilling + batch_idx)
+    if prefilling:
+        if materialize:
+            # Prefill produced canonical state, so publish an exact copy.
+            tl.store(plan_flush_count + batch_idx, 0)
+    else:
+        if QUERY_METADATA_IS_CUMULATIVE:
+            query_len = tl.load(query_metadata + batch_idx + 1) - tl.load(
+                query_metadata + batch_idx
+            )
+        else:
+            query_len = tl.load(query_metadata + batch_idx)
+        accepted = tl.load(num_accepted_tokens + req_idx)
+        old_start = tl.load(tracker_start + live_slot)
+        old_committed = tl.load(tracker_committed + live_slot)
+        checkpointed = old_committed + query_len > LOGICAL_WINDOW
+        next_start = tl.where(
+            checkpointed,
+            (old_start + old_committed) % RING_BUFFER_LEN,
+            old_start,
+        )
+        next_committed = tl.where(checkpointed, accepted, old_committed + accepted)
+        tl.store(tracker_start + live_slot, next_start)
+        tl.store(tracker_committed + live_slot, next_committed)
+
+        if materialize:
+            boundary_count = tl.load(materialize_token_counts + batch_idx)
+            tl.store(plan_ring_start + batch_idx, next_start)
+            tl.store(
+                plan_flush_count + batch_idx,
+                boundary_count + tl.where(checkpointed, 0, old_committed),
+            )
+
+    if not materialize:
+        return
+    dst_slot = tl.load(block_table + batch_idx * block_table_stride_req + dst_col)
+    for layer_idx in tl.static_range(0, NUM_LAYERS):
+        slot_offset = layer_idx * slot_table_stride_layer + batch_idx
+        tl.store(src_slots + slot_offset, live_slot)
+        tl.store(dst_slots + slot_offset, dst_slot)
+
+    # The published destination is canonical and therefore has no live replay.
+    tl.store(tracker_start + dst_slot, 0)
+    tl.store(tracker_committed + dst_slot, 0)
 
 
 def _replayssm_specialization_key(mixer: Any) -> tuple[Any, ...]:
@@ -433,7 +421,6 @@ class _ReplaySSMGroupContext:
         num_accepted_tokens: torch.Tensor,
         is_prefilling: torch.Tensor,
         live_cols: torch.Tensor,
-        materialize_src_cols: torch.Tensor,
         materialize_dst_cols: torch.Tensor,
         materialize_token_counts: torch.Tensor,
         num_reqs: int,
@@ -447,7 +434,6 @@ class _ReplaySSMGroupContext:
             num_accepted_tokens,
             is_prefilling,
             live_cols,
-            materialize_src_cols,
             materialize_dst_cols,
             materialize_token_counts,
             self.block_table,
@@ -464,7 +450,6 @@ class _ReplaySSMGroupContext:
             LOGICAL_WINDOW=self.logical_window,
             RING_BUFFER_LEN=self.ring_buffer_len,
             NUM_LAYERS=len(self.mixers),
-            PAD_SLOT_ID=NULL_BLOCK_ID,
             QUERY_METADATA_IS_CUMULATIVE=query_metadata_is_cumulative,
             HAS_IDX_MAPPING=idx_mapping is not None,
             MATERIALIZE_PREFIXES=self.materialize_prefixes,

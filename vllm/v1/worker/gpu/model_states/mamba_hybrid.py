@@ -543,7 +543,6 @@ class MambaHybridModelState(DefaultModelState):
                 if self._needs_prefix_state_migration
                 else self._replayssm_live_cols_gpu
             ),
-            materialize_src_cols=ctx.materialize_src_cols,
             materialize_dst_cols=ctx.materialize_dst_cols,
             materialize_token_counts=ctx.materialize_token_counts,
             num_reqs=num_reqs,
