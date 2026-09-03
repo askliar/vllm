@@ -36,6 +36,7 @@ except ImportError:
 # Mamba2 (Nemotron-3) hybrid.
 MAMBA2_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
 MAMBA2_MTP_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+MAMBA2_PREFIX_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
 MODELS = [
     pytest.param(MAMBA2_MODEL, marks=large_gpu_mark(min_gb=40)),
 ]
@@ -390,9 +391,10 @@ def test_flashinfer_replayssm_prefix_cache_tp1(
 def test_flashinfer_replayssm_all_prefix_cache(vllm_runner, monkeypatch, use_v2: bool):
     _check_flashinfer_replayssm_prefix_caching(
         vllm_runner,
-        MAMBA2_MODEL,
+        MAMBA2_PREFIX_MODEL,
         monkeypatch,
         mamba_cache_mode="all",
+        moe_backend="triton",
         use_ngram=False,
         use_v2=use_v2,
         tensor_parallel_size=1,
