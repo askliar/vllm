@@ -444,21 +444,12 @@ def test_modelwide_replayssm_none_commits_trackers_without_materialization(
         query_len[0] = scheduled
         accepted[0] = num_accepted
         is_prefilling[0] = prefilling
-        ctx.preprocess(
-            idx_mapping=None,
-            query_metadata=query_len,
-            query_metadata_is_cumulative=False,
-            num_computed_tokens=num_computed,
-            is_prefilling=is_prefilling,
-            src_cols=live_cols,
-            dst_cols=live_cols,
-            mamba_block_size=1024,
-            num_reqs=1,
-        )
         ctx.postprocess(
             idx_mapping=None,
             query_metadata=query_len,
             query_metadata_is_cumulative=False,
+            num_computed_tokens=num_computed,
+            num_computed_is_post_step=False,
             num_accepted_tokens=accepted,
             is_prefilling=is_prefilling,
             live_cols=live_cols,
@@ -524,6 +515,8 @@ def test_modelwide_replayssm_materializes_each_cache_group(monkeypatch):
         idx_mapping=torch.tensor([0], dtype=torch.int32, device="cuda"),
         query_metadata=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
         query_metadata_is_cumulative=True,
+        num_computed_tokens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        num_computed_is_post_step=True,
         num_accepted_tokens=torch.tensor([2, 1], dtype=torch.int32, device="cuda"),
         is_prefilling=torch.tensor([False, False], device="cuda"),
         live_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
@@ -563,6 +556,54 @@ def test_modelwide_replayssm_materializes_each_cache_group(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_modelwide_replayssm_materialization_uses_independent_group_mappings(
+    monkeypatch,
+):
+    groups, config, forward_context, block_tables = _modelwide_replayssm_fixture()
+    groups[0][0]._replayssm_prev_num_accepted[1] = 4
+    groups[1][0]._replayssm_prev_num_accepted[5] = 9
+    # The request has a source in group zero but a null source in group one.
+    block_tables[1][0, 0] = NULL_BLOCK_ID
+    materializer = Mock()
+    monkeypatch.setattr(
+        ssu_dispatch, "_load_replayssm_materialize", lambda: materializer
+    )
+
+    ctx = ReplaySSMModelContext.create(
+        config,
+        [0, 1],
+        forward_context,
+        block_tables,
+        max_num_reqs=2,
+    )
+    assert ctx is not None
+    ctx.postprocess(
+        idx_mapping=None,
+        query_metadata=torch.tensor([4, 0], dtype=torch.int32, device="cuda"),
+        query_metadata_is_cumulative=False,
+        num_computed_tokens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        num_computed_is_post_step=False,
+        num_accepted_tokens=torch.tensor([2, 1], dtype=torch.int32, device="cuda"),
+        is_prefilling=torch.zeros(2, dtype=torch.bool, device="cuda"),
+        live_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
+        materialize_dst_cols=torch.tensor([1, -1], dtype=torch.int32, device="cuda"),
+        materialize_token_counts=torch.tensor([2, 0], dtype=torch.int32, device="cuda"),
+        num_reqs=1,
+    )
+    ctx.materialize()
+    torch.accelerator.synchronize()
+
+    assert materializer.call_count == 2
+    assert ctx.groups[0].active_request_indices.tolist() == [0, -1]
+    assert ctx.groups[0].plan_flush_count.tolist() == [6, -1]
+    assert ctx.groups[1].active_request_indices.tolist() == [-1, -1]
+    assert ctx.groups[1].plan_flush_count.tolist() == [-1, -1]
+    assert ctx.groups[1].src_slots[:, 0].tolist() == [NULL_BLOCK_ID] * 2
+    assert ctx.groups[1].dst_slots[:, 0].tolist() == [NULL_BLOCK_ID] * 2
+    assert groups[1][0]._replayssm_prev_num_accepted[5].item() == 9
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_modelwide_replayssm_compacts_sparse_materialization_requests(monkeypatch):
     _, config, forward_context, block_tables = _modelwide_replayssm_fixture()
     block_tables[0][1] = torch.tensor([3, 2, 1], device="cuda")
@@ -584,6 +625,8 @@ def test_modelwide_replayssm_compacts_sparse_materialization_requests(monkeypatc
         idx_mapping=None,
         query_metadata=torch.tensor([1, 4], dtype=torch.int32, device="cuda"),
         query_metadata_is_cumulative=False,
+        num_computed_tokens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        num_computed_is_post_step=False,
         num_accepted_tokens=torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
         is_prefilling=torch.tensor([False, False], device="cuda"),
         live_cols=torch.zeros(2, dtype=torch.int32, device="cuda"),
@@ -621,6 +664,8 @@ def test_modelwide_replayssm_postprocess_commits_checkpoint_boundary(monkeypatch
         idx_mapping=torch.tensor([1], dtype=torch.int32, device="cuda"),
         query_metadata=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
         query_metadata_is_cumulative=True,
+        num_computed_tokens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        num_computed_is_post_step=True,
         num_accepted_tokens=torch.tensor([1, 3], dtype=torch.int32, device="cuda"),
         is_prefilling=torch.tensor([False, False], device="cuda"),
         live_cols=torch.tensor([-1, 0], dtype=torch.int32, device="cuda"),
@@ -667,6 +712,8 @@ def test_modelwide_replayssm_postprocess_skips_filtered_pp_row():
         idx_mapping=torch.tensor([-1], dtype=torch.int32, device="cuda"),
         query_metadata=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
         query_metadata_is_cumulative=True,
+        num_computed_tokens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        num_computed_is_post_step=True,
         num_accepted_tokens=torch.ones(2, dtype=torch.int32, device="cuda"),
         is_prefilling=torch.zeros(2, dtype=torch.bool, device="cuda"),
         live_cols=torch.zeros(2, dtype=torch.int32, device="cuda"),
@@ -683,7 +730,7 @@ def test_modelwide_replayssm_postprocess_skips_filtered_pp_row():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-def test_modelwide_replayssm_preprocess_resets_prefill_slots(monkeypatch):
+def test_modelwide_replayssm_postprocess_resets_prefill_slots(monkeypatch):
     groups, config, forward_context, block_tables = _modelwide_replayssm_fixture()
     for mixers, source_slots in zip(groups, ((1, 2), (4, 5))):
         for source_slot in source_slots:
@@ -700,16 +747,17 @@ def test_modelwide_replayssm_preprocess_resets_prefill_slots(monkeypatch):
         max_num_reqs=2,
     )
     assert ctx is not None
-    no_change = torch.full((2,), -1, dtype=torch.int32, device="cuda")
-    ctx.preprocess(
+    ctx.postprocess(
         idx_mapping=None,
         query_metadata=torch.tensor([8, 0], dtype=torch.int32, device="cuda"),
         query_metadata_is_cumulative=False,
         num_computed_tokens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        num_computed_is_post_step=False,
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32, device="cuda"),
         is_prefilling=torch.tensor([True, False], device="cuda"),
-        src_cols=no_change,
-        dst_cols=no_change,
-        mamba_block_size=4,
+        live_cols=torch.tensor([1, -1], dtype=torch.int32, device="cuda"),
+        materialize_dst_cols=torch.full((2,), -1, dtype=torch.int32, device="cuda"),
+        materialize_token_counts=torch.zeros(2, dtype=torch.int32, device="cuda"),
         num_reqs=1,
     )
     torch.accelerator.synchronize()
@@ -744,6 +792,8 @@ def test_modelwide_replayssm_prefill_commit_publishes_exact_copy(monkeypatch):
         idx_mapping=None,
         query_metadata=torch.tensor([4, 0], dtype=torch.int32, device="cuda"),
         query_metadata_is_cumulative=False,
+        num_computed_tokens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        num_computed_is_post_step=False,
         num_accepted_tokens=torch.ones(2, dtype=torch.int32, device="cuda"),
         is_prefilling=torch.tensor([True, False], device="cuda"),
         live_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
@@ -764,11 +814,16 @@ def test_modelwide_replayssm_prefill_commit_publishes_exact_copy(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-def test_modelwide_replayssm_copies_reassigned_live_slot_once(monkeypatch):
+def test_modelwide_replayssm_resets_only_group_specific_fresh_slot(monkeypatch):
     groups, config, forward_context, block_tables = _modelwide_replayssm_fixture()
-    for mixers, source_slot in zip(groups, (1, 4)):
-        mixers[0]._replayssm_ring_start[source_slot] = 2
-        mixers[0]._replayssm_prev_num_accepted[source_slot] = 4
+    # Group zero aliases the two logical columns and therefore already has a
+    # valid source. Group one has no physical source for the same logical move.
+    block_tables[0][0, 1] = block_tables[0][0, 0]
+    block_tables[1][0, 0] = NULL_BLOCK_ID
+    groups[0][0]._replayssm_ring_start[1] = 2
+    groups[0][0]._replayssm_prev_num_accepted[1] = 4
+    groups[1][0]._replayssm_ring_start[5] = 7
+    groups[1][0]._replayssm_prev_num_accepted[5] = 9
     kernel = Mock()
     monkeypatch.setattr(ssu_dispatch, "_load_replayssm_materialize", lambda: kernel)
 
@@ -780,32 +835,19 @@ def test_modelwide_replayssm_copies_reassigned_live_slot_once(monkeypatch):
         max_num_reqs=2,
     )
     assert ctx is not None
-    ctx.preprocess(
+    ctx.reset_new_slots(
         idx_mapping=torch.tensor([0], dtype=torch.int32, device="cuda"),
-        query_metadata=torch.zeros(2, dtype=torch.int32, device="cuda"),
-        query_metadata_is_cumulative=False,
-        num_computed_tokens=torch.zeros(2, dtype=torch.int32, device="cuda"),
-        is_prefilling=torch.zeros(2, dtype=torch.bool, device="cuda"),
         src_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),
         dst_cols=torch.tensor([1, 0], dtype=torch.int32, device="cuda"),
-        mamba_block_size=4,
         num_reqs=1,
     )
-    ctx.materialize()
     torch.accelerator.synchronize()
 
-    assert kernel.call_count == 2
-    for group_ctx, source_slot, destination_slot in zip(ctx.groups, (1, 4), (2, 5)):
-        assert group_ctx.plan_ring_start.tolist() == [2, 0]
-        assert group_ctx.plan_flush_count.tolist() == [4, -1]
-        assert group_ctx.active_request_indices.tolist() == [0, -1]
-        assert group_ctx.src_slots[:, 0].tolist() == [source_slot] * 2
-        assert group_ctx.dst_slots[:, 0].tolist() == [destination_slot] * 2
-    for mixers, source_slot, destination_slot in zip(groups, (1, 4), (2, 5)):
-        assert mixers[0]._replayssm_ring_start[source_slot].item() == 2
-        assert mixers[0]._replayssm_prev_num_accepted[source_slot].item() == 4
-        assert mixers[0]._replayssm_ring_start[destination_slot].item() == 0
-        assert mixers[0]._replayssm_prev_num_accepted[destination_slot].item() == 0
+    assert kernel.call_count == 0
+    assert groups[0][0]._replayssm_ring_start[1].item() == 2
+    assert groups[0][0]._replayssm_prev_num_accepted[1].item() == 4
+    assert groups[1][0]._replayssm_ring_start[5].item() == 0
+    assert groups[1][0]._replayssm_prev_num_accepted[5].item() == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
@@ -829,6 +871,8 @@ def test_modelwide_replayssm_postprocess_materializes_in_place(monkeypatch):
         idx_mapping=None,
         query_metadata=torch.tensor([4, 0], dtype=torch.int32, device="cuda"),
         query_metadata_is_cumulative=False,
+        num_computed_tokens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        num_computed_is_post_step=False,
         num_accepted_tokens=torch.tensor([2, 1], dtype=torch.int32, device="cuda"),
         is_prefilling=torch.zeros(2, dtype=torch.bool, device="cuda"),
         live_cols=torch.tensor([0, -1], dtype=torch.int32, device="cuda"),

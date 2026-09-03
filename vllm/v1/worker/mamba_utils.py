@@ -539,18 +539,19 @@ def preprocess_mamba_align_fused_kernel(
     num_reqs,
     BLOCK_SIZE: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
+    PRESERVE_ACCEPTED: tl.constexpr = False,
 ):
     """Fused align preprocess: emit the pre-copy src column/offset AND advance
-    state_idx (with accepted-token reset) in a single launch (V2 align).
+    state_idx in a single launch (V2 align).
 
     Per batch_idx (0..num_reqs-1), resolving req slot via idx_mapping:
       1. Read pre-advance state_idx and num_accepted (last step's values).
       2. Store the pre-copy src columns for ``precopy_mamba_align_fused_kernel``:
          - src_col = state_idx (the previous running block column)
          - src_off = max(num_accepted - 1, 0) (the accepted-token bias)
-      3. Advance state_idx to the new running block, and reset num_accepted to 1
-         when a block boundary is crossed (so the migrated state, now at the
-         start of the new block, is read with the neutral bias).
+      3. Advance state_idx to the new running block. Baseline Mamba resets
+         num_accepted after shifting its state; exact ReplaySSM block copies
+         preserve it so the copied live slot keeps the same accepted position.
     """
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < num_reqs
@@ -569,8 +570,9 @@ def preprocess_mamba_align_fused_kernel(
     computed_after = num_computed + query_end - query_start
     new_state_idx = (computed_after + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1
     tl.store(state_idx_ptr + req_indices, new_state_idx, mask=mask)
-    should_reset = (state_idx >= 0) & (state_idx != new_state_idx)
-    tl.store(num_accepted_tokens_ptr + req_indices, 1, mask=mask & should_reset)
+    if not PRESERVE_ACCEPTED:
+        should_reset = (state_idx >= 0) & (state_idx != new_state_idx)
+        tl.store(num_accepted_tokens_ptr + req_indices, 1, mask=mask & should_reset)
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
@@ -825,6 +827,7 @@ class MambaSpecDecodeGPUContext:
     state_conv_widths: torch.Tensor  # int32: conv width (0 for temporal states)
     state_group_indices: torch.Tensor  # int32: maps state_idx to group index
     state_skip_postprocess: torch.Tensor  # int32: materializer owns this state
+    state_skip_precopy: torch.Tensor  # int32: scheduler block copy owns this state
     # DS conv row metadata. Zero keeps the single-region copy path.
     state_dim_row_count: torch.Tensor  # int32: per-block dim row count
     state_dim_row_stride: torch.Tensor  # int64: bytes between rows
@@ -872,6 +875,9 @@ class MambaSpecDecodeGPUContext:
     # Persistent all-layer ReplaySSM descriptors, populated with the cache
     # addresses on first real forward. None for non-FlashInfer configurations.
     replayssm: ReplaySSMModelContext | None = None
+    # V1 can prove on the host that no accepted-token outcome reaches a
+    # boundary. V2 leaves this true because its sampled count is GPU-resident.
+    replayssm_materialize_possible: bool = True
 
     @classmethod
     def create(
@@ -930,6 +936,9 @@ class MambaSpecDecodeGPUContext:
                 total_states, dtype=torch.int32, device=device
             ),
             state_skip_postprocess=torch.zeros(
+                total_states, dtype=torch.int32, device=device
+            ),
+            state_skip_precopy=torch.zeros(
                 total_states, dtype=torch.int32, device=device
             ),
             state_dim_row_count=torch.zeros(
@@ -1034,6 +1043,8 @@ class MambaSpecDecodeGPUContext:
         block_tables: list[torch.Tensor],
     ) -> None:
         idx = 0
+        has_replayssm_layer = False
+        has_baseline_layer = False
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             kv_cache_group = kv_cache_config.kv_cache_groups[mamba_group_id]
             layer_names = kv_cache_group.layer_names
@@ -1046,6 +1057,8 @@ class MambaSpecDecodeGPUContext:
                     getattr(attention, "use_replayssm", False)
                     and attention.mamba_config.backend == MambaBackendEnum.FLASHINFER
                 )
+                has_replayssm_layer |= bool(is_flashinfer_replayssm)
+                has_baseline_layer |= not is_flashinfer_replayssm
                 if len(kv_caches) < len(state_copy_funcs):
                     raise ValueError(
                         f"Expected at least {len(state_copy_funcs)} Mamba state "
@@ -1053,6 +1066,7 @@ class MambaSpecDecodeGPUContext:
                     )
                 for state_type_idx, copy_func in enumerate(state_copy_funcs):
                     state = kv_caches[state_type_idx]
+                    self.state_skip_precopy[idx] = is_flashinfer_replayssm
                     # Base address
                     self.state_base_addrs[idx] = _reinterpret_u64_as_i64(
                         state.data_ptr()
@@ -1133,6 +1147,10 @@ class MambaSpecDecodeGPUContext:
                     idx += 1
 
         assert idx == self.num_states
+        if has_replayssm_layer and has_baseline_layer:
+            raise ValueError(
+                "mixed FlashInfer ReplaySSM and baseline Mamba layers are unsupported"
+            )
 
         # Cache per-group block-table base addresses and per-request stride.
         # `block_tables[i]` is the persistent 2D int32 block-table tensor for
@@ -1300,7 +1318,7 @@ class MambaSpecDecodeGPUContext:
             self.state_inner_sizes,
             self.state_conv_widths,
             self.state_group_indices,
-            self.state_skip_postprocess,
+            self.state_skip_precopy,
             self.state_dim_row_count,
             self.state_dim_row_stride,
             idx_mapping,
@@ -1583,6 +1601,11 @@ def preprocess_mamba(
         mamba_state_idx[req_id] = curr_state_idx
         if fused is not None:
             fused.state_idx.np[i] = curr_state_idx
+            if fused.ctx.replayssm is not None:
+                # A negative source means that this request has no live owner.
+                # Preserve same-column sources so ordinary decode steps are
+                # not mistaken for fresh slot ownership.
+                fused.src_col.np[i] = prev_state_idx
 
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
@@ -1602,12 +1625,20 @@ def preprocess_mamba(
                     req_state,
                     forward_context,
                 )
-            input_batch.num_accepted_tokens_cpu[i] = 1
+            if fused is None or fused.ctx.replayssm is None:
+                input_batch.num_accepted_tokens_cpu[i] = 1
 
     if fused is not None:
         fused.state_idx.copy_to_gpu(num_reqs)
         fused.src_col.copy_to_gpu(num_reqs)
         fused.token_bias.copy_to_gpu(num_reqs)
+        if fused.ctx.replayssm is not None:
+            fused.ctx.replayssm.reset_new_slots(
+                idx_mapping=None,
+                src_cols=fused.src_col.gpu,
+                dst_cols=fused.state_idx.gpu,
+                num_reqs=num_reqs,
+            )
         fused.ctx.run_fused_precopy(
             num_reqs=num_reqs,
             state_idx_gpu=fused.state_idx.gpu,
@@ -1723,6 +1754,8 @@ def postprocess_mamba_align_gpu(
             idx_mapping=None,
             query_metadata=ctx.num_scheduled_tokens_buf.gpu,
             query_metadata_is_cumulative=False,
+            num_computed_tokens=ctx.num_computed_tokens_buf.gpu,
+            num_computed_is_post_step=False,
             num_accepted_tokens=accepted_tokens_for_postprocess,
             is_prefilling=ctx.is_prefilling_buf.gpu,
             live_cols=ctx.mamba_state_idx_buf.gpu,
@@ -1730,7 +1763,7 @@ def postprocess_mamba_align_gpu(
             materialize_token_counts=ctx.materialize_token_counts,
             num_reqs=num_reqs,
         )
-        if ctx.replayssm.materialize_prefixes:
+        if ctx.replayssm.materialize_prefixes and ctx.replayssm_materialize_possible:
             ctx.replayssm.materialize()
 
     # ``num_accepted_tokens_out`` is pre-initialized from
@@ -1769,7 +1802,6 @@ def stage_postprocess_inputs_to_gpu(
     assert ctx.num_computed_tokens_buf is not None
     assert ctx.num_draft_tokens_buf is not None
     assert ctx.is_prefilling_buf is not None
-    assert ctx.precopy_src_col_buf is not None
 
     scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
     num_scheduled = scheduler_output.num_scheduled_tokens
@@ -1778,6 +1810,9 @@ def stage_postprocess_inputs_to_gpu(
     computed_np = ctx.num_computed_tokens_buf.np
     draft_np = ctx.num_draft_tokens_buf.np
     prefill_np = ctx.is_prefilling_buf.np
+    materialize_possible = not (
+        ctx.replayssm is not None and ctx.replayssm.materialize_prefixes
+    )
     for i in range(num_reqs):
         req_id = req_ids[i]
         state_idx = fixed_live_col
@@ -1797,30 +1832,16 @@ def stage_postprocess_inputs_to_gpu(
         prefill_np[i] = (
             requests[req_id].num_computed_tokens < requests[req_id].num_prompt_tokens
         )
+        if not materialize_possible:
+            running_state_tokens = computed + scheduled - num_draft
+            max_new_computed = running_state_tokens + num_draft
+            aligned_max_new_computed = (
+                max_new_computed // ctx.block_size
+            ) * ctx.block_size
+            materialize_possible = aligned_max_new_computed >= running_state_tokens
     ctx.mamba_state_idx_buf.copy_to_gpu(num_reqs)
     ctx.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_computed_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_draft_tokens_buf.copy_to_gpu(num_reqs)
     ctx.is_prefilling_buf.copy_to_gpu(num_reqs)
-    if ctx.replayssm is not None:
-        # Prefix modes use the source/destination columns prepared by
-        # preprocess_mamba. Mode none has no migration, so passing the live
-        # column as both endpoints makes that part of the kernel a no-op.
-        src_cols = (
-            ctx.precopy_src_col_buf.gpu
-            if ctx.replayssm.materialize_prefixes
-            else ctx.mamba_state_idx_buf.gpu
-        )
-        ctx.replayssm.preprocess(
-            idx_mapping=None,
-            query_metadata=ctx.num_scheduled_tokens_buf.gpu,
-            query_metadata_is_cumulative=False,
-            num_computed_tokens=ctx.num_computed_tokens_buf.gpu,
-            is_prefilling=ctx.is_prefilling_buf.gpu,
-            src_cols=src_cols,
-            dst_cols=ctx.mamba_state_idx_buf.gpu,
-            mamba_block_size=ctx.block_size,
-            num_reqs=num_reqs,
-        )
-        if ctx.replayssm.materialize_prefixes:
-            ctx.replayssm.materialize()
+    ctx.replayssm_materialize_possible = materialize_possible

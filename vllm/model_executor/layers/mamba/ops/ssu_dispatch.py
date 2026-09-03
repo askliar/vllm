@@ -28,33 +28,20 @@ logger = init_logger(__name__)
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
-def _preprocess_replayssm_kernel(
+def _reset_new_replayssm_slots_kernel(
     idx_mapping,
-    query_metadata,
-    num_computed_tokens,
-    is_prefilling,
     src_cols,
     dst_cols,
     block_table,
     tracker_start,
     tracker_committed,
-    src_slots,
-    dst_slots,
-    plan_ring_start,
-    plan_flush_count,
-    active_request_indices,
     block_table_stride_req: tl.int64,
-    slot_table_stride_layer: tl.int64,
+    tracker_capacity,
     num_reqs,
-    MAMBA_BLOCK_SIZE: tl.constexpr,
-    NUM_LAYERS: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
-    QUERY_METADATA_IS_CUMULATIVE: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr,
-    MATERIALIZE_PREFIXES: tl.constexpr,
-    MAX_NUM_REQS: tl.constexpr,
 ) -> None:
-    """Reset prefill state and prepare an optional writable-slot move."""
+    """Reset cursors only when this cache group has no physical source."""
     batch_idx = tl.program_id(0)
     active = batch_idx < num_reqs
     req_idx = batch_idx
@@ -62,87 +49,44 @@ def _preprocess_replayssm_kernel(
         req_idx = tl.load(idx_mapping + batch_idx, mask=active, other=-1)
     valid_req = active & (req_idx >= 0)
 
-    src_col = tl.load(src_cols + req_idx, mask=valid_req, other=-1)
     dst_col = tl.load(dst_cols + req_idx, mask=valid_req, other=-1)
-    changed = valid_req & (src_col >= 0) & (src_col != dst_col)
-    src_slot = tl.load(
-        block_table + batch_idx * block_table_stride_req + src_col,
-        mask=changed,
-        other=PAD_SLOT_ID,
-    )
+    valid_dst_col = valid_req & (dst_col >= 0)
     dst_slot = tl.load(
         block_table + batch_idx * block_table_stride_req + dst_col,
-        mask=changed,
+        mask=valid_dst_col,
         other=PAD_SLOT_ID,
     )
-    for layer_idx in tl.static_range(0, NUM_LAYERS):
-        slot_offset = layer_idx * slot_table_stride_layer + batch_idx
-        tl.store(src_slots + slot_offset, src_slot)
-        tl.store(dst_slots + slot_offset, dst_slot)
+    valid_dst = (
+        valid_dst_col
+        & (dst_slot != PAD_SLOT_ID)
+        & (dst_slot >= 0)
+        & (dst_slot < tracker_capacity)
+    )
 
-    # Clear the fixed-capacity plan row before deciding whether this request
-    # belongs in the compact materialization list.
-    tl.store(plan_ring_start + batch_idx, 0)
-    tl.store(plan_flush_count + batch_idx, -1)
-    if changed:
-        # BlockManager guarantees that distinct live columns map to allocated,
-        # distinct physical slots. Snapshot the old owner before clearing the
-        # destination tracker.
-        tl.store(plan_ring_start + batch_idx, tl.load(tracker_start + src_slot))
-        tl.store(
-            plan_flush_count + batch_idx,
-            tl.load(tracker_committed + src_slot),
-        )
-        tl.store(tracker_start + dst_slot, 0)
-        tl.store(tracker_committed + dst_slot, 0)
+    src_col = tl.load(src_cols + req_idx, mask=valid_req, other=-1)
+    valid_src_col = valid_req & (src_col >= 0)
+    src_slot = tl.load(
+        block_table + batch_idx * block_table_stride_req + src_col,
+        mask=valid_src_col,
+        other=PAD_SLOT_ID,
+    )
+    valid_src = (
+        valid_src_col
+        & (src_slot != PAD_SLOT_ID)
+        & (src_slot >= 0)
+        & (src_slot < tracker_capacity)
+    )
 
-    prefilling = tl.load(is_prefilling + batch_idx, mask=active, other=0)
-    if valid_req & prefilling:
-        if QUERY_METADATA_IS_CUMULATIVE:
-            query_len = tl.load(query_metadata + batch_idx + 1) - tl.load(
-                query_metadata + batch_idx
-            )
-        else:
-            query_len = tl.load(query_metadata + batch_idx)
-        computed = tl.load(num_computed_tokens + req_idx)
-        first_col = tl.maximum(computed // MAMBA_BLOCK_SIZE, 0)
-        last_col = tl.maximum(
-            (computed + query_len + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1,
-            0,
-        )
-        for col in tl.range(first_col, last_col + 1):
-            slot = tl.load(block_table + batch_idx * block_table_stride_req + col)
-            tl.store(tracker_start + slot, 0)
-            tl.store(tracker_committed + slot, 0)
-
-    if MATERIALIZE_PREFIXES & (batch_idx == 0):
-        active_count = 0
-        for candidate_idx in tl.range(0, num_reqs):
-            candidate_req_idx = candidate_idx
-            if HAS_IDX_MAPPING:
-                candidate_req_idx = tl.load(idx_mapping + candidate_idx)
-            valid_candidate = candidate_req_idx >= 0
-            src_col = tl.load(
-                src_cols + candidate_req_idx,
-                mask=valid_candidate,
-                other=-1,
-            )
-            dst_col = tl.load(
-                dst_cols + candidate_req_idx,
-                mask=valid_candidate,
-                other=-1,
-            )
-            if valid_candidate & (src_col >= 0) & (src_col != dst_col):
-                tl.store(active_request_indices + active_count, candidate_idx)
-                active_count += 1
-        if active_count < MAX_NUM_REQS:
-            tl.store(active_request_indices + active_count, -1)
+    fresh = valid_dst & ~valid_src
+    tl.store(tracker_start + dst_slot, 0, mask=fresh)
+    tl.store(tracker_committed + dst_slot, 0, mask=fresh)
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
 def _postprocess_replayssm_kernel(
     idx_mapping,
     query_metadata,
+    num_computed_tokens,
     num_accepted_tokens,
     is_prefilling,
     live_cols,
@@ -158,11 +102,15 @@ def _postprocess_replayssm_kernel(
     active_request_indices,
     block_table_stride_req: tl.int64,
     slot_table_stride_layer: tl.int64,
+    tracker_capacity,
     num_reqs,
+    MAMBA_BLOCK_SIZE: tl.constexpr,
     LOGICAL_WINDOW: tl.constexpr,
     RING_BUFFER_LEN: tl.constexpr,
     NUM_LAYERS: tl.constexpr,
+    PAD_SLOT_ID: tl.constexpr,
     QUERY_METADATA_IS_CUMULATIVE: tl.constexpr,
+    NUM_COMPUTED_IS_POST_STEP: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr,
     MATERIALIZE_PREFIXES: tl.constexpr,
     MAX_NUM_REQS: tl.constexpr,
@@ -170,22 +118,53 @@ def _postprocess_replayssm_kernel(
     """Commit a completed step and prepare an optional prefix snapshot."""
     batch_idx = tl.program_id(0)
 
-    # FlashInfer requires active rows to be a compact prefix. The generic
-    # planner's destination is the sole materialization work sentinel.
+    # FlashInfer requires active rows to be a compact prefix. Resolve physical
+    # validity per group so divergent group mappings remain independent.
     if MATERIALIZE_PREFIXES & (batch_idx == 0):
         active_count = 0
         for candidate_idx in tl.range(0, num_reqs):
             candidate_req_idx = candidate_idx
             if HAS_IDX_MAPPING:
                 candidate_req_idx = tl.load(idx_mapping + candidate_idx)
-            dst_col = tl.load(materialize_dst_cols + candidate_idx)
-            if (candidate_req_idx >= 0) & (dst_col >= 0):
+            valid_candidate = candidate_req_idx >= 0
+            live_col = tl.load(
+                live_cols + candidate_req_idx,
+                mask=valid_candidate,
+                other=-1,
+            )
+            dst_col = tl.load(
+                materialize_dst_cols + candidate_idx,
+                mask=valid_candidate,
+                other=-1,
+            )
+            wants_materialize = valid_candidate & (live_col >= 0) & (dst_col >= 0)
+            live_slot = tl.load(
+                block_table + candidate_idx * block_table_stride_req + live_col,
+                mask=wants_materialize,
+                other=PAD_SLOT_ID,
+            )
+            dst_slot = tl.load(
+                block_table + candidate_idx * block_table_stride_req + dst_col,
+                mask=wants_materialize,
+                other=PAD_SLOT_ID,
+            )
+            valid_materialize = (
+                wants_materialize
+                & (live_slot != PAD_SLOT_ID)
+                & (dst_slot != PAD_SLOT_ID)
+                & (live_slot >= 0)
+                & (dst_slot >= 0)
+                & (live_slot < tracker_capacity)
+                & (dst_slot < tracker_capacity)
+            )
+            if valid_materialize:
                 tl.store(active_request_indices + active_count, candidate_idx)
                 active_count += 1
         if active_count < MAX_NUM_REQS:
             tl.store(active_request_indices + active_count, -1)
 
     # Clear the fixed-capacity plan row before any per-request early exit.
+    tl.store(plan_ring_start + batch_idx, 0)
     tl.store(plan_flush_count + batch_idx, -1)
     if batch_idx >= num_reqs:
         return
@@ -196,25 +175,78 @@ def _postprocess_replayssm_kernel(
         if req_idx < 0:
             return
 
-    # BlockManager supplies allocated live/destination columns. The generic
-    # Mamba planner always materializes from this same live column.
     live_col = tl.load(live_cols + req_idx)
-    live_slot = tl.load(block_table + batch_idx * block_table_stride_req + live_col)
+    valid_live_col = live_col >= 0
+    live_slot = tl.load(
+        block_table + batch_idx * block_table_stride_req + live_col,
+        mask=valid_live_col,
+        other=PAD_SLOT_ID,
+    )
+    valid_live = (
+        valid_live_col
+        & (live_slot != PAD_SLOT_ID)
+        & (live_slot >= 0)
+        & (live_slot < tracker_capacity)
+    )
     dst_col = tl.load(materialize_dst_cols + batch_idx)
-    materialize = dst_col >= 0
+    wants_materialize = valid_live & (dst_col >= 0)
+    dst_slot = tl.load(
+        block_table + batch_idx * block_table_stride_req + dst_col,
+        mask=wants_materialize,
+        other=PAD_SLOT_ID,
+    )
+    materialize = (
+        wants_materialize
+        & (dst_slot != PAD_SLOT_ID)
+        & (dst_slot >= 0)
+        & (dst_slot < tracker_capacity)
+    )
+    for layer_idx in tl.static_range(0, NUM_LAYERS):
+        slot_offset = layer_idx * slot_table_stride_layer + batch_idx
+        tl.store(
+            src_slots + slot_offset,
+            tl.where(materialize, live_slot, PAD_SLOT_ID),
+        )
+        tl.store(
+            dst_slots + slot_offset,
+            tl.where(materialize, dst_slot, PAD_SLOT_ID),
+        )
+
     prefilling = tl.load(is_prefilling + batch_idx)
+    if QUERY_METADATA_IS_CUMULATIVE:
+        query_len = tl.load(query_metadata + batch_idx + 1) - tl.load(
+            query_metadata + batch_idx
+        )
+    else:
+        query_len = tl.load(query_metadata + batch_idx)
+
     if prefilling:
+        computed = tl.load(num_computed_tokens + req_idx)
+        computed_before = tl.where(
+            NUM_COMPUTED_IS_POST_STEP, computed - query_len, computed
+        )
+        computed_after = computed_before + query_len
+        first_col = tl.maximum(computed_before // MAMBA_BLOCK_SIZE, 0)
+        last_col = tl.maximum(
+            (computed_after + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1,
+            0,
+        )
+        for col in tl.range(first_col, last_col + 1):
+            prefill_slot = tl.load(
+                block_table + batch_idx * block_table_stride_req + col
+            )
+            valid_prefill_slot = (
+                (prefill_slot != PAD_SLOT_ID)
+                & (prefill_slot >= 0)
+                & (prefill_slot < tracker_capacity)
+            )
+            tl.store(tracker_start + prefill_slot, 0, mask=valid_prefill_slot)
+            tl.store(tracker_committed + prefill_slot, 0, mask=valid_prefill_slot)
         if materialize:
             # Prefill produced canonical state, so publish an exact copy.
             tl.store(plan_flush_count + batch_idx, 0)
-    else:
-        if QUERY_METADATA_IS_CUMULATIVE:
-            query_len = tl.load(query_metadata + batch_idx + 1) - tl.load(
-                query_metadata + batch_idx
-            )
-        else:
-            query_len = tl.load(query_metadata + batch_idx)
-        accepted = tl.load(num_accepted_tokens + req_idx)
+    elif valid_live:
+        accepted = tl.maximum(tl.load(num_accepted_tokens + req_idx), 1)
         old_start = tl.load(tracker_start + live_slot)
         old_committed = tl.load(tracker_committed + live_slot)
         checkpointed = old_committed + query_len > LOGICAL_WINDOW
@@ -235,17 +267,9 @@ def _postprocess_replayssm_kernel(
                 boundary_count + tl.where(checkpointed, 0, old_committed),
             )
 
-    if not materialize:
-        return
-    dst_slot = tl.load(block_table + batch_idx * block_table_stride_req + dst_col)
-    for layer_idx in tl.static_range(0, NUM_LAYERS):
-        slot_offset = layer_idx * slot_table_stride_layer + batch_idx
-        tl.store(src_slots + slot_offset, live_slot)
-        tl.store(dst_slots + slot_offset, dst_slot)
-
     # The published destination is canonical and therefore has no live replay.
-    tl.store(tracker_start + dst_slot, 0)
-    tl.store(tracker_committed + dst_slot, 0)
+    tl.store(tracker_start + dst_slot, 0, mask=materialize)
+    tl.store(tracker_committed + dst_slot, 0, mask=materialize)
 
 
 def _replayssm_specialization_key(mixer: Any) -> tuple[Any, ...]:
@@ -282,6 +306,7 @@ class _ReplaySSMGroupContext:
     plan_flush_count: torch.Tensor
     active_request_indices: torch.Tensor
     max_num_reqs: int
+    mamba_block_size: int
     logical_window: int
     ring_buffer_len: int
     materialize_prefixes: bool
@@ -292,6 +317,7 @@ class _ReplaySSMGroupContext:
         mixers: list[Any],
         block_table: torch.Tensor,
         cache_mode: str,
+        mamba_block_size: int,
         max_num_reqs: int,
     ) -> "_ReplaySSMGroupContext":
         if (
@@ -364,52 +390,35 @@ class _ReplaySSMGroupContext:
                 (max_num_reqs,), -1, dtype=torch.int32, device=device
             ),
             max_num_reqs=max_num_reqs,
+            mamba_block_size=mamba_block_size,
             logical_window=int(first.replayssm_buffer_len),
             ring_buffer_len=first_x.size(2),
             materialize_prefixes=cache_mode in ("align", "all"),
         )
 
-    def preprocess(
+    def reset_new_slots(
         self,
         *,
         idx_mapping: torch.Tensor | None,
-        query_metadata: torch.Tensor,
-        query_metadata_is_cumulative: bool,
-        num_computed_tokens: torch.Tensor,
-        is_prefilling: torch.Tensor,
         src_cols: torch.Tensor,
         dst_cols: torch.Tensor,
-        mamba_block_size: int,
         num_reqs: int,
     ) -> None:
-        """Reset prefill state and prepare an optional writable-slot move."""
+        """Reset cursors for fresh physical slots in this cache group."""
         if num_reqs == 0:
             return
-        _preprocess_replayssm_kernel[(self.max_num_reqs,)](
+        _reset_new_replayssm_slots_kernel[(self.max_num_reqs,)](
             idx_mapping,
-            query_metadata,
-            num_computed_tokens,
-            is_prefilling,
             src_cols,
             dst_cols,
             self.block_table,
             self.ring_start,
             self.num_committed,
-            self.src_slots,
-            self.dst_slots,
-            self.plan_ring_start,
-            self.plan_flush_count,
-            self.active_request_indices,
             self.block_table.stride(0),
-            self.src_slots.stride(0),
+            self.num_committed.numel(),
             num_reqs,
-            MAMBA_BLOCK_SIZE=mamba_block_size,
-            NUM_LAYERS=len(self.mixers),
             PAD_SLOT_ID=NULL_BLOCK_ID,
-            QUERY_METADATA_IS_CUMULATIVE=query_metadata_is_cumulative,
             HAS_IDX_MAPPING=idx_mapping is not None,
-            MATERIALIZE_PREFIXES=self.materialize_prefixes,
-            MAX_NUM_REQS=self.max_num_reqs,
         )
 
     def postprocess(
@@ -418,6 +427,8 @@ class _ReplaySSMGroupContext:
         idx_mapping: torch.Tensor | None,
         query_metadata: torch.Tensor,
         query_metadata_is_cumulative: bool,
+        num_computed_tokens: torch.Tensor,
+        num_computed_is_post_step: bool,
         num_accepted_tokens: torch.Tensor,
         is_prefilling: torch.Tensor,
         live_cols: torch.Tensor,
@@ -431,6 +442,7 @@ class _ReplaySSMGroupContext:
         _postprocess_replayssm_kernel[(self.max_num_reqs,)](
             idx_mapping,
             query_metadata,
+            num_computed_tokens,
             num_accepted_tokens,
             is_prefilling,
             live_cols,
@@ -446,18 +458,22 @@ class _ReplaySSMGroupContext:
             self.active_request_indices,
             self.block_table.stride(0),
             self.src_slots.stride(0),
+            self.num_committed.numel(),
             num_reqs,
+            MAMBA_BLOCK_SIZE=self.mamba_block_size,
             LOGICAL_WINDOW=self.logical_window,
             RING_BUFFER_LEN=self.ring_buffer_len,
             NUM_LAYERS=len(self.mixers),
+            PAD_SLOT_ID=NULL_BLOCK_ID,
             QUERY_METADATA_IS_CUMULATIVE=query_metadata_is_cumulative,
+            NUM_COMPUTED_IS_POST_STEP=num_computed_is_post_step,
             HAS_IDX_MAPPING=idx_mapping is not None,
             MATERIALIZE_PREFIXES=self.materialize_prefixes,
             MAX_NUM_REQS=self.max_num_reqs,
         )
 
     def materialize(self) -> None:
-        """Execute the plan prepared by ``preprocess`` or ``postprocess``."""
+        """Publish the canonical prefix snapshots prepared by ``postprocess``."""
         if not self.materialize_prefixes:
             raise RuntimeError("ReplaySSM materialization requires align or all mode")
         first = self.mixers[0]
@@ -528,7 +544,14 @@ class ReplaySSMModelContext:
                     f"got {type(spec).__name__}"
                 )
             modes.add(spec.mamba_cache_mode)
-            group_args.append((mixers, block_table_by_gid[gid], spec.mamba_cache_mode))
+            group_args.append(
+                (
+                    mixers,
+                    block_table_by_gid[gid],
+                    spec.mamba_cache_mode,
+                    spec.block_size,
+                )
+            )
         if len(modes) != 1:
             raise ValueError(
                 "model-wide ReplaySSM requires one Mamba cache mode; "
@@ -543,9 +566,9 @@ class ReplaySSMModelContext:
             materialize_prefixes=next(iter(modes)) in ("align", "all"),
         )
 
-    def preprocess(self, **kwargs: Any) -> None:
+    def reset_new_slots(self, **kwargs: Any) -> None:
         for group in self.groups:
-            group.preprocess(**kwargs)
+            group.reset_new_slots(**kwargs)
 
     def postprocess(self, **kwargs: Any) -> None:
         for group in self.groups:

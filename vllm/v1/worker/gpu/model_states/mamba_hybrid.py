@@ -212,13 +212,13 @@ class MambaHybridModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
     ) -> None:
-        """Migrate each request's mamba state across block boundaries before
-        the forward (V1 lifecycle semantics, done on GPU). Runs on real batches
-        only (dummy DP/profiling runs skip preprocess_state), and before
-        ``prepare_attn`` gathers ``num_accepted_tokens``, so the boundary reset
-        is visible to the forward kernels.
+        """Prepare each request's Mamba slot before the forward.
+
+        ReplaySSM live state has already moved through the scheduler block-copy
+        path, so this phase only resets a fresh slot's cursors. Baseline Mamba
+        retains the fused state pre-copy. Dummy DP/profiling runs skip this.
         """
-        if not (self._needs_prefix_state_migration or self._use_flashinfer_replayssm):
+        if not self._needs_prefix_state_migration:
             return
         num_reqs = input_batch.num_reqs
         if num_reqs == 0:
@@ -229,52 +229,32 @@ class MambaHybridModelState(DefaultModelState):
         )
 
         replayssm = ctx.replayssm
-        if replayssm is not None:
-            self._is_prefilling_gpu[:num_reqs].copy_(
-                torch.from_numpy(input_batch.is_prefilling_np[:num_reqs])
-            )
-
-        if self._needs_prefix_state_migration:
-            # This decision kernel fast-exits per request when no block boundary
-            # is crossed. Avoiding the launch would require a CPU sync under
-            # async scheduling.
-            block = 256
-            grid = (triton.cdiv(num_reqs, block),)
-            preprocess_mamba_align_fused_kernel[grid](
-                input_batch.idx_mapping,
-                self._mamba_state_idx_gpu,
-                num_computed_tokens,
-                input_batch.query_start_loc,
-                self.num_accepted_tokens_gpu,
-                self._mamba_src_col_gpu,
-                self._mamba_src_off_gpu,
-                num_reqs,
-                BLOCK_SIZE=block,
-                MAMBA_BLOCK_SIZE=mamba_spec.block_size,
-            )
+        # This decision kernel fast-exits per request when no block boundary is
+        # crossed. Avoiding the launch would require a CPU sync under async
+        # scheduling.
+        block = 256
+        grid = (triton.cdiv(num_reqs, block),)
+        preprocess_mamba_align_fused_kernel[grid](
+            input_batch.idx_mapping,
+            self._mamba_state_idx_gpu,
+            num_computed_tokens,
+            input_batch.query_start_loc,
+            self.num_accepted_tokens_gpu,
+            self._mamba_src_col_gpu,
+            self._mamba_src_off_gpu,
+            num_reqs,
+            BLOCK_SIZE=block,
+            MAMBA_BLOCK_SIZE=mamba_spec.block_size,
+            PRESERVE_ACCEPTED=replayssm is not None,
+        )
 
         if replayssm is not None:
-            if self._needs_prefix_state_migration:
-                src_cols = self._mamba_src_col_gpu
-                dst_cols = self._mamba_state_idx_gpu
-            else:
-                src_cols = dst_cols = self._replayssm_live_cols_gpu
-            replayssm.preprocess(
+            replayssm.reset_new_slots(
                 idx_mapping=input_batch.idx_mapping,
-                query_metadata=input_batch.query_start_loc,
-                query_metadata_is_cumulative=True,
-                num_computed_tokens=num_computed_tokens,
-                is_prefilling=self._is_prefilling_gpu,
-                src_cols=src_cols,
-                dst_cols=dst_cols,
-                mamba_block_size=ctx.block_size,
+                src_cols=self._mamba_src_col_gpu,
+                dst_cols=self._mamba_state_idx_gpu,
                 num_reqs=num_reqs,
             )
-            if replayssm.materialize_prefixes:
-                replayssm.materialize()
-
-        if not self._needs_prefix_state_migration:
-            return
         ctx.run_fused_precopy(
             num_reqs,
             self._mamba_state_idx_gpu,
@@ -529,6 +509,8 @@ class MambaHybridModelState(DefaultModelState):
             idx_mapping=idx_mapping,
             query_metadata=query_start_loc,
             query_metadata_is_cumulative=True,
+            num_computed_tokens=num_computed_tokens,
+            num_computed_is_post_step=True,
             # Prefix migration can reset the live buffer to one for the
             # next step; use its snapshot in that case. Mode none never
             # runs the migration kernel, so the acceptance buffer is exact.

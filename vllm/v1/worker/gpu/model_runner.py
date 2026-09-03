@@ -164,6 +164,7 @@ from vllm.v1.worker.utils import (
     KVBlockZeroer,
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
+    get_replayssm_block_copy_tensors,
     get_uniform_decode_token_count,
 )
 from vllm.v1.worker.workspace import use_workspace_lane
@@ -1111,7 +1112,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
+                [
+                    *self.kv_caches,
+                    *get_replayssm_block_copy_tensors(
+                        self.compilation_config.static_forward_context
+                    ),
+                ],
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )

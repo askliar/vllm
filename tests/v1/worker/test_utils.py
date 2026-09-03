@@ -3,11 +3,17 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.config.mamba import MambaBackendEnum, MambaConfig
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
-from vllm.v1.worker.utils import bind_kv_cache
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.worker.utils import (
+    bind_kv_cache,
+    copy_kv_cache_blocks_inplace,
+    get_replayssm_block_copy_tensors,
+)
 
 
 class _TestReplaySSMMixer(MambaMixer2):
@@ -83,6 +89,67 @@ def test_bind_kv_cache_shares_replayssm_trackers_by_cache_group():
         assert group_tracker.shape == (4,)
         assert group_tracker.dtype == torch.int32
         assert torch.count_nonzero(group_tracker) == 0
+
+
+def test_replayssm_block_copy_includes_rings_and_group_trackers(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.v1.worker.utils.async_tensor_h2d",
+        lambda array, *, device, **_: torch.from_numpy(array).to(device),
+    )
+    mixers = [_TestReplaySSMMixer() for _ in range(3)]
+    layer_names = [f"layers.{i}.mixer" for i in range(3)]
+    ctx = dict(zip(layer_names, mixers))
+    kv_cache = {name: _packed_replayssm_cache(4) for name in layer_names}
+    kv_cache_groups = [
+        SimpleNamespace(layer_names=[layer_names[0], layer_names[2]]),
+        SimpleNamespace(layer_names=[layer_names[1]]),
+    ]
+    replayssm_caches = {
+        name: tuple(
+            torch.zeros((4, *shape), dtype=torch.float32)
+            for shape in mixer.get_replayssm_state_shape()
+        )
+        for name, mixer in ctx.items()
+    }
+    runner_kv_caches: list[torch.Tensor] = []
+    bind_kv_cache(
+        kv_cache,
+        ctx,
+        runner_kv_caches,
+        kv_cache_groups=kv_cache_groups,
+        replayssm_caches=replayssm_caches,
+    )
+
+    src, dst = 1, 2
+    for layer_idx, mixer in enumerate(mixers):
+        for state_idx, state in enumerate(mixer.kv_cache):
+            state[src].fill_(10 * layer_idx + state_idx + 1)
+            state[dst].fill_(-1)
+    for group_idx, mixer in enumerate(mixers[:2]):
+        mixer._replayssm_ring_start[src] = 20 + group_idx
+        mixer._replayssm_prev_num_accepted[src] = 30 + group_idx
+
+    copy_kv_cache_blocks_inplace(
+        [*runner_kv_caches, *get_replayssm_block_copy_tensors(ctx)],
+        4,
+        [KVCacheBlockCopy(src, dst)],
+    )
+
+    for mixer in mixers:
+        for state in mixer.kv_cache:
+            torch.testing.assert_close(state[dst], state[src])
+    assert mixers[0]._replayssm_ring_start[dst].item() == 20
+    assert mixers[0]._replayssm_prev_num_accepted[dst].item() == 30
+    assert mixers[1]._replayssm_ring_start[dst].item() == 21
+    assert mixers[1]._replayssm_prev_num_accepted[dst].item() == 31
+
+
+def test_replayssm_block_copy_validates_exact_cache_roles():
+    mixer = _TestReplaySSMMixer()
+    mixer.kv_cache = tuple(torch.zeros(4, 1) for _ in range(4))
+
+    with pytest.raises(ValueError, match="exactly 5 cache roles"):
+        get_replayssm_block_copy_tensors({"layers.0.mixer": mixer})
 
 
 def test_bind_kv_cache(default_vllm_config):
