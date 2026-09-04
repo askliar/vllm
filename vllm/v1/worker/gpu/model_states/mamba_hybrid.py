@@ -90,9 +90,6 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
-        self._is_prefilling_gpu = torch.zeros(
-            self.max_num_reqs, dtype=torch.bool, device=self.device
-        )
         self._replayssm_query_start_loc: torch.Tensor | None = None
         # Pre-copy prefix-cache state (V2). The migration of each request's
         # mamba state across block boundaries runs as a fused GPU kernel reusing
@@ -107,6 +104,10 @@ class MambaHybridModelState(DefaultModelState):
             self.cache_config.mamba_cache_mode == "all"
             and self._use_flashinfer_replayssm
         )
+        if self._use_flashinfer_replayssm:
+            self._is_prefilling_gpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.bool, device=self.device
+            )
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
@@ -132,11 +133,8 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._needs_prefix_state_migration:
             # Seed the running state block from the resumed/prefilled position.
-            state_block_size = self.cache_config.block_size
-            if self.cache_config.mamba_cache_mode == "all":
-                mamba_block_size = self.cache_config.mamba_block_size
-                assert mamba_block_size is not None
-                state_block_size = mamba_block_size
+            state_block_size = self.cache_config.mamba_block_size
+            assert state_block_size is not None
             self._mamba_state_idx_gpu[req_index].fill_(
                 (new_req_data.num_computed_tokens - 1) // state_block_size
             )
@@ -287,7 +285,8 @@ class MambaHybridModelState(DefaultModelState):
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
             input_batch.is_prefilling_np
         )
-        self._is_prefilling_gpu[:num_reqs].copy_(is_prefilling, non_blocking=True)
+        if self._use_flashinfer_replayssm:
+            self._is_prefilling_gpu[:num_reqs].copy_(is_prefilling, non_blocking=True)
         # During CUDAGraph capture, num_decode_draft_tokens_cpu and num_accepted_tokens
         # are created by attn_metadata_builder.build_for_cudagraph_capture, so we only
         # compute them during actual (non-capture) forward execution.

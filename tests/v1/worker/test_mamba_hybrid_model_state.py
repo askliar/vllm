@@ -16,6 +16,25 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 
 
+def test_add_request_seeds_state_with_mamba_block_size() -> None:
+    state = object.__new__(MambaHybridModelState)
+    state.rope_state = None
+    state.prompt_embeds_state = None
+    state.cache_config = SimpleNamespace(
+        block_size=16,
+        mamba_block_size=8,
+        mamba_cache_mode="align",
+    )
+    state._needs_prefix_state_migration = True
+    state.num_accepted_tokens_gpu = torch.full((2,), 9, dtype=torch.int32)
+    state._mamba_state_idx_gpu = torch.full((2,), -1, dtype=torch.int32)
+
+    state.add_request(1, Mock(num_computed_tokens=17))
+
+    assert state.num_accepted_tokens_gpu.tolist() == [9, 1]
+    assert state._mamba_state_idx_gpu.tolist() == [-1, 2]
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 @pytest.mark.parametrize(("num_sampled", "expected_value"), [(0, 1), (3, 3)])
 def test_postprocess_state_scalar_with_int32_mapping(

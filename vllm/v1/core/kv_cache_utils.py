@@ -1817,7 +1817,6 @@ def _get_packed_kv_cache_groups(
         groups,
         use_deepseek_v4_fallback=_is_deepseek_v4_eagle(vllm_config),
     )
-    _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
 
@@ -1839,7 +1838,7 @@ def _annotate_eagle_groups(
 ) -> None:
     """Flag the KV cache groups that hold drafter attention layers.
 
-    Two detection rules, in order of preference:
+    Three detection rules, in order of preference:
 
     1. Spec-driven. ``non_causal_multi_token_decode`` is declared on
        MLAAttentionSpec and set by drafter attention layers that run a
@@ -1857,6 +1856,10 @@ def _annotate_eagle_groups(
        ``use_deepseek_v4_fallback`` False. The caller gates this fallback on
        the configured model type.
        FIXME(yifan): avoid/generalize this hacky check.
+    3. Hybrid fallback. If neither rule identifies a draft group and Mamba
+       groups are present, conservatively flag every non-Mamba group. This
+       preserves the existing all-groups fallback for attention caches without
+       applying its widened lookup window to Mamba state.
 
     Args:
         vllm_config: Config supplying the speculative method, if any.
@@ -1876,55 +1879,25 @@ def _annotate_eagle_groups(
         ):
             group.is_eagle_group = True
 
-    if not use_deepseek_v4_fallback:
-        return
-    last_layer = next(reversed(kv_cache_spec))
-    for group in kv_cache_groups:
-        if last_layer in group.layer_names:
-            group.is_eagle_group = True
-            break
+    if use_deepseek_v4_fallback:
+        last_layer = next(reversed(kv_cache_spec))
+        for group in kv_cache_groups:
+            if last_layer in group.layer_names:
+                group.is_eagle_group = True
+                break
 
-
-def _warn_if_unannotated_eagle_mamba(
-    vllm_config: VllmConfig,
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> None:
-    """Warn when the flag-all eagle fallback will silently disable reuse.
-
-    With no group annotated, consumers flag every group as a draft group. That
-    widens a Mamba group's required lookup window to two consecutive chunks,
-    which align-mode checkpointing never produces, so reuse drops to zero with
-    no error and no metric to show it.
-
-    Args:
-        vllm_config: Config supplying the speculative method, if any.
-        kv_cache_groups: Groups as they will be handed to consumers.
-    """
-    spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
-        return
-    if any(group.is_eagle_group for group in kv_cache_groups):
-        return
-    mamba_groups = [
-        idx
-        for idx, group in enumerate(kv_cache_groups)
-        if any(
-            isinstance(spec, MambaSpec)
-            for spec in iter_layer_specs(group.kv_cache_spec)
-        )
-    ]
-    if not mamba_groups:
-        return
-    logger.warning(
-        "Speculative decoding (method=%s) is enabled but no KV cache group "
-        "could be identified as the draft model's, so every group -- "
-        "including Mamba groups %s -- will be treated as a draft group. A "
-        "Mamba group cannot satisfy the widened lookup window that implies, "
-        "so prefix-cache reuse across requests will be disabled and any "
-        "external KV offload tier will store without ever serving a hit.",
-        spec_config.method,
-        mamba_groups,
-    )
+    if not any(group.is_eagle_group for group in kv_cache_groups):
+        non_mamba_groups = [
+            group
+            for group in kv_cache_groups
+            if not any(
+                isinstance(spec, MambaSpec)
+                for spec in iter_layer_specs(group.kv_cache_spec)
+            )
+        ]
+        if len(non_mamba_groups) < len(kv_cache_groups):
+            for group in non_mamba_groups:
+                group.is_eagle_group = True
 
 
 def _largest_divisor_at_most(value: int, limit: int) -> int:
@@ -2017,7 +1990,6 @@ def get_kv_cache_groups(
             groups.append(KVCacheGroupSpec([name], aligned))
 
     _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
-    _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
 
@@ -2240,7 +2212,11 @@ def _project_kv_cache_groups_to_worker(
             KVCacheGroupSpec(
                 worker_layer_names,
                 group_spec,
-                is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                # Empty projected groups preserve global group identity across
+                # PP ranks. Keep the annotation too, so a Mamba-only stage does
+                # not reinterpret "no local draft layers" as "all groups are
+                # draft groups" in local or external-cache coordinators.
+                is_eagle_group=group.is_eagle_group,
             )
         )
     return projected_groups
