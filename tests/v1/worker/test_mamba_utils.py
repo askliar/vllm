@@ -32,7 +32,7 @@ from vllm.v1.worker.mamba_utils import (
     collect_mamba_copy_meta,
     do_mamba_copy_block,
     get_mamba_groups,
-    postprocess_mamba_align_gpu,
+    postprocess_mamba_gpu,
     preprocess_mamba,
     preprocess_mamba_align_fused_kernel,
     stage_postprocess_inputs_to_gpu,
@@ -99,7 +99,7 @@ def postprocess_mamba(
 ):
     """CPU reference for the align-mode postprocess.
 
-    Used as a golden against the GPU fused kernel (``postprocess_mamba_align_gpu``).
+    Used as a golden against the GPU fused kernel (``postprocess_mamba_gpu``).
     Mirrors what the production code did before the fused kernel replaced it;
     kept here because production no longer has a CPU implementation.
     """
@@ -268,7 +268,7 @@ def test_preprocess_mamba_preserves_live_replayssm_state(
     assert align_ctx.precopy_src_col_buf.np[0] == 0
 
 
-def test_postprocess_mamba_align_materializes_prefixes():
+def test_postprocess_mamba_materializes_prefixes():
     order: list[str] = []
     ctx = MagicMock()
     ctx.is_initialized = True
@@ -278,7 +278,7 @@ def test_postprocess_mamba_align_materializes_prefixes():
     ctx.num_computed_tokens_buf = MagicMock()
     ctx.num_draft_tokens_buf = MagicMock()
     ctx.is_prefilling_buf = MagicMock()
-    ctx.num_accepted_tokens_out = torch.tensor([3], dtype=torch.int32)
+    ctx.num_accepted_tokens_snapshot = torch.tensor([3], dtype=torch.int32)
     accepted = torch.tensor([3], dtype=torch.int32)
 
     def run_fused_postprocess(**kwargs):
@@ -298,7 +298,7 @@ def test_postprocess_mamba_align_materializes_prefixes():
     kv_cache_config.kv_cache_groups = [MagicMock()]
     accepted_cpu = torch.zeros(1, dtype=torch.int32)
 
-    postprocess_mamba_align_gpu(
+    postprocess_mamba_gpu(
         bufs=MagicMock(postprocess_align=ctx),
         num_reqs=1,
         num_accepted_tokens_gpu=accepted,
@@ -312,7 +312,7 @@ def test_postprocess_mamba_align_materializes_prefixes():
 
     assert order == ["copy", "postprocess", "materialize"]
     assert ctx.replayssm.postprocess.call_args.kwargs["num_accepted_tokens"] is (
-        ctx.num_accepted_tokens_out
+        ctx.num_accepted_tokens_snapshot
     )
     assert accepted_cpu.tolist() == [1]
 
@@ -334,7 +334,7 @@ def test_postprocess_mamba_none_skips_prefix_copy():
     accepted = torch.tensor([2], dtype=torch.int32)
     accepted_cpu = torch.zeros(1, dtype=torch.int32)
 
-    postprocess_mamba_align_gpu(
+    postprocess_mamba_gpu(
         bufs=MagicMock(postprocess_align=ctx),
         num_reqs=1,
         num_accepted_tokens_gpu=accepted,
@@ -349,6 +349,7 @@ def test_postprocess_mamba_none_skips_prefix_copy():
     ctx.run_fused_postprocess.assert_not_called()
     assert ctx.replayssm.postprocess.call_count == 1
     assert ctx.replayssm.postprocess.call_args.kwargs["num_accepted_tokens"] is accepted
+    assert ctx.replayssm.postprocess.call_args.kwargs["live_cols"] is None
     ctx.replayssm.materialize.assert_not_called()
     assert accepted_cpu.tolist() == [2]
 
@@ -1090,9 +1091,12 @@ def test_stage_postprocess_inputs_to_gpu_asserts_on_missing_state_idx():
         )
 
 
-def test_stage_postprocess_inputs_to_gpu_uses_fixed_none_mode_live_col():
+def test_stage_postprocess_inputs_to_gpu_skips_none_mode_live_col():
     device = torch.device("cpu")
     ctx = _make_staging_ctx(max_num_reqs=4, device=device)
+    ctx.replayssm = MagicMock(materialize_prefixes=False)
+    ctx.mamba_state_idx_buf.cpu.fill_(17)
+    ctx.mamba_state_idx_buf.gpu.fill_(23)
     scheduler_output = _make_postprocess_scheduler_output(
         req_ids=["req_a", "req_b"],
         num_scheduled_tokens={"req_a": 4, "req_b": 1},
@@ -1111,10 +1115,10 @@ def test_stage_postprocess_inputs_to_gpu_uses_fixed_none_mode_live_col():
         2,
         requests,
         {},
-        fixed_live_col=0,
     )
 
-    np.testing.assert_array_equal(ctx.mamba_state_idx_buf.np[:2], [0, 0])
+    np.testing.assert_array_equal(ctx.mamba_state_idx_buf.np[:2], [17, 17])
+    assert ctx.mamba_state_idx_buf.gpu[:2].tolist() == [23, 23]
     np.testing.assert_array_equal(ctx.num_scheduled_tokens_buf.np[:2], [4, 1])
     np.testing.assert_array_equal(ctx.num_computed_tokens_buf.np[:2], [20, 7])
 

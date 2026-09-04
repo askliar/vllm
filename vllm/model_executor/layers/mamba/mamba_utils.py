@@ -88,16 +88,13 @@ class MambaStateDtypeCalculator:
         )
 
     @classmethod
-    def append_replayssm_ring(
+    def replayssm_ring_dtypes(
         cls,
-        base_dtypes: tuple[torch.dtype, ...],
         model_dtype: ModelDType | torch.dtype,
     ) -> tuple[torch.dtype, ...]:
-        """Append the ReplaySSM ring dtypes to a base ``(conv, ssm)`` tuple:
-        ``(x_cache, dt_cache, B_cache)`` = ``(activation, fp32, activation)``.
-        """
+        """Return ``(x_cache, dt_cache, B_cache)`` dtypes."""
         activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
-        return (*base_dtypes, activation_dtype, torch.float32, activation_dtype)
+        return (activation_dtype, torch.float32, activation_dtype)
 
     @classmethod
     def _mamba_state_dtype(

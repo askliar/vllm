@@ -97,7 +97,7 @@ class MambaHybridModelState(DefaultModelState):
         # running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
         self._use_flashinfer_replayssm = (
-            self.cache_config.use_replayssm is True
+            self.cache_config.use_replayssm
             and vllm_config.mamba_config.backend == MambaBackendEnum.FLASHINFER
         )
         self._needs_prefix_state_migration = self._align_mode or (
@@ -247,7 +247,7 @@ class MambaHybridModelState(DefaultModelState):
                 dst_cols=self._mamba_state_idx_gpu,
                 num_reqs=num_reqs,
             )
-        if replayssm is None:
+        else:
             ctx.run_fused_precopy(
                 num_reqs,
                 self._mamba_state_idx_gpu,
@@ -438,22 +438,18 @@ class MambaHybridModelState(DefaultModelState):
         if not num_reqs or not self._use_flashinfer_replayssm:
             return
 
-        if num_computed_tokens is None:
-            raise RuntimeError(
-                "ReplaySSM postprocess requires the post-step computed-token "
-                "counts from the forward that produced this acceptance"
-            )
-        query_start_loc = self._replayssm_query_start_loc
+        assert num_computed_tokens is not None
+        query_start_loc, self._replayssm_query_start_loc = (
+            self._replayssm_query_start_loc,
+            None,
+        )
         if query_start_loc is None:
             raise RuntimeError(
                 "ReplaySSM postprocess requires the query_start_loc from "
                 "the forward that produced this acceptance"
             )
         ctx = self._mamba_ctx
-        if ctx is None or not ctx.is_initialized:
-            raise RuntimeError(
-                "ReplaySSM postprocess context was not initialized before forward"
-            )
+        assert ctx is not None and ctx.is_initialized
         replayssm = ctx.replayssm
         assert replayssm is not None
         replayssm.postprocess(
@@ -466,7 +462,7 @@ class MambaHybridModelState(DefaultModelState):
             # next step; use its snapshot in that case. Mode none never
             # runs the migration kernel, so the acceptance buffer is exact.
             num_accepted_tokens=(
-                ctx.num_accepted_tokens_out
+                ctx.num_accepted_tokens_snapshot
                 if self._needs_prefix_state_migration
                 else self.num_accepted_tokens_gpu
             ),

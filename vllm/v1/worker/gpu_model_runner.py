@@ -1607,8 +1607,9 @@ class GPUModelRunner(
         each sequence, and a shifting is done during the next iteration
         based on the number of accepted tokens.
         """
-        if not self._use_flashinfer_replayssm and (
-            not self.speculative_config or not self.model_config.is_hybrid
+        if not (
+            self._use_flashinfer_replayssm
+            or (self.speculative_config and self.model_config.is_hybrid)
         ):
             return
 
@@ -1626,7 +1627,7 @@ class GPUModelRunner(
             # update without CPU-GPU sync. The metadata
             # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
             # pre-staged to GPU buffers in _prepare_inputs.
-            mamba_utils.postprocess_mamba_align_gpu(
+            mamba_utils.postprocess_mamba_gpu(
                 bufs=self._get_mamba_bufs(),
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
@@ -1643,18 +1644,9 @@ class GPUModelRunner(
             )
 
             if self.num_accepted_tokens_event is not None:
+                # STP ReplaySSM has no accepted-count D2H copy and therefore
+                # does not allocate an event.
                 self.num_accepted_tokens_event.record()
-
-            if self.cache_config.mamba_cache_mode == "all":
-                mamba_utils.postprocess_mamba_all(
-                    scheduler_output,
-                    self.kv_cache_config,
-                    self.input_batch,
-                    self.requests,
-                    self.mamba_state_idx,
-                    self.num_spec_tokens,
-                    num_reqs,
-                )
         else:
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
@@ -1662,16 +1654,16 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
-            if self.cache_config.mamba_cache_mode == "all":
-                mamba_utils.postprocess_mamba_all(
-                    scheduler_output,
-                    self.kv_cache_config,
-                    self.input_batch,
-                    self.requests,
-                    self.mamba_state_idx,
-                    self.num_spec_tokens,
-                    num_reqs,
-                )
+        if self.cache_config.mamba_cache_mode == "all":
+            mamba_utils.postprocess_mamba_all(
+                scheduler_output,
+                self.kv_cache_config,
+                self.input_batch,
+                self.requests,
+                self.mamba_state_idx,
+                self.num_spec_tokens,
+                num_reqs,
+            )
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -2165,9 +2157,7 @@ class GPUModelRunner(
         # Skipped under async scheduling (non-align): the CPU copy races with
         # the in-flight D2H copy and with input-batch row moves.
         needs_cpu_accepted_counts = self.num_accepted_tokens_event is not None and (
-            not self.use_async_scheduling
-            or self.cache_config.mamba_cache_mode == "align"
-            or self._needs_prefix_state_migration
+            not self.use_async_scheduling or self._needs_prefix_state_migration
         )
         if needs_cpu_accepted_counts:
             assert self.num_accepted_tokens_event is not None
@@ -4497,7 +4487,6 @@ class GPUModelRunner(
                     num_reqs,
                     self.requests,
                     self.mamba_state_idx,
-                    fixed_live_col=(None if self._needs_prefix_state_migration else 0),
                 )
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0

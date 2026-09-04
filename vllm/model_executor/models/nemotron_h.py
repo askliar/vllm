@@ -740,12 +740,11 @@ class NemotronHForCausalLM(
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, ...]:
         cache_config = vllm_config.cache_config
-        base_dtype = MambaStateDtypeCalculator.mamba2_state_dtype(
+        return MambaStateDtypeCalculator.mamba2_state_dtype(
             vllm_config.model_config.dtype,
             cache_config.mamba_cache_dtype,
             cache_config.mamba_ssm_cache_dtype,
         )
-        return base_dtype
 
     @classmethod
     def get_mamba_state_shape_from_config(
@@ -766,7 +765,7 @@ class NemotronHForCausalLM(
         hf_config = vllm_config.model_config.hf_config
         intermediate_size = hf_config.mamba_num_heads * hf_config.mamba_head_dim
 
-        base_shape = MambaStateShapeCalculator.mamba2_state_shape(
+        return MambaStateShapeCalculator.mamba2_state_shape(
             intermediate_size=intermediate_size,
             tp_world_size=parallel_config.tensor_parallel_size,
             n_groups=hf_config.n_groups,
@@ -776,7 +775,6 @@ class NemotronHForCausalLM(
             conv_kernel=hf_config.conv_kernel,
             num_spec=vllm_config.num_speculative_tokens,
         )
-        return base_shape
 
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:

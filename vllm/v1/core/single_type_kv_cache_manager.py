@@ -1712,12 +1712,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 if partial_hit is not None:
                     live_source = partial_hit[1]
                 elif prev_block_len > 0:
-                    live_source_idx = (
-                        prev_block_len - 1 - self.num_speculative_blocks
-                        if request_id in self._allocated_block_reqs
-                        else prev_block_len - 1
-                    )
-                    live_source = req_blocks[live_source_idx]
+                    live_source = req_blocks[prev_block_len - 1]
             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
             # over-allocated at last round.
             if num_required_blocks <= len(req_blocks) and not has_partial_hit:
@@ -1804,11 +1799,8 @@ class MambaManager(SingleTypeKVCacheManager):
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
                 req_blocks.extend(new_blocks)
-                if self._copy_replayssm_live_state:
-                    live_dest_idx = len(req_blocks) - 1 - self.num_speculative_blocks
-                    live_dest = req_blocks[live_dest_idx]
-                    if any(live_dest is block for block in new_blocks):
-                        self._queue_replayssm_live_copy(live_source, live_dest)
+                if self._copy_replayssm_live_state and new_blocks:
+                    self._queue_replayssm_live_copy(live_source, req_blocks[-1])
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
                 returned_blocks.extend(new_blocks)

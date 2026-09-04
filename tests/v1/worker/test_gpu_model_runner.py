@@ -1448,7 +1448,7 @@ def test_replayssm_stp_keeps_accepted_one_without_cpu_copy(monkeypatch):
     postprocess = Mock()
     monkeypatch.setattr(
         gpu_model_runner_module.mamba_utils,
-        "postprocess_mamba_align_gpu",
+        "postprocess_mamba_gpu",
         postprocess,
     )
 

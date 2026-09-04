@@ -793,6 +793,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     dim=0,
                 )
             )
+            conv_initial_state_idx_d = block_idx_last_computed_token_d
             block_idx_last_scheduled_token_d, block_idx_last_scheduled_token_p = (
                 torch.split(
                     attn_metadata.block_idx_last_scheduled_token,
@@ -819,6 +820,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             block_idx_first_scheduled_token_p = None
             block_idx_last_scheduled_token_d = None
             block_idx_last_computed_token_d = None
+            conv_initial_state_idx_d = None
             block_idx_last_scheduled_token_prev_step_d = None
             num_computed_tokens_p = None
 
@@ -1007,13 +1009,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     # forward. Keep both convolution and ReplaySSM on that private
                     # live page instead of touching the cached prefix source.
                     assert block_idx_last_scheduled_token_d is not None
-                    live_indices = state_indices_tensor_d.gather(
-                        1,
-                        block_idx_last_scheduled_token_d.to(torch.int64).unsqueeze(1),
-                    ).squeeze(1)
-                    state_indices_tensor_d_input = live_indices
-                    state_indices_tensor_d_output = live_indices
-                    block_idx_last_computed_token_d = block_idx_last_scheduled_token_d
+                    assert replayssm_state_indices_d is not None
+                    state_indices_tensor_d_input = replayssm_state_indices_d
+                    state_indices_tensor_d_output = replayssm_state_indices_d
+                    conv_initial_state_idx_d = block_idx_last_scheduled_token_d
                 elif self.num_spec > 0:
                     assert block_idx_last_scheduled_token_prev_step_d is not None
                     input_indices = (
@@ -1051,7 +1050,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 self.activation,
                 conv_state_indices=state_indices_tensor_d,
                 block_idx_last_scheduled_token=block_idx_last_scheduled_token_d,
-                initial_state_idx=block_idx_last_computed_token_d,
+                initial_state_idx=conv_initial_state_idx_d,
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=query_start_loc_d,
                 # ReplaySSM keeps one physical state block while a speculative
@@ -1218,9 +1217,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         if not self.use_replayssm:
             return ()
         assert self.model_config is not None
-        return MambaStateDtypeCalculator.append_replayssm_ring(
-            (), self.model_config.dtype
-        )
+        return MambaStateDtypeCalculator.replayssm_ring_dtypes(self.model_config.dtype)
 
     def get_replayssm_state_shape(self) -> tuple[tuple[int, ...], ...]:
         if not self.use_replayssm:

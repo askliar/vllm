@@ -749,6 +749,8 @@ def get_replayssm_block_copy_tensors(
         mamba_config = getattr(layer, "mamba_config", None)
         backend = getattr(mamba_config, "backend", None)
         if backend == MambaBackendEnum.FLASHINFER:
+            # Group-shared trackers appear once per layer; the block-copy helper
+            # deduplicates them by (device, data_ptr()).
             extra_tensors.extend(
                 (layer._replayssm_ring_start, layer._replayssm_prev_num_accepted)
             )

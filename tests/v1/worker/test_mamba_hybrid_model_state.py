@@ -94,6 +94,7 @@ def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
     assert state.num_accepted_tokens_gpu.tolist() == [1, 1, 2, 1]
     assert kwargs["num_accepted_tokens"] is state.num_accepted_tokens_gpu
     assert kwargs["live_cols"] is None
+    assert state._replayssm_query_start_loc is None
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
@@ -114,7 +115,7 @@ def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
     ctx = Mock(
         is_initialized=True,
         replayssm=replayssm,
-        num_accepted_tokens_out=accepted_snapshot,
+        num_accepted_tokens_snapshot=accepted_snapshot,
     )
 
     def normalize_live(*_args) -> None:
@@ -134,6 +135,7 @@ def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
     assert kwargs["num_accepted_tokens"] is accepted_snapshot
     assert accepted_snapshot[2].item() == 3
     assert state.num_accepted_tokens_gpu[2].item() == 1
+    assert state._replayssm_query_start_loc is None
 
 
 def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:

@@ -489,6 +489,7 @@ def test_modelwide_replayssm_materializes_each_cache_group(monkeypatch):
     ):
         args = call.args
         kwargs = call.kwargs
+        assert args[9] is args[10]
         assert args[11] is group_ctx.src_slots
         assert args[12] is group_ctx.dst_slots
         assert args[13] is group_ctx.plan_ring_start

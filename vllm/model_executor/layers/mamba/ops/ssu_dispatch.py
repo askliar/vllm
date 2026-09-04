@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -192,12 +192,14 @@ def _postprocess_replayssm_kernel(
                 tl.where(materialize, dst_slot, PAD_SLOT_ID),
             )
     if prefilling:
-        computed_after = computed_before + query_len
-        first_col = tl.maximum(computed_before // MAMBA_BLOCK_SIZE, 0)
+        first_col = computed_before // MAMBA_BLOCK_SIZE
         last_col = tl.maximum(
             (computed_after + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1,
             0,
         )
+        # Any block touched by prefill can later become another request's live
+        # source through a prefix-cache hit. Clear every such block's cursors,
+        # including intermediate blocks that are neither live_slot nor dst_slot.
         for col in tl.range(first_col, last_col + 1):
             prefill_slot = tl.load(
                 block_table + batch_idx * block_table_stride_req + col
@@ -229,6 +231,8 @@ def _postprocess_replayssm_kernel(
             )
 
     # The published destination is canonical and therefore has no live replay.
+    # When dst_slot aliases live_slot, these stores intentionally supersede the
+    # live tracker update above: the newly published snapshot is canonical.
     tl.store(tracker_start + dst_slot, 0, mask=materialize)
     tl.store(tracker_committed + dst_slot, 0, mask=materialize)
 
@@ -262,23 +266,18 @@ def _compact_replayssm_requests_kernel(
     )
 
 
-def _replayssm_specialization_key(mixer: Any) -> tuple[Any, ...]:
-    ssm = mixer.kv_cache[1]
-    x_cache = mixer.replayssm_cache[0]
-    b_cache = mixer.replayssm_cache[2]
-    return (
-        ssm.dtype,
-        x_cache.dtype,
-        mixer.A.dtype,
-        ssm.size(1),
-        ssm.size(2),
-        ssm.size(3),
-        ssm.size(1) // b_cache.size(1),
-        int(mixer.replayssm_buffer_len),
-        x_cache.size(2),
-        bool(mixer.mamba_config.enable_stochastic_rounding),
-        int(mixer.mamba_config.stochastic_rounding_philox_rounds or 0),
-    )
+class _ReplaySSMMaterializeTables(NamedTuple):
+    state_ptrs: torch.Tensor
+    state_slot_strides: torch.Tensor
+    x_cache_ptrs: torch.Tensor
+    x_cache_slot_strides: torch.Tensor
+    B_cache_ptrs: torch.Tensor
+    B_cache_slot_strides: torch.Tensor
+    dt_cache_ptrs: torch.Tensor
+    dt_cache_slot_strides: torch.Tensor
+    A_ptrs: torch.Tensor
+    state_scale_ptrs: torch.Tensor
+    state_scale_slot_strides: torch.Tensor
 
 
 @dataclass
@@ -289,7 +288,7 @@ class _ReplaySSMGroupContext:
     block_table: torch.Tensor
     ring_start: torch.Tensor
     num_committed: torch.Tensor
-    materialize_tables: tuple[torch.Tensor, ...]
+    materialize_tables: _ReplaySSMMaterializeTables
     src_slots: torch.Tensor
     dst_slots: torch.Tensor
     plan_ring_start: torch.Tensor
@@ -310,34 +309,9 @@ class _ReplaySSMGroupContext:
         mamba_block_size: int,
         max_num_reqs: int,
     ) -> "_ReplaySSMGroupContext":
-        if (
-            block_table.ndim != 2
-            or block_table.dtype != torch.int32
-            or not block_table.is_cuda
-            or block_table.numel() == 0
-        ):
-            raise ValueError("ReplaySSM requires a non-empty 2D CUDA int32 block table")
         first = mixers[0]
         first_ssm = first.kv_cache[1]
         first_x = first.replayssm_cache[0]
-        compatibility = _replayssm_specialization_key(first)
-        for mixer in mixers[1:]:
-            current = _replayssm_specialization_key(mixer)
-            if current != compatibility:
-                raise ValueError(
-                    "Layers in one ReplaySSM cache group require identical "
-                    "materialization specialization; got "
-                    f"{compatibility} and {current}"
-                )
-            if (
-                mixer._replayssm_ring_start.data_ptr()
-                != first._replayssm_ring_start.data_ptr()
-                or mixer._replayssm_prev_num_accepted.data_ptr()
-                != first._replayssm_prev_num_accepted.data_ptr()
-            ):
-                raise ValueError(
-                    "Layers in one ReplaySSM cache group must share ring trackers"
-                )
 
         device = first_ssm.device
         zero_table = torch.zeros(len(mixers), dtype=torch.int64, device=device)
@@ -346,18 +320,26 @@ class _ReplaySSMGroupContext:
             block_table=block_table,
             ring_start=first._replayssm_ring_start,
             num_committed=first._replayssm_prev_num_accepted,
-            materialize_tables=(
-                _cuda_i64_ptrs([m.kv_cache[1] for m in mixers]),
-                _cuda_i64_slot_strides([m.kv_cache[1] for m in mixers]),
-                _cuda_i64_ptrs([m.replayssm_cache[0] for m in mixers]),
-                _cuda_i64_slot_strides([m.replayssm_cache[0] for m in mixers]),
-                _cuda_i64_ptrs([m.replayssm_cache[2] for m in mixers]),
-                _cuda_i64_slot_strides([m.replayssm_cache[2] for m in mixers]),
-                _cuda_i64_ptrs([m.replayssm_cache[1] for m in mixers]),
-                _cuda_i64_slot_strides([m.replayssm_cache[1] for m in mixers]),
-                _cuda_i64_ptrs([m.A for m in mixers]),
-                zero_table,
-                zero_table.clone(),
+            materialize_tables=_ReplaySSMMaterializeTables(
+                state_ptrs=_cuda_i64_ptrs([m.kv_cache[1] for m in mixers]),
+                state_slot_strides=_cuda_i64_slot_strides(
+                    [m.kv_cache[1] for m in mixers]
+                ),
+                x_cache_ptrs=_cuda_i64_ptrs([m.replayssm_cache[0] for m in mixers]),
+                x_cache_slot_strides=_cuda_i64_slot_strides(
+                    [m.replayssm_cache[0] for m in mixers]
+                ),
+                B_cache_ptrs=_cuda_i64_ptrs([m.replayssm_cache[2] for m in mixers]),
+                B_cache_slot_strides=_cuda_i64_slot_strides(
+                    [m.replayssm_cache[2] for m in mixers]
+                ),
+                dt_cache_ptrs=_cuda_i64_ptrs([m.replayssm_cache[1] for m in mixers]),
+                dt_cache_slot_strides=_cuda_i64_slot_strides(
+                    [m.replayssm_cache[1] for m in mixers]
+                ),
+                A_ptrs=_cuda_i64_ptrs([m.A for m in mixers]),
+                state_scale_ptrs=zero_table,
+                state_scale_slot_strides=zero_table,
             ),
             src_slots=torch.full(
                 (len(mixers), max_num_reqs),
@@ -462,8 +444,6 @@ class _ReplaySSMGroupContext:
 
     def materialize(self) -> None:
         """Publish the canonical prefix snapshots prepared by ``postprocess``."""
-        if not self.materialize_prefixes:
-            raise RuntimeError("ReplaySSM materialization requires align or all mode")
         first = self.mixers[0]
         mamba_config = first.mamba_config
         rand_seed = None
@@ -501,7 +481,10 @@ class ReplaySSMModelContext:
     """ReplaySSM lifecycle split by physical cache-slot namespace."""
 
     groups: list[_ReplaySSMGroupContext]
-    materialize_prefixes: bool
+
+    @property
+    def materialize_prefixes(self) -> bool:
+        return self.groups[0].materialize_prefixes
 
     @classmethod
     def create(
@@ -551,10 +534,7 @@ class ReplaySSMModelContext:
         groups = [
             _ReplaySSMGroupContext.create(*args, max_num_reqs) for args in group_args
         ]
-        return cls(
-            groups=groups,
-            materialize_prefixes=next(iter(modes)) in ("align", "all"),
-        )
+        return cls(groups=groups)
 
     def reset_new_slots(self, **kwargs: Any) -> None:
         for group in self.groups:
@@ -565,8 +545,6 @@ class ReplaySSMModelContext:
             group.postprocess(**kwargs)
 
     def materialize(self) -> None:
-        if not self.materialize_prefixes:
-            raise RuntimeError("ReplaySSM materialization requires align or all mode")
         for group in self.groups:
             group.materialize()
 
