@@ -1007,11 +1007,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 if self.use_replayssm:
                     # The ownership pre-copy seeds the last-scheduled page before
                     # forward. Keep both convolution and ReplaySSM on that private
-                    # live page instead of touching the cached prefix source.
+                    # live page instead of touching the cached prefix source, so
+                    # SSM input and output deliberately use the same slot.
                     assert block_idx_last_scheduled_token_d is not None
                     assert replayssm_state_indices_d is not None
-                    state_indices_tensor_d_input = replayssm_state_indices_d
-                    state_indices_tensor_d_output = replayssm_state_indices_d
+                    state_indices_tensor_d_input = state_indices_tensor_d_output = (
+                        replayssm_state_indices_d
+                    )
                     conv_initial_state_idx_d = block_idx_last_scheduled_token_d
                 elif self.num_spec > 0:
                     assert block_idx_last_scheduled_token_prev_step_d is not None

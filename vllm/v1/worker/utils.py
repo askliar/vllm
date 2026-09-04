@@ -740,7 +740,14 @@ def copy_kv_cache_blocks_inplace(
 def get_replayssm_block_copy_tensors(
     forward_context: Mapping[str, Any],
 ) -> list[torch.Tensor]:
-    """Return ReplaySSM rings and FlashInfer's group-shared cursors."""
+    """Collect ReplaySSM-owned state that must follow scheduler block copies.
+
+    The runner's normal KV-cache list already contains canonical convolution
+    and SSM state. ReplaySSM ring caches use separate allocations on every
+    backend, so they are added here. FlashInfer additionally keeps its ring
+    position and accepted-token trackers in separate group-shared tensors;
+    the block-copy helper deduplicates those aliases by storage.
+    """
     extra_tensors: list[torch.Tensor] = []
     for layer in forward_context.values():
         if not getattr(layer, "use_replayssm", False):
