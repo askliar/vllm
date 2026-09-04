@@ -19,7 +19,6 @@ import torch
 
 from vllm.config.mamba import MambaBackendEnum, MambaConfig, MambaSSUAlgorithm
 from vllm.logger import init_logger
-from vllm.model_executor.layers.mamba.mamba_utils import _reinterpret_u64_as_i64
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -28,18 +27,23 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 logger = init_logger(__name__)
 
 
+def _reinterpret_u64_as_i64(value: int) -> int:
+    """Preserve a uint64 pointer bit pattern in a torch.int64 tensor."""
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
 @triton.jit
-def _mamba_state_copy_boundary(
+def mamba_state_copy_boundary(
     num_tokens_running_state,
     new_num_computed,
     block_size: tl.constexpr,
 ):
-    """Return the canonical aligned Mamba state-copy decision."""
+    """Return the aligned Mamba state-copy decision and destination."""
     aligned_new_computed = (new_num_computed // block_size) * block_size
     needs_copy = aligned_new_computed >= num_tokens_running_state
     accept_token_bias = aligned_new_computed - num_tokens_running_state
-    dest_col = aligned_new_computed // block_size - 1
-    return needs_copy, accept_token_bias, dest_col
+    dest_block_idx = aligned_new_computed // block_size - 1
+    return needs_copy, accept_token_bias, dest_block_idx
 
 
 @triton.jit
@@ -145,9 +149,7 @@ def _postprocess_replayssm_kernel(
     prefilling = prefilling & ((query_len != 1) | (computed_before <= 0))
     accepted = tl.maximum(tl.load(num_accepted_tokens + req_idx), 1)
 
-    # Derive this request's pre/post-step positions from ReplaySSM metadata,
-    # then share the canonical copy-boundary calculation with the generic
-    # Mamba state-copy kernel.
+    # Derive this request's pre/post-step positions from ReplaySSM metadata.
     computed_after = tl.where(
         prefilling,
         computed_before + query_len,
@@ -156,7 +158,7 @@ def _postprocess_replayssm_kernel(
     running_state_pos = tl.where(
         prefilling, computed_after, computed_after - accepted + 1
     )
-    boundary, accept_token_bias, dst_col = _mamba_state_copy_boundary(
+    boundary, accept_token_bias, dst_col = mamba_state_copy_boundary(
         running_state_pos,
         computed_after,
         MAMBA_BLOCK_SIZE,
@@ -442,7 +444,7 @@ class _ReplaySSMGroupContext:
                 BLOCK_SIZE=triton.next_power_of_2(self.max_num_reqs),
             )
 
-    def materialize(self) -> None:
+    def materialize(self, materialize_fn: Callable[..., None]) -> None:
         """Publish the canonical prefix snapshots prepared by ``postprocess``."""
         first = self.mixers[0]
         mamba_config = first.mamba_config
@@ -453,7 +455,7 @@ class _ReplaySSMGroupContext:
                 0, 2**32, (1,), device=self.src_slots.device, dtype=torch.int64
             )
             philox_rounds = mamba_config.stochastic_rounding_philox_rounds or 10
-        _load_replayssm_materialize()(
+        materialize_fn(
             *self.materialize_tables,
             self.src_slots,
             self.dst_slots,
@@ -545,8 +547,12 @@ class ReplaySSMModelContext:
             group.postprocess(**kwargs)
 
     def materialize(self) -> None:
+        # Keep the optional FlashInfer dependency lazy: mode ``none`` never
+        # reaches this path. Resolve the cached callable once for this model
+        # operation, then invoke it once per physical cache-slot namespace.
+        materialize_fn = _load_replayssm_materialize()
         for group in self.groups:
-            group.materialize()
+            group.materialize(materialize_fn)
 
 
 class MambaSSUBackend(ABC):

@@ -1643,9 +1643,11 @@ class GPUModelRunner(
                 run_prefix_state_migration=self._needs_prefix_state_migration,
             )
 
-            if self.num_accepted_tokens_event is not None:
-                # STP ReplaySSM has no accepted-count D2H copy and therefore
-                # does not allocate an event.
+            if self._use_flashinfer_replayssm and not self.num_spec_tokens:
+                # STP ReplaySSM has no accepted-count D2H copy or event.
+                assert self.num_accepted_tokens_event is None
+            else:
+                assert self.num_accepted_tokens_event is not None
                 self.num_accepted_tokens_event.record()
         else:
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(

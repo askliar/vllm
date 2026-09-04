@@ -548,14 +548,12 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             ) = self._compute_prefix_caching_block_indices(
                 common_attn_metadata, mamba_block_size
             )
-            if self.use_spec_decode:
-                block_idx_last_scheduled_token_prev_step = block_idx_last_computed_token
-                if prev_last_scheduled_idx is not None:
-                    block_idx_last_scheduled_token_prev_step = torch.where(
-                        prev_last_scheduled_idx >= 0,
-                        prev_last_scheduled_idx,
-                        block_idx_last_computed_token,
-                    )
+            if self.use_spec_decode and prev_last_scheduled_idx is not None:
+                block_idx_last_scheduled_token_prev_step = torch.where(
+                    prev_last_scheduled_idx >= 0,
+                    prev_last_scheduled_idx,
+                    block_idx_last_computed_token,
+                )
         else:
             state_indices_tensor = mamba_get_block_table_tensor(
                 common_attn_metadata.block_table_tensor,

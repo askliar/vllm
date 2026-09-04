@@ -11,7 +11,6 @@ import torch
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncsByType,
-    _reinterpret_u64_as_i64,
     get_conv_copy_spec,
     get_temporal_copy_spec,
 )
@@ -27,6 +26,7 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.mamba_utils import (
     MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
+    _reinterpret_u64_as_i64,
     batch_memcpy,
     collect_mamba_copy_meta,
     do_mamba_copy_block,

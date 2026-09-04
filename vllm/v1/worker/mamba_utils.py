@@ -12,14 +12,13 @@ from vllm.config.mamba import MambaBackendEnum
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncsByType,
-    _reinterpret_u64_as_i64,
     get_conv_copy_spec,
     get_temporal_copy_spec,
     is_conv_state_dim_first,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     ReplaySSMModelContext,
-    _mamba_state_copy_boundary,
+    mamba_state_copy_boundary,
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
@@ -187,6 +186,11 @@ def _memcpy_u64_tiled(
             mask = (i + offsets) < tile_end
             data = tl.load(src_u8 + i + offsets, mask=mask)
             tl.store(dst_u8 + i + offsets, data, mask=mask)
+
+
+def _reinterpret_u64_as_i64(value: int) -> int:
+    """Preserve a uint64 pointer bit pattern in a torch.int64 tensor."""
+    return value if value < (1 << 63) else value - (1 << 64)
 
 
 @triton.jit
@@ -463,7 +467,7 @@ def postprocess_mamba_fused_kernel(
         num_tokens_running_state = num_computed + num_scheduled - num_draft
         new_num_computed = num_tokens_running_state + num_accepted - 1
 
-    needs_copy, accept_token_bias, dest_block_idx = _mamba_state_copy_boundary(
+    needs_copy, accept_token_bias, dest_block_idx = mamba_state_copy_boundary(
         num_tokens_running_state,
         new_num_computed,
         block_size,
@@ -625,6 +629,7 @@ def precopy_mamba_align_fused_kernel(
     # so there is nothing to copy.
     if src_col < 0 or src_col == dst_col:
         return
+
     token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
         state_idx,
@@ -730,9 +735,9 @@ def validate_mamba_state_copy_funcs(
         )
         state_copy_funcs = copy_funcs[mamba_spec.mamba_type]
         assert 0 < len(state_copy_funcs) <= len(mamba_spec.shapes), (
-            f"{mamba_spec.mamba_type} expects {len(mamba_spec.shapes)} state copy "
-            "funcs for its canonical state tensors, but provides "
-            f"{len(state_copy_funcs)}; expected a non-empty copyable prefix"
+            f"{mamba_spec.mamba_type} declares {len(mamba_spec.shapes)} states, "
+            f"but provides {len(state_copy_funcs)} state copy funcs; expected "
+            "a non-empty copyable prefix"
         )
 
 
