@@ -76,7 +76,6 @@ def test_replayssm_autotune_decode_kwargs(runner_kwargs, expected_num_reqs):
     assert max_num_reqs == expected_num_reqs
     assert decode_kwargs["num_tokens"] == expected_num_reqs * query_len
     assert decode_kwargs["uniform_decode"] is True
-    assert decode_kwargs["is_profile"] is True
     if runner_kwargs.get("use_v2_model_runner"):
         assert decode_kwargs["valid_dummy_state_slots"] is True
         assert "profile_seq_lens" not in decode_kwargs

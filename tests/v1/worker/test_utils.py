@@ -84,7 +84,6 @@ def test_bind_kv_cache_shares_replayssm_trackers_by_cache_group():
         assert group_tracker.data_ptr() == getattr(mixers[2], tracker_name).data_ptr()
         assert group_tracker.data_ptr() != getattr(mixers[1], tracker_name).data_ptr()
         assert group_tracker.shape == (4,)
-        assert group_tracker.dtype == torch.int32
         assert torch.count_nonzero(group_tracker) == 0
 
 

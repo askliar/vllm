@@ -13,21 +13,19 @@ from ...models.utils import check_logprobs_close
 from ...utils import large_gpu_mark, multi_gpu_test
 
 try:
-    from flashinfer.mamba.checkpointing_ssu import (
+    from flashinfer.mamba.checkpointing_ssu import (  # noqa: F401
         CheckpointingSSURunner,
         allocate_checkpointing_ssu_scratch,
     )
 
-    HAS_FLASHINFER_CHECKPOINTING_SSU = callable(CheckpointingSSURunner) and callable(
-        allocate_checkpointing_ssu_scratch
-    )
+    HAS_FLASHINFER_CHECKPOINTING_SSU = True
 except ImportError:
     HAS_FLASHINFER_CHECKPOINTING_SSU = False
 
 try:
     from flashinfer.mamba.replayssm_materialize import replayssm_materialize
 
-    HAS_FLASHINFER_REPLAYSSM_MATERIALIZE = callable(replayssm_materialize) and (
+    HAS_FLASHINFER_REPLAYSSM_MATERIALIZE = (
         "active_request_indices" in signature(replayssm_materialize).parameters
     )
 except ImportError:
