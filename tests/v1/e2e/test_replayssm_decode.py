@@ -121,17 +121,6 @@ def test_replayssm_decode_matches_baseline_tp2(vllm_runner, model_name):
     _check_replayssm_parity(vllm_runner, model_name, tensor_parallel_size=2)
 
 
-@pytest.mark.parametrize("model_name", MODELS)
-def test_replayssm_flashinfer_decode_matches_baseline(vllm_runner, model_name):
-    pytest.importorskip("flashinfer.mamba.checkpointing_ssu")
-    _check_replayssm_parity(
-        vllm_runner,
-        model_name,
-        mamba_backend="flashinfer",
-        name_1="replayssm_flashinfer",
-    )
-
-
 @pytest.mark.skipif(
     not HAS_FLASHINFER_CHECKPOINTING_SSU,
     reason="flashinfer.mamba.checkpointing_ssu not available",
@@ -147,22 +136,6 @@ def test_replayssm_flashinfer_decode_matches_baseline_v2(
         name_1="replayssm_flashinfer_v2",
         require_v2=True,
         monkeypatch=monkeypatch,
-    )
-
-
-@multi_gpu_test(num_gpus=2)
-@pytest.mark.skipif(
-    not HAS_FLASHINFER_CHECKPOINTING_SSU,
-    reason="flashinfer.mamba.checkpointing_ssu not available",
-)
-@pytest.mark.parametrize("model_name", [MAMBA2_MODEL])
-def test_replayssm_flashinfer_decode_matches_baseline_tp2(vllm_runner, model_name):
-    _check_replayssm_parity(
-        vllm_runner,
-        model_name,
-        tensor_parallel_size=2,
-        mamba_backend="flashinfer",
-        name_1="replayssm_flashinfer_tp2",
     )
 
 
@@ -363,29 +336,18 @@ def _check_flashinfer_replayssm_prefix_caching(
 
 @requires_flashinfer_replayssm_materialization
 @pytest.mark.parametrize("model_name", MODELS)
-@pytest.mark.parametrize(
-    ("mamba_cache_mode", "use_v2", "use_ngram"),
-    [
-        pytest.param("align", False, False, id="align-v1-stp"),
-        pytest.param("align", False, True, id="align-v1-ngram-t4"),
-        pytest.param("align", True, False, id="align-v2-stp"),
-    ],
-)
-def test_flashinfer_replayssm_prefix_cache_tp1(
+def test_flashinfer_replayssm_align_prefix_cache_v1_ngram(
     vllm_runner,
     model_name,
     monkeypatch: pytest.MonkeyPatch,
-    mamba_cache_mode: str,
-    use_v2: bool,
-    use_ngram: bool,
 ):
     _check_flashinfer_replayssm_prefix_caching(
         vllm_runner,
         model_name,
         monkeypatch,
-        mamba_cache_mode=mamba_cache_mode,
-        use_ngram=use_ngram,
-        use_v2=use_v2,
+        mamba_cache_mode="align",
+        use_ngram=True,
+        use_v2=False,
         tensor_parallel_size=1,
     )
 

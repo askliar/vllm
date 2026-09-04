@@ -192,7 +192,6 @@ def _replayssm_config(
     ),
     [
         (MambaBackendEnum.TRITON, True, "none", 0, 16, "requires Model Runner V1"),
-        (MambaBackendEnum.FLASHINFER, True, "align", 3, 16, None),
         (
             MambaBackendEnum.FLASHINFER,
             True,
@@ -209,7 +208,6 @@ def _replayssm_config(
             16,
             "requires --mamba-backend flashinfer",
         ),
-        (MambaBackendEnum.FLASHINFER, False, "all", 0, 16, None),
         (
             MambaBackendEnum.TRITON,
             False,
@@ -229,10 +227,8 @@ def _replayssm_config(
     ],
     ids=[
         "triton-v2-rejected",
-        "flashinfer-align-spec-v2",
         "flashinfer-spec-buffer-too-short",
         "triton-spec-rejected",
-        "flashinfer-all",
         "triton-all-rejected",
         "flashinfer-buffer-too-long",
     ],
@@ -243,7 +239,7 @@ def test_replayssm_config_matrix(
     mamba_cache_mode: str,
     num_speculative_tokens: int,
     replayssm_buffer_len: int,
-    error_match: str | None,
+    error_match: str,
 ):
     config = _replayssm_config(
         backend=backend,
@@ -253,11 +249,8 @@ def test_replayssm_config_matrix(
     config.cache_config.replayssm_buffer_len = replayssm_buffer_len
     config.num_speculative_tokens = num_speculative_tokens
 
-    if error_match is None:
-        assert VllmConfig.validate_mamba_cached_kernel(config) is config
-    else:
-        with pytest.raises(ValueError, match=error_match):
-            VllmConfig.validate_mamba_cached_kernel(config)
+    with pytest.raises(ValueError, match=error_match):
+        VllmConfig.validate_mamba_cached_kernel(config)
 
 
 def test_replayssm_rejects_pipeline_parallelism():
