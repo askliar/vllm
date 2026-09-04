@@ -133,8 +133,11 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._needs_prefix_state_migration:
             # Seed the running state block from the resumed/prefilled position.
-            state_block_size = self.cache_config.mamba_block_size
-            assert state_block_size is not None
+            state_block_size = self.cache_config.block_size
+            if self._use_flashinfer_replayssm:
+                mamba_block_size = self.cache_config.mamba_block_size
+                assert mamba_block_size is not None
+                state_block_size = mamba_block_size
             self._mamba_state_idx_gpu[req_index].fill_(
                 (new_req_data.num_computed_tokens - 1) // state_block_size
             )

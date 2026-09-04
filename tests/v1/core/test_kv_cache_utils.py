@@ -1284,7 +1284,7 @@ def test_project_kv_cache_groups_to_worker():
     spec_b = new_kv_cache_spec(num_kv_heads=4)
 
     global_groups = [
-        KVCacheGroupSpec(["layer1", "layer2", "layer3"], spec_a, is_eagle_group=True),
+        KVCacheGroupSpec(["layer1", "layer2", "layer3"], spec_a),
     ]
     worker_spec = {"layer1": spec_a, "layer2": spec_a}
     projected = kv_cache_utils._project_kv_cache_groups_to_worker(
@@ -1300,7 +1300,6 @@ def test_project_kv_cache_groups_to_worker():
     assert len(projected) == 1
     assert projected[0].layer_names == []
     assert projected[0].kv_cache_spec is spec_a
-    assert projected[0].is_eagle_group
 
     uniform_spec = UniformTypeKVCacheSpecs(
         block_size=16,
@@ -3284,14 +3283,21 @@ def test_iter_layer_specs_returns_group_members():
     assert list(iter_layer_specs(wrapped)) == [full, mla]
 
 
-def _spec_decode_grouping_config(method="dspark", model_type=None):
+def _spec_decode_grouping_config(
+    method="dspark",
+    model_type=None,
+    use_replayssm=False,
+    use_kda_recoverssm=False,
+):
     """Grouping config with an EAGLE-family speculative method enabled."""
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         cache_config=SimpleNamespace(
+            use_replayssm=use_replayssm,
+            use_kda_recoverssm=use_kda_recoverssm,
             get_resolved_kv_cache_layout=lambda: SimpleNamespace(
                 is_block_outermost=True
-            )
+            ),
         ),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
         speculative_config=SimpleNamespace(
@@ -3363,11 +3369,32 @@ def test_draft_group_not_annotated_without_spec_decode():
     assert not any(g.is_eagle_group for g in groups)
 
 
-def test_unidentifiable_draft_flags_only_non_mamba_groups():
-    # When no group carries a draft marker, retain the conservative fallback
-    # for attention while excluding Mamba state from the widened lookup window.
+@pytest.mark.parametrize(
+    ("use_replayssm", "use_kda_recoverssm"), [(False, False), (True, True)]
+)
+def test_unidentifiable_draft_with_mamba_warns(
+    caplog_vllm, use_replayssm, use_kda_recoverssm
+):
+    # Baseline behavior remains unchanged when ReplaySSM is not enabled.
     groups = get_kv_cache_groups(
-        _spec_decode_grouping_config(), _hybrid_specs_with_draft(draft=False)
+        _spec_decode_grouping_config(
+            use_replayssm=use_replayssm,
+            use_kda_recoverssm=use_kda_recoverssm,
+        ),
+        _hybrid_specs_with_draft(draft=False),
+    )
+
+    assert not any(g.is_eagle_group for g in groups)
+    assert "no KV cache group could be identified as the draft model's" in (
+        caplog_vllm.text
+    )
+    assert "Mamba groups" in caplog_vllm.text
+
+
+def test_replayssm_unidentifiable_draft_flags_only_non_mamba_groups():
+    groups = get_kv_cache_groups(
+        _spec_decode_grouping_config(use_replayssm=True),
+        _hybrid_specs_with_draft(draft=False),
     )
 
     for group in groups:
@@ -3376,6 +3403,14 @@ def test_unidentifiable_draft_flags_only_non_mamba_groups():
             for spec in iter_layer_specs(group.kv_cache_spec)
         )
         assert group.is_eagle_group is not contains_mamba
+
+
+def test_no_warning_when_draft_group_is_identified(caplog_vllm):
+    get_kv_cache_groups(
+        _spec_decode_grouping_config(), _hybrid_specs_with_draft(draft=True)
+    )
+
+    assert "could be identified as the draft model's" not in caplog_vllm.text
 
 
 def _deepseek_v4_specs(model_version="deepseek_v4"):
