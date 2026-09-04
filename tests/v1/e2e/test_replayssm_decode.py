@@ -266,6 +266,13 @@ PREFIX_CACHING_PROMPTS = [
     _PC_PREFIX + "Surprisingly, the experiments showed that",
     _PC_PREFIX + "The most important conclusion was that",
 ]
+# All-mode MTP must cache at least two full state blocks: the drafter drops
+# the volatile trailing block before resuming from the preceding boundary.
+_PC_MTP_PREFIX = _PC_SENTENCE * 240
+MTP_PREFIX_CACHING_PROMPTS = [
+    _PC_MTP_PREFIX + prompt.removeprefix(_PC_PREFIX)
+    for prompt in PREFIX_CACHING_PROMPTS
+]
 
 
 def _prefix_cache_hits(llm) -> int:
@@ -405,7 +412,7 @@ def test_flashinfer_replayssm_all_prefix_cache(vllm_runner, monkeypatch, use_v2:
 @large_gpu_mark(min_gb=40)
 def test_flashinfer_replayssm_all_prefix_cache_mtp_v2(vllm_runner, monkeypatch):
     common = dict(
-        max_model_len=8192,
+        max_model_len=12288,
         trust_remote_code=True,
         enable_prefix_caching=True,
         enable_chunked_prefill=True,
@@ -426,11 +433,11 @@ def test_flashinfer_replayssm_all_prefix_cache_mtp_v2(vllm_runner, monkeypatch):
             ) as llm:
                 assert llm.llm.llm_engine.vllm_config.use_v2_model_runner
                 first_pass = llm.generate_greedy_logprobs(
-                    PREFIX_CACHING_PROMPTS, max_tokens=32, num_logprobs=5
+                    MTP_PREFIX_CACHING_PROMPTS, max_tokens=32, num_logprobs=5
                 )
                 first_pass_hits = _prefix_cache_hits(llm)
                 cached = llm.generate_greedy_logprobs(
-                    PREFIX_CACHING_PROMPTS, max_tokens=32, num_logprobs=5
+                    MTP_PREFIX_CACHING_PROMPTS, max_tokens=32, num_logprobs=5
                 )
                 cached_hits = _prefix_cache_hits(llm)
                 draft_count = sum(
