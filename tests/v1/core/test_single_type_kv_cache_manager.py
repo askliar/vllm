@@ -103,14 +103,15 @@ def test_mamba_speculative_block_relocation_requires_exclusive_ownership():
         manager._relocate_speculative_block([pinned_block], 0)
 
 
-def test_replayssm_queues_live_copy_for_new_state_block():
+@pytest.mark.parametrize("mamba_cache_mode", ["align", "all"])
+def test_replayssm_queues_live_copy_for_new_state_block(mamba_cache_mode: str):
     spec = MambaSpec(
         block_size=4,
         shapes=((2,), (3,)),
         dtypes=(torch.float32, torch.float32),
         replayssm_shapes=((4,), (5,), (6,)),
         replayssm_dtypes=(torch.float32,) * 3,
-        mamba_cache_mode="all",
+        mamba_cache_mode=mamba_cache_mode,
     )
     block_pool = BlockPool(num_gpu_blocks=6, enable_caching=True, hash_block_size=4)
     manager = MambaManager(

@@ -336,18 +336,27 @@ def _check_flashinfer_replayssm_prefix_caching(
 
 @requires_flashinfer_replayssm_materialization
 @pytest.mark.parametrize("model_name", MODELS)
-def test_flashinfer_replayssm_align_prefix_cache_v1_ngram(
+@pytest.mark.parametrize(
+    ("use_v2", "use_ngram"),
+    [
+        pytest.param(False, True, id="align-v1-ngram-t4"),
+        pytest.param(True, False, id="align-v2-stp"),
+    ],
+)
+def test_flashinfer_replayssm_prefix_cache_tp1(
     vllm_runner,
     model_name,
     monkeypatch: pytest.MonkeyPatch,
+    use_v2: bool,
+    use_ngram: bool,
 ):
     _check_flashinfer_replayssm_prefix_caching(
         vllm_runner,
         model_name,
         monkeypatch,
         mamba_cache_mode="align",
-        use_ngram=True,
-        use_v2=False,
+        use_ngram=use_ngram,
+        use_v2=use_v2,
         tensor_parallel_size=1,
     )
 

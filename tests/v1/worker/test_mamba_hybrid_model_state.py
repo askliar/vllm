@@ -59,6 +59,47 @@ def test_postprocess_state_scalar_with_int32_mapping(
     torch.testing.assert_close(state.num_accepted_tokens_gpu, expected)
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = True
+    state._needs_prefix_state_migration = True
+    state._use_flashinfer_replayssm = True
+    state.recoverssm = None
+    state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32, device="cuda")
+    state._mamba_state_idx_gpu = torch.zeros(4, dtype=torch.int32, device="cuda")
+    state._is_prefilling_gpu = torch.zeros(4, dtype=torch.bool, device="cuda")
+    state._replayssm_query_start_loc = torch.tensor(
+        [0, 4], dtype=torch.int32, device="cuda"
+    )
+    replayssm = Mock(materialize_prefixes=True)
+    accepted_snapshot = torch.zeros(4, dtype=torch.int32, device="cuda")
+    ctx = Mock(
+        is_initialized=True,
+        replayssm=replayssm,
+        num_accepted_tokens_snapshot=accepted_snapshot,
+    )
+
+    def normalize_live(*_args) -> None:
+        accepted_snapshot.copy_(state.num_accepted_tokens_gpu)
+        state.num_accepted_tokens_gpu[2] = 1
+
+    ctx.run_fused_postprocess_align.side_effect = normalize_live
+    state._mamba_ctx = ctx
+
+    state.postprocess_state(
+        torch.tensor([2], dtype=torch.int32, device="cuda"),
+        torch.tensor([3], dtype=torch.int32, device="cuda"),
+        num_computed_tokens=torch.tensor([0, 0, 8, 0], device="cuda"),
+    )
+
+    kwargs = replayssm.postprocess.call_args.kwargs
+    assert kwargs["num_accepted_tokens"] is accepted_snapshot
+    assert accepted_snapshot[2].item() == 3
+    assert state.num_accepted_tokens_gpu[2].item() == 1
+    assert state._replayssm_query_start_loc is None
+
+
 def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
     state = RecoverSSMState()
     metadata = Mock(spec=RecoverSSMMetadata)
