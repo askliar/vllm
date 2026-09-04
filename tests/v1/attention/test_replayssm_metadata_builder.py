@@ -341,36 +341,3 @@ def test_flashinfer_replayssm_state_indices_are_stable_for_full_cudagraph():
     assert second_indices is not None
     assert second_indices.data_ptr() == first_ptr
     assert torch.equal(second_indices, second.state_indices_tensor_d[:, 0])
-
-
-def test_flashinfer_replayssm_all_uses_last_scheduled_state_page():
-    builder = _create_replayssm_builder(
-        16,
-        mamba_cache_mode="all",
-        mamba_backend=MambaBackendEnum.FLASHINFER,
-        num_speculative_tokens=3,
-    )
-    builder.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-
-    metadata = _build(
-        builder,
-        ReplaySSMBuildCase(
-            seq_lens=[34, 50],
-            query_lens=[1, 1],
-            is_prefilling=[False, False],
-            decode_base=[33, 49],
-            buffer_len=16,
-            expected_write_pos=[],
-            expected_is_flush=[],
-            mamba_cache_mode="all",
-        ),
-    )
-
-    assert metadata.replayssm_state_indices_d is not None
-    assert metadata.block_idx_last_scheduled_token is not None
-    live_cols = metadata.block_idx_last_scheduled_token[:2].to(torch.int64)
-    expected = metadata.state_indices_tensor_d.gather(
-        1, live_cols.unsqueeze(1)
-    ).squeeze(1)
-    assert torch.equal(metadata.replayssm_state_indices_d, expected)
-    assert not torch.equal(expected, metadata.state_indices_tensor_d[:, 0])

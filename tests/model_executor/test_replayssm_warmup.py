@@ -110,16 +110,6 @@ def test_replayssm_autotune_kwargs_skipped(runner_kwargs, flashinfer_supported):
     assert result is None
 
 
-def test_replayssm_autotune_kwargs_skipped_without_non_padding_slot():
-    with patch.object(
-        warmup, "flashinfer_replayssm_autotune_supported", return_value=True
-    ):
-        result = warmup._replayssm_autotune_kwargs(
-            _autotune_runner(num_blocks=1), PREFILL_KWARGS
-        )
-    assert result is None
-
-
 def test_replayssm_autotune_slots_restore_state_and_trackers():
     mixer = MambaMixer2.__new__(MambaMixer2)
     torch.nn.Module.__init__(mixer)

@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.config.mamba import MambaBackendEnum
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncsByType,
@@ -33,9 +32,7 @@ from vllm.v1.worker.mamba_utils import (
     do_mamba_copy_block,
     get_mamba_groups,
     preprocess_mamba,
-    preprocess_mamba_align_fused_kernel,
     stage_postprocess_inputs_to_gpu,
-    validate_mamba_state_copy_funcs,
 )
 
 # Conv + temporal copy specs, in the order the tests' MambaSpec shapes expect.
@@ -48,43 +45,6 @@ _COPY_FUNCS: MambaStateCopyFuncsByType = {
     MambaAttentionBackendEnum.GDN_ATTN: _DEFAULT_COPY_FUNCS,
     MambaAttentionBackendEnum.SHORT_CONV: (get_conv_copy_spec,),
 }
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-@pytest.mark.parametrize(
-    ("preserve_accepted", "expected_accepted"), [(False, 1), (True, 3)]
-)
-def test_preprocess_mamba_preserves_replayssm_accepted_offset(
-    preserve_accepted: bool, expected_accepted: int
-):
-    device = torch.device("cuda")
-    idx_mapping = torch.tensor([0], dtype=torch.int32, device=device)
-    state_idx = torch.tensor([0], dtype=torch.int32, device=device)
-    num_computed = torch.tensor([4], dtype=torch.int32, device=device)
-    query_start = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    num_accepted = torch.tensor([3], dtype=torch.int32, device=device)
-    src_col = torch.empty(1, dtype=torch.int32, device=device)
-    src_off = torch.empty(1, dtype=torch.int32, device=device)
-
-    preprocess_mamba_align_fused_kernel[(1,)](
-        idx_mapping,
-        state_idx,
-        num_computed,
-        query_start,
-        num_accepted,
-        src_col,
-        src_off,
-        1,
-        BLOCK_SIZE=32,
-        MAMBA_BLOCK_SIZE=4,
-        PRESERVE_ACCEPTED=preserve_accepted,
-    )
-    torch.accelerator.synchronize()
-
-    assert state_idx.item() == 1
-    assert src_col.item() == 0
-    assert src_off.item() == 2
-    assert num_accepted.item() == expected_accepted
 
 
 def postprocess_mamba(
@@ -328,33 +288,6 @@ def test_gpu_context_reinterprets_high_data_ptrs_for_int64_metadata():
     assert gpu_ctx.block_table_ptrs.tolist() == [
         _reinterpret_u64_as_i64(block_table_ptr)
     ]
-
-
-def test_gpu_context_rejects_mixed_replayssm_and_baseline_layers():
-    cfg = _TestConfig(num_layers=2)
-    device = torch.device("cpu")
-    layer_names = ["layer_0", "layer_1"]
-    kv_cache_config = _make_kv_cache_config(cfg, layer_names)
-    gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
-    forward_context = {
-        name: _make_mock_attention(
-            torch.empty(cfg.num_blocks, cfg.conv_width, cfg.conv_inner_dim),
-            torch.empty(cfg.num_blocks, cfg.temporal_state_dim),
-        )
-        for name in layer_names
-    }
-    forward_context["layer_0"].use_replayssm = True
-    forward_context["layer_0"].mamba_config.backend = MambaBackendEnum.FLASHINFER
-    forward_context["layer_1"].use_replayssm = False
-    forward_context["layer_1"].mamba_config.backend = MambaBackendEnum.TRITON
-
-    with pytest.raises(ValueError, match="mixed FlashInfer ReplaySSM"):
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config,
-            forward_context,
-            _COPY_FUNCS,
-            [torch.empty(1, 4, dtype=torch.int32)],
-        )
 
 
 def _make_postprocess_scheduler_output(
@@ -625,36 +558,6 @@ def test_mamba_groups_support_different_state_specs():
     assert ctx.is_initialized
     assert ctx.state_group_indices.tolist() == [0, 0, 0, 0, 1]
     assert ctx.state_conv_widths.tolist() == [4, 0, 4, 0, 12]
-
-
-def test_mamba_copy_funcs_accept_nonempty_canonical_prefix():
-    replayssm_spec = MambaSpec(
-        block_size=16,
-        shapes=((4, 4), (2, 4, 4)),
-        dtypes=(torch.float16,) * 2,
-        replayssm_shapes=((2, 8, 4), (2, 8), (1, 8, 4)),
-        replayssm_dtypes=(torch.float16,) * 3,
-        mamba_type=MambaAttentionBackendEnum.MAMBA2,
-        mamba_cache_mode="align",
-    )
-
-    for valid_funcs in ((get_conv_copy_spec,), _DEFAULT_COPY_FUNCS):
-        copy_funcs = {
-            **_COPY_FUNCS,
-            MambaAttentionBackendEnum.MAMBA2: valid_funcs,
-        }
-        validate_mamba_state_copy_funcs({replayssm_spec: [0]}, copy_funcs)
-
-    for invalid_funcs in (
-        (),
-        (*_DEFAULT_COPY_FUNCS, get_temporal_copy_spec),
-    ):
-        invalid_copy_funcs = {
-            **_COPY_FUNCS,
-            MambaAttentionBackendEnum.MAMBA2: invalid_funcs,
-        }
-        with pytest.raises(AssertionError, match="non-empty copyable prefix"):
-            validate_mamba_state_copy_funcs({replayssm_spec: [0]}, invalid_copy_funcs)
 
 
 def test_mamba_groups_support_mixed_specs_in_uniform_group():

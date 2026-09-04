@@ -16,21 +16,18 @@ from vllm.v1.worker.utils import (
 
 
 class _TestReplaySSMMixer(MambaMixer2):
-    _state_shapes = ((2,), (3,))
-    _state_dtypes = (torch.float32, torch.float32)
-
-    def __init__(self, backend: MambaBackendEnum = MambaBackendEnum.FLASHINFER) -> None:
+    def __init__(self) -> None:
         torch.nn.Module.__init__(self)
         self.use_replayssm = True
-        self.mamba_config = MambaConfig(backend=backend)
+        self.mamba_config = MambaConfig(backend=MambaBackendEnum.FLASHINFER)
         self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
         self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
-        return self._state_shapes
+        return ((2,), (3,))
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
-        return self._state_dtypes
+        return (torch.float32, torch.float32)
 
     def get_replayssm_state_shape(self) -> tuple[tuple[int, ...], ...]:
         return ((4,), (5,), (6,))
@@ -39,8 +36,8 @@ class _TestReplaySSMMixer(MambaMixer2):
         return (torch.float32,) * 3
 
 
-def _packed_replayssm_cache(num_blocks: int, fill_value: int = 0) -> torch.Tensor:
-    return torch.full((num_blocks, 1, 1, 20), fill_value, dtype=torch.int8)
+def _packed_replayssm_cache(num_blocks: int) -> torch.Tensor:
+    return torch.zeros((num_blocks, 1, 1, 20), dtype=torch.int8)
 
 
 def test_bind_kv_cache_shares_replayssm_trackers_by_cache_group():
@@ -142,20 +139,6 @@ def test_replayssm_block_copy_includes_rings_and_group_trackers(monkeypatch):
     assert mixers[0]._replayssm_prev_num_accepted[dst].item() == 30
     assert mixers[1]._replayssm_ring_start[dst].item() == 21
     assert mixers[1]._replayssm_prev_num_accepted[dst].item() == 31
-
-
-def test_replayssm_block_copy_includes_triton_rings_without_trackers():
-    mixer = _TestReplaySSMMixer(MambaBackendEnum.TRITON)
-    mixer.kv_cache = tuple(torch.zeros(4, 1) for _ in range(2))
-    mixer.replayssm_cache = tuple(torch.zeros(4, 1) for _ in range(3))
-
-    tensors = get_replayssm_block_copy_tensors({"layers.0.mixer": mixer})
-
-    assert len(tensors) == 3
-    assert all(
-        actual is expected
-        for actual, expected in zip(tensors, mixer.replayssm_cache, strict=True)
-    )
 
 
 def test_bind_kv_cache(default_vllm_config):

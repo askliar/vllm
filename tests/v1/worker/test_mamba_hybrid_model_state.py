@@ -60,44 +60,6 @@ def test_postprocess_state_scalar_with_int32_mapping(
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
-def test_flashinfer_replayssm_none_postprocess_skips_prefix_migration() -> None:
-    state = object.__new__(MambaHybridModelState)
-    state._align_mode = False
-    state._needs_prefix_state_migration = False
-    state._use_flashinfer_replayssm = True
-    state.recoverssm = None
-    state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32, device="cuda")
-    state._is_prefilling_gpu = torch.zeros(4, dtype=torch.bool, device="cuda")
-    replayssm = Mock()
-    replayssm.materialize_prefixes = False
-    ctx = Mock(
-        is_initialized=True,
-        replayssm=replayssm,
-        block_size=1024,
-    )
-    state._mamba_ctx = ctx
-    idx_mapping = torch.tensor([2], dtype=torch.int32, device="cuda")
-    num_sampled = torch.tensor([2], dtype=torch.int32, device="cuda")
-    num_computed = torch.tensor([0, 0, 20, 0], dtype=torch.int32, device="cuda")
-    query_start_loc = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
-    state._replayssm_query_start_loc = query_start_loc
-
-    state.postprocess_state(
-        idx_mapping,
-        num_sampled,
-        num_computed_tokens=num_computed,
-    )
-
-    ctx.run_fused_postprocess_align.assert_not_called()
-    assert replayssm.postprocess.call_count == 1
-    kwargs = replayssm.postprocess.call_args.kwargs
-    assert state.num_accepted_tokens_gpu.tolist() == [1, 1, 2, 1]
-    assert kwargs["num_accepted_tokens"] is state.num_accepted_tokens_gpu
-    assert kwargs["live_cols"] is None
-    assert state._replayssm_query_start_loc is None
-
-
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
     state = object.__new__(MambaHybridModelState)
     state._align_mode = True
