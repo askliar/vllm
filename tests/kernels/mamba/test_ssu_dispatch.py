@@ -591,7 +591,8 @@ def test_modelwide_replayssm_compacts_sparse_materialization_requests(monkeypatc
 
     assert materializer.call_count == 2
     for group_ctx in ctx.groups:
-        assert group_ctx.plan_flush_count.tolist() == [-1, 1]
+        # Request 1 advances from token 6 to the block boundary at token 8.
+        assert group_ctx.plan_flush_count.tolist() == [-1, 2]
         assert group_ctx.active_request_indices.tolist() == [1, -1]
 
     # A shorter batch clears the compacted active tail. Fixed-capacity plan and
