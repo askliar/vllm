@@ -4487,6 +4487,7 @@ class GPUModelRunner(
                     num_reqs,
                     self.requests,
                     self.mamba_state_idx,
+                    run_prefix_state_migration=self._needs_prefix_state_migration,
                 )
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0

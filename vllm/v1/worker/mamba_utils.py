@@ -1555,16 +1555,17 @@ def preprocess_mamba(
                 # not mistaken for fresh slot ownership.
                 fused.src_col.np[i] = prev_state_idx
 
-        if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
+        if (
+            prev_state_idx != -1
+            and prev_state_idx != curr_state_idx
+            and (fused is None or fused.ctx.replayssm is None)
+        ):
+            accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
             if fused is not None:
-                if fused.ctx.replayssm is None:
-                    accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
-                    assert accept_token_bias >= 0
-                    fused.src_col.np[i] = prev_state_idx
-                    fused.token_bias.np[i] = accept_token_bias
-                    input_batch.num_accepted_tokens_cpu[i] = 1
+                assert accept_token_bias >= 0
+                fused.src_col.np[i] = prev_state_idx
+                fused.token_bias.np[i] = accept_token_bias
             else:
-                accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
                 collect_mamba_copy_meta(
                     copy_bufs,
                     kv_cache_config,
@@ -1576,7 +1577,7 @@ def preprocess_mamba(
                     req_state,
                     forward_context,
                 )
-                input_batch.num_accepted_tokens_cpu[i] = 1
+            input_batch.num_accepted_tokens_cpu[i] = 1
 
     if fused is not None:
         fused.state_idx.copy_to_gpu(num_reqs)
@@ -1732,6 +1733,7 @@ def stage_postprocess_inputs_to_gpu(
     num_reqs: int,
     requests: dict[str, CachedRequestState],
     mamba_state_idx: dict[str, int],
+    run_prefix_state_migration: bool,
 ) -> None:
     """Stage all per-request inputs the fused mamba postprocess kernel reads.
 
@@ -1747,9 +1749,8 @@ def stage_postprocess_inputs_to_gpu(
 
     scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
     num_scheduled = scheduler_output.num_scheduled_tokens
-    stage_live_cols = ctx.replayssm is None or ctx.replayssm.materialize_prefixes
     state_idx_np = None
-    if stage_live_cols:
+    if run_prefix_state_migration:
         assert ctx.mamba_state_idx_buf is not None
         state_idx_np = ctx.mamba_state_idx_buf.np
     scheduled_np = ctx.num_scheduled_tokens_buf.np
@@ -1758,7 +1759,7 @@ def stage_postprocess_inputs_to_gpu(
     prefill_np = ctx.is_prefilling_buf.np
     for i in range(num_reqs):
         req_id = req_ids[i]
-        if stage_live_cols:
+        if run_prefix_state_migration:
             state_idx = mamba_state_idx.get(req_id)
             assert state_idx is not None, (
                 f"mamba_state_idx missing entry for {req_id!r}; "
@@ -1774,7 +1775,7 @@ def stage_postprocess_inputs_to_gpu(
         computed_np[i] = computed
         draft_np[i] = num_draft
         prefill_np[i] = computed < req_state.num_prompt_tokens
-    if stage_live_cols:
+    if run_prefix_state_migration:
         assert ctx.mamba_state_idx_buf is not None
         ctx.mamba_state_idx_buf.copy_to_gpu(num_reqs)
     ctx.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)

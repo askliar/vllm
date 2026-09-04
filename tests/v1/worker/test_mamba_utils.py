@@ -1029,6 +1029,7 @@ def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
         num_reqs,
         requests,
         mamba_state_idx,
+        run_prefix_state_migration=True,
     )
 
     np.testing.assert_array_equal(
@@ -1088,6 +1089,7 @@ def test_stage_postprocess_inputs_to_gpu_asserts_on_missing_state_idx():
             1,
             requests,
             mamba_state_idx,
+            run_prefix_state_migration=True,
         )
 
 
@@ -1115,6 +1117,7 @@ def test_stage_postprocess_inputs_to_gpu_skips_none_mode_live_col():
         2,
         requests,
         {},
+        run_prefix_state_migration=False,
     )
 
     np.testing.assert_array_equal(ctx.mamba_state_idx_buf.np[:2], [17, 17])

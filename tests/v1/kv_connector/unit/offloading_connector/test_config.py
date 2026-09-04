@@ -367,6 +367,36 @@ def test_dcp_scales_attention_but_not_mamba_group_blocks():
     ] == [1, 3]
 
 
+def test_hybrid_eagle_annotation_does_not_change_partial_tail_support():
+    config = _make_vllm_config()
+    config.cache_config.prefix_match_unit = 4
+    config.speculative_config.use_eagle_block_drop.return_value = True
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    unannotated = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+    # The offloader's existing fallback treats every group as an EAGLE group.
+    assert not unannotated.supports_partial_tail
+    assert [group.is_eagle_group for group in unannotated.kv_group_configs] == [
+        True,
+        True,
+    ]
+
+    kv_cache_config.kv_cache_groups[0].is_eagle_group = True
+    annotated = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+    # Explicit classification narrows the volatile set to attention. Partial
+    # tails remain disabled because at least one EAGLE group is still present.
+    assert not annotated.supports_partial_tail
+    assert [group.is_eagle_group for group in annotated.kv_group_configs] == [
+        True,
+        False,
+    ]
+
+
 def test_preserves_data_parallel_config():
     config = _make_vllm_config()
     config.parallel_config.data_parallel_index = 2
