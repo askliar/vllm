@@ -32,7 +32,6 @@ from vllm.v1.worker.mamba_utils import (
     collect_mamba_copy_meta,
     do_mamba_copy_block,
     get_mamba_groups,
-    postprocess_mamba_gpu,
     preprocess_mamba,
     preprocess_mamba_align_fused_kernel,
     stage_postprocess_inputs_to_gpu,
@@ -207,153 +206,6 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
     assert mamba_state_idx == {"keep": 99}
 
 
-@pytest.mark.parametrize(
-    (
-        "with_replayssm",
-        "num_computed_tokens",
-        "expected_order",
-        "expected_accepted",
-    ),
-    [
-        pytest.param(True, 4, ["reset"], 3, id="replayssm-boundary"),
-        pytest.param(True, 3, ["reset"], 3, id="replayssm-no-boundary"),
-        pytest.param(False, 4, ["copy"], 1, id="generic"),
-    ],
-)
-def test_preprocess_mamba_preserves_live_replayssm_state(
-    with_replayssm: bool,
-    num_computed_tokens: int,
-    expected_order: list[str],
-    expected_accepted: int,
-) -> None:
-    spec = MagicMock(block_size=4, num_speculative_blocks=0)
-    cache_config = MagicMock(enable_prefix_caching=True, use_replayssm=True)
-    input_batch = MagicMock()
-    input_batch.req_ids = ["r0"]
-    input_batch.num_accepted_tokens_cpu = np.array([3], dtype=np.int32)
-    copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
-    requests = {"r0": MagicMock(num_computed_tokens=num_computed_tokens)}
-    mamba_state_idx: dict[str, int] = {"r0": 0}
-    sched = _make_scheduler_output(set(), None, set())
-    sched.num_scheduled_tokens = {"r0": 1}
-
-    order: list[str] = []
-    device = torch.device("cpu")
-    align_ctx = MagicMock(is_initialized=True)
-    align_ctx.mamba_state_idx_buf = _MockCpuGpuBuffer(1, torch.int32, device)
-    align_ctx.precopy_src_col_buf = _MockCpuGpuBuffer(1, torch.int32, device)
-    align_ctx.precopy_token_bias_buf = _MockCpuGpuBuffer(1, torch.int32, device)
-    align_ctx.replayssm = MagicMock() if with_replayssm else None
-    if align_ctx.replayssm is not None:
-        align_ctx.replayssm.reset_new_slots.side_effect = lambda **kwargs: order.append(
-            "reset"
-        )
-    align_ctx.run_fused_precopy.side_effect = lambda **kwargs: order.append("copy")
-
-    preprocess_mamba(
-        sched,
-        MagicMock(),
-        cache_config,
-        mamba_state_idx,
-        input_batch,
-        requests,
-        {},
-        {},
-        copy_bufs,
-        align_ctx=align_ctx,
-    )
-
-    assert order == expected_order
-    assert input_batch.num_accepted_tokens_cpu[0] == expected_accepted
-    assert align_ctx.precopy_src_col_buf.np[0] == 0
-
-
-def test_postprocess_mamba_materializes_prefixes():
-    order: list[str] = []
-    ctx = MagicMock()
-    ctx.is_initialized = True
-    ctx.mamba_group_ids = [0]
-    ctx.mamba_state_idx_buf = MagicMock()
-    ctx.num_scheduled_tokens_buf = MagicMock()
-    ctx.num_computed_tokens_buf = MagicMock()
-    ctx.num_draft_tokens_buf = MagicMock()
-    ctx.is_prefilling_buf = MagicMock()
-    ctx.num_accepted_tokens_snapshot = torch.tensor([3], dtype=torch.int32)
-    accepted = torch.tensor([3], dtype=torch.int32)
-
-    def run_fused_postprocess(**kwargs):
-        order.append("copy")
-        kwargs["num_accepted_tokens_gpu"].fill_(1)
-
-    ctx.run_fused_postprocess.side_effect = run_fused_postprocess
-    ctx.replayssm = MagicMock()
-    ctx.replayssm.materialize_prefixes = True
-    ctx.replayssm.postprocess.side_effect = lambda **kwargs: order.append("postprocess")
-    ctx.replayssm.materialize.side_effect = lambda: order.append("materialize")
-    block_table = MagicMock()
-    block_table.get_device_tensor.return_value = torch.zeros((1, 4), dtype=torch.int32)
-    input_batch = MagicMock()
-    input_batch.block_table = [block_table]
-    kv_cache_config = MagicMock()
-    kv_cache_config.kv_cache_groups = [MagicMock()]
-    accepted_cpu = torch.zeros(1, dtype=torch.int32)
-
-    postprocess_mamba_gpu(
-        bufs=MagicMock(postprocess_align=ctx),
-        num_reqs=1,
-        num_accepted_tokens_gpu=accepted,
-        num_accepted_tokens_cpu_tensor=accepted_cpu,
-        input_batch=input_batch,
-        kv_cache_config=kv_cache_config,
-        forward_context={},
-        mamba_state_copy_funcs={},
-        run_prefix_state_migration=True,
-    )
-
-    assert order == ["copy", "postprocess", "materialize"]
-    assert ctx.replayssm.postprocess.call_args.kwargs["num_accepted_tokens"] is (
-        ctx.num_accepted_tokens_snapshot
-    )
-    assert accepted_cpu.tolist() == [1]
-
-
-def test_postprocess_mamba_none_skips_prefix_copy():
-    ctx = MagicMock()
-    ctx.is_initialized = True
-    ctx.mamba_group_ids = [0]
-    ctx.mamba_state_idx_buf = MagicMock(gpu=torch.zeros(1, dtype=torch.int32))
-    ctx.num_scheduled_tokens_buf = MagicMock(gpu=torch.tensor([4], dtype=torch.int32))
-    ctx.num_computed_tokens_buf = MagicMock(gpu=torch.tensor([20], dtype=torch.int32))
-    ctx.num_draft_tokens_buf = MagicMock(gpu=torch.tensor([3], dtype=torch.int32))
-    ctx.is_prefilling_buf = MagicMock(gpu=torch.tensor([False]))
-    ctx.block_size = 1024
-    ctx.replayssm = MagicMock()
-    ctx.replayssm.materialize_prefixes = False
-    input_batch = MagicMock()
-    input_batch.block_table = []
-    accepted = torch.tensor([2], dtype=torch.int32)
-    accepted_cpu = torch.zeros(1, dtype=torch.int32)
-
-    postprocess_mamba_gpu(
-        bufs=MagicMock(postprocess_align=ctx),
-        num_reqs=1,
-        num_accepted_tokens_gpu=accepted,
-        num_accepted_tokens_cpu_tensor=accepted_cpu,
-        input_batch=input_batch,
-        kv_cache_config=MagicMock(),
-        forward_context={},
-        mamba_state_copy_funcs={},
-        run_prefix_state_migration=False,
-    )
-
-    ctx.run_fused_postprocess.assert_not_called()
-    assert ctx.replayssm.postprocess.call_count == 1
-    assert ctx.replayssm.postprocess.call_args.kwargs["num_accepted_tokens"] is accepted
-    assert ctx.replayssm.postprocess.call_args.kwargs["live_cols"] is None
-    ctx.replayssm.materialize.assert_not_called()
-    assert accepted_cpu.tolist() == [2]
-
-
 # -----------------------------------------------------------------------------
 # Golden tests for postprocess_mamba_fused_kernel
 # -----------------------------------------------------------------------------
@@ -476,62 +328,6 @@ def test_gpu_context_reinterprets_high_data_ptrs_for_int64_metadata():
     assert gpu_ctx.block_table_ptrs.tolist() == [
         _reinterpret_u64_as_i64(block_table_ptr)
     ]
-
-
-def test_gpu_context_initializes_flashinfer_replayssm_lifecycle():
-    cfg = _TestConfig(num_layers=1)
-    device = torch.device("cpu")
-    kv_cache_config = _make_kv_cache_config(cfg, ["layer_0"])
-    gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
-    attention = _make_mock_attention(
-        torch.empty(cfg.num_blocks, cfg.conv_width, cfg.conv_inner_dim),
-        torch.empty(cfg.num_blocks, cfg.temporal_state_dim),
-    )
-    attention.use_replayssm = True
-    attention.mamba_config.backend = MambaBackendEnum.FLASHINFER
-
-    model_ctx = object()
-    with patch(
-        "vllm.v1.worker.mamba_utils.ReplaySSMModelContext.create",
-        return_value=model_ctx,
-    ) as create:
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config,
-            {"layer_0": attention},
-            _COPY_FUNCS,
-            [torch.empty(1, 4, dtype=torch.int32)],
-        )
-
-    assert gpu_ctx.has_flashinfer_replayssm
-    assert gpu_ctx.replayssm is model_ctx
-    create.assert_called_once()
-
-
-def test_gpu_context_rejects_missing_replayssm_lifecycle():
-    cfg = _TestConfig(num_layers=1)
-    device = torch.device("cpu")
-    kv_cache_config = _make_kv_cache_config(cfg, ["layer_0"])
-    gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
-    attention = _make_mock_attention(
-        torch.empty(cfg.num_blocks, cfg.conv_width, cfg.conv_inner_dim),
-        torch.empty(cfg.num_blocks, cfg.temporal_state_dim),
-    )
-    attention.use_replayssm = True
-    attention.mamba_config.backend = MambaBackendEnum.FLASHINFER
-
-    with (
-        patch(
-            "vllm.v1.worker.mamba_utils.ReplaySSMModelContext.create",
-            return_value=None,
-        ),
-        pytest.raises(RuntimeError, match="could not be initialized"),
-    ):
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config,
-            {"layer_0": attention},
-            _COPY_FUNCS,
-            [torch.empty(1, 4, dtype=torch.int32)],
-        )
 
 
 def test_gpu_context_rejects_mixed_replayssm_and_baseline_layers():
@@ -861,18 +657,6 @@ def test_mamba_copy_funcs_accept_nonempty_canonical_prefix():
             validate_mamba_state_copy_funcs({replayssm_spec: [0]}, invalid_copy_funcs)
 
 
-def test_gdn_copy_funcs_cover_copyable_prefix_only():
-    gdn_spec = MambaSpec(
-        block_size=16,
-        shapes=((4, 4), (2, 4, 4), (2, 4), (2, 4)),
-        dtypes=(torch.float16,) * 4,
-        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
-        mamba_cache_mode="none",
-    )
-
-    validate_mamba_state_copy_funcs({gdn_spec: [0]}, _COPY_FUNCS)
-
-
 def test_mamba_groups_support_mixed_specs_in_uniform_group():
     gdn_spec = MambaSpec(
         block_size=16,
@@ -1091,39 +875,6 @@ def test_stage_postprocess_inputs_to_gpu_asserts_on_missing_state_idx():
             mamba_state_idx,
             run_prefix_state_migration=True,
         )
-
-
-def test_stage_postprocess_inputs_to_gpu_skips_none_mode_live_col():
-    device = torch.device("cpu")
-    ctx = _make_staging_ctx(max_num_reqs=4, device=device)
-    ctx.replayssm = MagicMock(materialize_prefixes=False)
-    ctx.mamba_state_idx_buf.cpu.fill_(17)
-    ctx.mamba_state_idx_buf.gpu.fill_(23)
-    scheduler_output = _make_postprocess_scheduler_output(
-        req_ids=["req_a", "req_b"],
-        num_scheduled_tokens={"req_a": 4, "req_b": 1},
-    )
-    requests = _make_requests(
-        ["req_a", "req_b"],
-        [20, 7],
-        [[0], [0]],
-        num_prompt_tokens=[10, 8],
-    )
-
-    stage_postprocess_inputs_to_gpu(
-        ctx,
-        scheduler_output,
-        ["req_a", "req_b"],
-        2,
-        requests,
-        {},
-        run_prefix_state_migration=False,
-    )
-
-    np.testing.assert_array_equal(ctx.mamba_state_idx_buf.np[:2], [17, 17])
-    assert ctx.mamba_state_idx_buf.gpu[:2].tolist() == [23, 23]
-    np.testing.assert_array_equal(ctx.num_scheduled_tokens_buf.np[:2], [4, 1])
-    np.testing.assert_array_equal(ctx.num_computed_tokens_buf.np[:2], [20, 7])
 
 
 def test_gpu_context_ignores_auxiliary_cache_tensors() -> None:

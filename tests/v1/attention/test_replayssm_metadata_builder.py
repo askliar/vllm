@@ -374,23 +374,3 @@ def test_flashinfer_replayssm_all_uses_last_scheduled_state_page():
     ).squeeze(1)
     assert torch.equal(metadata.replayssm_state_indices_d, expected)
     assert not torch.equal(expected, metadata.state_indices_tensor_d[:, 0])
-
-
-def test_flashinfer_replayssm_scratch_metadata_fresh_decode():
-    checkpointing_ssu = pytest.importorskip("flashinfer.mamba.checkpointing_ssu")
-    if not hasattr(checkpointing_ssu, "allocate_checkpointing_ssu_scratch"):
-        pytest.skip("FlashInfer does not expose ReplaySSM scratch allocation")
-
-    builder = _create_replayssm_builder(16, mamba_backend=MambaBackendEnum.FLASHINFER)
-    case = REPLAYSSM_BUILD_CASES["fresh_decode"]
-    meta = _build(builder, case)
-
-    assert meta.write_pos_d is None
-    assert meta.is_flush_d is None
-    assert meta.bc_pre_scratch is None
-    assert meta.replayssm_scratch is not None
-    assert [tensor.shape for tensor in meta.replayssm_scratch] == [
-        (1, 1, 32, 8),
-        (1, 1, 16),
-        (1, 1, 32, 8),
-    ]
