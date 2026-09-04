@@ -3283,21 +3283,14 @@ def test_iter_layer_specs_returns_group_members():
     assert list(iter_layer_specs(wrapped)) == [full, mla]
 
 
-def _spec_decode_grouping_config(
-    method="dspark",
-    model_type=None,
-    use_replayssm=False,
-    use_kda_recoverssm=False,
-):
+def _spec_decode_grouping_config(method="dspark", model_type=None):
     """Grouping config with an EAGLE-family speculative method enabled."""
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         cache_config=SimpleNamespace(
-            use_replayssm=use_replayssm,
-            use_kda_recoverssm=use_kda_recoverssm,
             get_resolved_kv_cache_layout=lambda: SimpleNamespace(
                 is_block_outermost=True
-            ),
+            )
         ),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
         speculative_config=SimpleNamespace(
@@ -3369,19 +3362,12 @@ def test_draft_group_not_annotated_without_spec_decode():
     assert not any(g.is_eagle_group for g in groups)
 
 
-@pytest.mark.parametrize(
-    ("use_replayssm", "use_kda_recoverssm"), [(False, False), (True, True)]
-)
-def test_unidentifiable_draft_with_mamba_warns(
-    caplog_vllm, use_replayssm, use_kda_recoverssm
-):
-    # Baseline behavior remains unchanged when ReplaySSM is not enabled.
+def test_unidentifiable_draft_with_mamba_warns(caplog_vllm):
+    # No group carries the draft marker, so every consumer falls back to
+    # flagging all groups -- including Mamba ones, which then can never report
+    # a hit. That is silent today; it must at least be visible.
     groups = get_kv_cache_groups(
-        _spec_decode_grouping_config(
-            use_replayssm=use_replayssm,
-            use_kda_recoverssm=use_kda_recoverssm,
-        ),
-        _hybrid_specs_with_draft(draft=False),
+        _spec_decode_grouping_config(), _hybrid_specs_with_draft(draft=False)
     )
 
     assert not any(g.is_eagle_group for g in groups)
@@ -3389,20 +3375,6 @@ def test_unidentifiable_draft_with_mamba_warns(
         caplog_vllm.text
     )
     assert "Mamba groups" in caplog_vllm.text
-
-
-def test_replayssm_unidentifiable_draft_flags_only_non_mamba_groups():
-    groups = get_kv_cache_groups(
-        _spec_decode_grouping_config(use_replayssm=True),
-        _hybrid_specs_with_draft(draft=False),
-    )
-
-    for group in groups:
-        contains_mamba = any(
-            isinstance(spec, MambaSpec)
-            for spec in iter_layer_specs(group.kv_cache_spec)
-        )
-        assert group.is_eagle_group is not contains_mamba
 
 
 def test_no_warning_when_draft_group_is_identified(caplog_vllm):

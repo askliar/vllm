@@ -1839,7 +1839,7 @@ def _annotate_eagle_groups(
 ) -> None:
     """Flag the KV cache groups that hold drafter attention layers.
 
-    Three detection rules, in order of preference:
+    Two detection rules, in order of preference:
 
     1. Spec-driven. ``non_causal_multi_token_decode`` is declared on
        MLAAttentionSpec and set by drafter attention layers that run a
@@ -1857,10 +1857,6 @@ def _annotate_eagle_groups(
        ``use_deepseek_v4_fallback`` False. The caller gates this fallback on
        the configured model type.
        FIXME(yifan): avoid/generalize this hacky check.
-    3. ReplaySSM hybrid fallback. If neither rule identifies a draft group,
-       flag every non-Mamba group only for Mamba ReplaySSM. This avoids applying
-       the downstream widened lookup window to ReplaySSM state without changing
-       the baseline hybrid-cache fallback.
 
     Args:
         vllm_config: Config supplying the speculative method, if any.
@@ -1880,31 +1876,13 @@ def _annotate_eagle_groups(
         ):
             group.is_eagle_group = True
 
-    if use_deepseek_v4_fallback:
-        last_layer = next(reversed(kv_cache_spec))
-        for group in kv_cache_groups:
-            if last_layer in group.layer_names:
-                group.is_eagle_group = True
-                break
-
-    cache_config = vllm_config.cache_config
-    if (
-        any(group.is_eagle_group for group in kv_cache_groups)
-        or not cache_config.use_replayssm
-        or cache_config.use_kda_recoverssm
-    ):
+    if not use_deepseek_v4_fallback:
         return
-    non_mamba_groups = [
-        group
-        for group in kv_cache_groups
-        if not any(
-            isinstance(spec, MambaSpec)
-            for spec in iter_layer_specs(group.kv_cache_spec)
-        )
-    ]
-    if len(non_mamba_groups) < len(kv_cache_groups):
-        for group in non_mamba_groups:
+    last_layer = next(reversed(kv_cache_spec))
+    for group in kv_cache_groups:
+        if last_layer in group.layer_names:
             group.is_eagle_group = True
+            break
 
 
 def _warn_if_unannotated_eagle_mamba(

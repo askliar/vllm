@@ -411,8 +411,10 @@ def postprocess_mamba_fused_kernel(
     # PRECOMPUTED_NEW_COMPUTED: when True, num_computed_tokens_ptr already holds
     # the post-step new_num_computed value (V2 supplies the advanced count).
     PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
-    # FlashInfer ReplaySSM owns temporal state, while this kernel continues to
-    # snapshot convolution state at the same block boundary.
+    # FlashInfer ReplaySSM migrates temporal state through its ring materializer.
+    # Skip the generic temporal copy in that case so it cannot overwrite the
+    # ReplaySSM-owned transition; canonical convolution state still needs the
+    # generic snapshot at the same block boundary.
     SKIP_TEMPORAL_STATE_COPY: tl.constexpr = False,
     # TEMPORAL_TILES: when > 1, the temporal copy body is partitioned across
     # TEMPORAL_TILES CTAs along the u64 inner range. Callers must launch a
@@ -481,8 +483,10 @@ def postprocess_mamba_fused_kernel(
         return
 
     if SKIP_TEMPORAL_STATE_COPY:
-        # state_conv_widths is also the state-kind metadata: convolution widths
-        # are positive, while zero explicitly denotes a temporal state.
+        # The flattened metadata interleaves convolution and temporal states.
+        # state_conv_widths doubles as the state-kind tag: a positive width is
+        # canonical convolution state, while zero marks ReplaySSM-owned temporal
+        # state and must bypass _copy_mamba_state_block.
         conv_width = tl.load(state_conv_widths_ptr + state_idx)
         if conv_width == 0:
             return
@@ -533,9 +537,11 @@ def preprocess_mamba_align_fused_kernel(
       2. Store the pre-copy src columns for ``precopy_mamba_align_fused_kernel``:
          - src_col = state_idx (the previous running block column)
          - src_off = max(num_accepted - 1, 0) (the accepted-token bias)
-      3. Advance state_idx to the new running block. Baseline Mamba resets
-         num_accepted after shifting its state; exact ReplaySSM block copies
-         preserve it so the copied live slot keeps the same accepted position.
+      3. Advance state_idx to the new running block. Unless PRESERVE_ACCEPTED is
+         set, reset num_accepted to 1 when the block changes: the migrated state
+         now sits at the start of the new block and must be read with the neutral
+         accepted-token bias. ReplaySSM block copies preserve the accepted count
+         because its copied live slot retains the same ring position.
     """
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < num_reqs
@@ -841,8 +847,9 @@ class MambaSpecDecodeGPUContext:
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
-    # True when the model-wide FlashInfer ReplaySSM lifecycle owns temporal
-    # state. Mixed ReplaySSM/baseline Mamba layers are rejected at populate time.
+    # False for the ordinary hybrid spec-decode state-copy context. True only
+    # when model-wide FlashInfer ReplaySSM owns temporal state; mixed ReplaySSM
+    # and baseline Mamba layers are rejected at populate time.
     has_flashinfer_replayssm: bool = False
     # Persistent all-layer ReplaySSM descriptors, populated with the cache
     # addresses on first real forward. None for non-FlashInfer configurations.
@@ -1520,6 +1527,8 @@ def preprocess_mamba(
             )
 
         fused.src_col.np[:num_reqs] = -1
+        # ReplaySSM reset consumes only source/destination columns. token_bias
+        # belongs to the generic pre-copy kernel, which ReplaySSM does not call.
         if fused.ctx.replayssm is None:
             fused.token_bias.np[:num_reqs] = 0
 
@@ -1555,6 +1564,9 @@ def preprocess_mamba(
                 # not mistaken for fresh slot ownership.
                 fused.src_col.np[i] = prev_state_idx
 
+        # Baseline Mamba migrates canonical state when ownership crosses a
+        # column. ReplaySSM receives that ownership move through scheduler block
+        # copies and uses src/dst only to reset genuinely fresh ring slots.
         if (
             prev_state_idx != -1
             and prev_state_idx != curr_state_idx
@@ -1661,13 +1673,15 @@ def postprocess_mamba_gpu(
     mamba_state_copy_funcs: MambaStateCopyFuncsByType,
     run_prefix_state_migration: bool,
 ) -> None:
-    """Run model-wide Mamba state maintenance after token acceptance.
+    """Publish accepted-token results to model-wide Mamba state.
 
-    Lazily binds the fused-kernel context to the persistent block tables and
-    forward-context state pointers on the first call. Prefix modes run the
-    generic state-copy planner before committing ReplaySSM trackers; mode none
-    commits only the trackers. The accepted counts are then copied back for any
-    CPU-side consumer on the next iteration.
+    The first call binds persistent block tables and state pointers. When prefix
+    migration is enabled, the fused kernel snapshots the original accepted
+    counts, copies canonical state at crossed boundaries, and normalizes the live
+    counts for the next step. ReplaySSM then commits its group-shared trackers
+    from the original counts and materializes any planned prefix snapshots; mode
+    ``none`` skips the copy phase and commits directly. Finally, the normalized
+    live counts are copied back only when the next iteration has a CPU consumer.
     """
     ctx = bufs.postprocess_align
     # The caller enables this context for spec-decode hybrid state copies or
@@ -1735,12 +1749,13 @@ def stage_postprocess_inputs_to_gpu(
     mamba_state_idx: dict[str, int],
     run_prefix_state_migration: bool,
 ) -> None:
-    """Stage all per-request inputs the fused mamba postprocess kernel reads.
+    """Stage the per-request decisions consumed after token acceptance.
 
-    Walks ``req_ids[:num_reqs]`` once, writing each request's mamba block
-    index and scheduled/computed/draft token counts into the matching pinned
-    numpy views, then issues non-blocking H→D copies. Mode ``none`` does not
-    stage a live column because ReplaySSM's live state is always column zero.
+    One host pass writes scheduled, computed, draft, and prefill values into
+    pinned views shared by generic Mamba postprocess and ReplaySSM tracker
+    publication, then launches non-blocking H→D copies. Prefix migration also
+    stages the live Mamba column used by the copy planner and ReplaySSM; mode
+    ``none`` omits it because ReplaySSM live state remains in column zero.
     """
     assert ctx.num_scheduled_tokens_buf is not None
     assert ctx.num_computed_tokens_buf is not None

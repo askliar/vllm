@@ -937,8 +937,9 @@ def _run_mamba_prefix_cache_mrv1_configured(
 def _run_mamba_prefix_cache_mrv1(
     monkeypatch: pytest.MonkeyPatch, async_scheduling: bool
 ):
-    # This test patches the V1 model runner, so pin V1 explicitly: MoE/hybrid
-    # models like Qwen3-Next now default to the V2 runner.
+    # The test patches V1 runner methods, while Qwen3-Next now defaults to V2.
+    # Scope the V1 override to this call, then clear the cached env value after
+    # monkeypatch restores it so following tests see the original runner choice.
     try:
         with monkeypatch.context() as patch:
             patch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
@@ -1239,6 +1240,9 @@ def _run_mamba_prefix_cache_mrv2_configured(
 def _run_mamba_prefix_cache_mrv2(
     monkeypatch: pytest.MonkeyPatch, async_scheduling: bool
 ):
+    # The test patches V2 runner methods in this process, so disable engine-core
+    # multiprocessing and select V2 only for this call. Clear the cached env
+    # values after monkeypatch restores them to avoid leaking either override.
     try:
         with monkeypatch.context() as patch:
             patch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
