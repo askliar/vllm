@@ -1718,6 +1718,13 @@ def postprocess_mamba_gpu(
         )
         accepted_tokens_for_postprocess = ctx.num_accepted_tokens_snapshot
     if ctx.replayssm is not None:
+        # Keep this separate from run_fused_postprocess: that kernel is a
+        # per-(request, canonical-state, tile) copy and is skipped when prefix
+        # migration is disabled. ReplaySSM must instead publish its shared
+        # per-(request, cache-group) ring trackers in every cache mode, then
+        # optionally compact/materialize one plan per group. Folding the two
+        # would either duplicate tracker writes for every state tensor or make
+        # the generic Mamba kernel depend on FlashInfer-only group descriptors.
         ctx.replayssm.postprocess(
             idx_mapping=None,
             query_metadata=ctx.num_scheduled_tokens_buf.gpu,

@@ -1372,8 +1372,16 @@ class MambaManager(SingleTypeKVCacheManager):
         self.block_size = kv_cache_spec.block_size
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        # ``replayssm_shapes`` means that this group's temporal state includes
+        # ReplaySSM rings indexed by the scheduler's physical block IDs. When
+        # allocation moves a request's live block, those rings and their
+        # trackers must move with it; otherwise the next forward reads the new
+        # block ID with the previous live history left behind. Both Triton and
+        # FlashInfer ReplaySSM use this scheduler-level migration path.
         self._copy_replayssm_live_state = bool(kv_cache_spec.replayssm_shapes)
         if self._copy_replayssm_live_state:
+            # ReplaySSM stores speculative history inside its ring. It must not
+            # also reserve the baseline Mamba speculative scratch blocks.
             assert self.num_speculative_blocks == 0, (
                 "ReplaySSM keeps speculative state in its replay rings, not "
                 "separate scheduler blocks"
@@ -1676,6 +1684,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 return super().allocate_new_blocks(
                     request_id, num_tokens, num_tokens_main_model
                 )
+            # The base allocator may append a new final block. Remember the
+            # current live owner before it mutates req_blocks so the worker can
+            # copy the complete ReplaySSM state into that new write slot.
+            # For a partial cache hit, the hit block—not the request's old
+            # tail—is the state source.
             req_blocks = self.req_to_blocks[request_id]
             prev_block_len = len(req_blocks)
             partial_hit = self._partial_hit_reqs.get(request_id)
@@ -1709,6 +1722,9 @@ class MambaManager(SingleTypeKVCacheManager):
             has_partial_hit = partial_hit is not None
             live_source = None
             if self._copy_replayssm_live_state:
+                # Capture the live state owner before align-mode allocation
+                # relocates/nulls table entries. The eventual destination is
+                # the last new block, where the next forward writes state.
                 if partial_hit is not None:
                     live_source = partial_hit[1]
                 elif prev_block_len > 0:
@@ -1811,7 +1827,14 @@ class MambaManager(SingleTypeKVCacheManager):
         source_block: KVCacheBlock | None,
         destination_block: KVCacheBlock,
     ) -> None:
-        """Queue and retain one complete live ReplaySSM slot migration."""
+        """Queue and retain one complete live ReplaySSM slot migration.
+
+        Reuse the existing CoW copy channel because the worker already applies
+        each queued physical-block pair to every cache tensor registered for
+        this group, including ReplaySSM rings and trackers. The extra references
+        keep both slots alive until the coordinator drains and executes the
+        copy; the scheduler releases those retained references afterward.
+        """
         if (
             source_block is None
             or source_block.is_null
