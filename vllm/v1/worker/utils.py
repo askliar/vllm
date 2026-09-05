@@ -11,7 +11,6 @@ import numpy as np
 import torch
 
 from vllm.config import CacheConfig, VllmConfig
-from vllm.config.mamba import MambaBackendEnum
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import share_replayssm_ring_trackers
@@ -445,7 +444,7 @@ def allocate_replayssm_caches(
     kv_cache_config: KVCacheConfig,
     device: torch.device,
 ) -> dict[str, tuple[torch.Tensor, ...]]:
-    """Allocate ReplaySSM ring state separately from canonical Mamba pages."""
+    """Allocate FlashInfer ReplaySSM rings outside canonical Mamba pages."""
     caches: dict[str, tuple[torch.Tensor, ...]] = {}
     for group in kv_cache_config.kv_cache_groups:
         group_spec = group.kv_cache_spec
@@ -740,27 +739,24 @@ def copy_kv_cache_blocks_inplace(
 def get_replayssm_block_copy_tensors(
     forward_context: Mapping[str, Any],
 ) -> list[torch.Tensor]:
-    """Collect ReplaySSM-owned state that must follow scheduler block copies.
+    """Collect FlashInfer ReplaySSM state for scheduler block copies.
 
     The runner's normal KV-cache list already contains canonical convolution
-    and SSM state. ReplaySSM ring caches use separate allocations on every
-    backend, so they are added here. FlashInfer additionally keeps its ring
-    position and accepted-token trackers in separate group-shared tensors;
-    the block-copy helper deduplicates those aliases by storage.
+    and SSM state. Triton ReplaySSM retains its packed five-state cache page, so
+    normal block copies already include its rings. FlashInfer keeps both rings
+    and group-shared trackers in separate allocations; the block-copy helper
+    deduplicates layer aliases by storage.
     """
     extra_tensors: list[torch.Tensor] = []
     for layer in forward_context.values():
-        if not getattr(layer, "use_replayssm", False):
+        if not getattr(layer, "use_flashinfer_replayssm", False):
             continue
         extra_tensors.extend(layer.replayssm_cache)
-        mamba_config = getattr(layer, "mamba_config", None)
-        backend = getattr(mamba_config, "backend", None)
-        if backend == MambaBackendEnum.FLASHINFER:
-            # Group-shared trackers appear once per layer; the block-copy helper
-            # deduplicates them by (device, data_ptr()).
-            extra_tensors.extend(
-                (layer._replayssm_ring_start, layer._replayssm_prev_num_accepted)
-            )
+        # Group-shared trackers appear once per layer; the block-copy helper
+        # deduplicates them by (device, data_ptr()).
+        extra_tensors.extend(
+            (layer._replayssm_ring_start, layer._replayssm_prev_num_accepted)
+        )
     return extra_tensors
 
 

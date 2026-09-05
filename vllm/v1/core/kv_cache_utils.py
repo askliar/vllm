@@ -1815,19 +1815,40 @@ def _get_packed_kv_cache_groups(
         vllm_config,
         kv_cache_spec,
         groups,
-        use_deepseek_v4_fallback=_is_deepseek_v4_eagle(vllm_config),
+        use_last_registered_draft_fallback=(
+            _uses_last_registered_draft_layer(vllm_config)
+        ),
     )
     _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
 
-def _is_deepseek_v4_eagle(vllm_config: VllmConfig) -> bool:
+def _uses_last_registered_draft_layer(vllm_config: VllmConfig) -> bool:
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_eagle():
         return False
-    model_config = vllm_config.model_config
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None:
+        return False
+    model_type = model_config.hf_config.model_type
+    # DeepSeekV4 uses this ordering for its EAGLE-family heads. Some native MTP
+    # models have the same invariant, but only for their MTP path.
+    return model_type == "deepseek_v4" or _uses_native_mtp_draft_layer_fallback(
+        vllm_config
+    )
+
+
+def _uses_native_mtp_draft_layer_fallback(vllm_config: VllmConfig) -> bool:
+    spec_config = vllm_config.speculative_config
+    model_config = getattr(vllm_config, "model_config", None)
     return (
-        model_config is not None and model_config.hf_config.model_type == "deepseek_v4"
+        spec_config is not None
+        and spec_config.method == "mtp"
+        and model_config is not None
+        # These native MTP implementations register their ordinary attention
+        # draft layer after every target cache layer.
+        and model_config.hf_config.model_type
+        in ("nemotron_h", "nemotron_h_puzzle", "qwen3_5")
     )
 
 
@@ -1835,7 +1856,7 @@ def _annotate_eagle_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
     kv_cache_groups: list[KVCacheGroupSpec],
-    use_deepseek_v4_fallback: bool = False,
+    use_last_registered_draft_fallback: bool = False,
 ) -> None:
     """Flag the KV cache groups that hold drafter attention layers.
 
@@ -1848,14 +1869,13 @@ def _annotate_eagle_groups(
        spec merging, wherever grouping happens to land. It is sufficient but
        not necessary: a drafter whose spec is indistinguishable from the
        target's cannot be found this way.
-    2. Model-scoped positional fallback for DeepseekV4, whose MTP block reuses
-       the target's own decoder layer and so carries no spec marker. Its draft
-       attention layer is always the last registered layer, so flag whichever
-       group holds it. This rule is only valid where the groups partition
-       exactly the layers of ``kv_cache_spec``, which is true on the packed
-       grouping path and not in general; other callers must leave
-       ``use_deepseek_v4_fallback`` False. The caller gates this fallback on
-       the configured model type.
+    2. Model-scoped positional fallback for models whose MTP attention carries
+       no spec marker but is known to register last. Flag whichever group holds
+       that layer. This rule requires ``kv_cache_groups`` to partition exactly
+       the layers of ``kv_cache_spec``. Both the packed and general grouping
+       callers satisfy that invariant; other callers must leave
+       ``use_last_registered_draft_fallback`` False. The caller also gates this
+       fallback on the configured model and speculative method.
        FIXME(yifan): avoid/generalize this hacky check.
 
     Args:
@@ -1863,7 +1883,9 @@ def _annotate_eagle_groups(
         kv_cache_spec: The kv cache spec of each attention layer, in layer
             registration order. Only read by rule 2.
         kv_cache_groups: Groups to annotate in place.
-        use_deepseek_v4_fallback: Enable rule 2 for a DeepseekV4 packed group.
+        use_last_registered_draft_fallback: Enable rule 2 for a model with a
+            known last-registered draft layer when the groups exactly partition
+            ``kv_cache_spec``.
     """
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_eagle_block_drop():
@@ -1876,7 +1898,7 @@ def _annotate_eagle_groups(
         ):
             group.is_eagle_group = True
 
-    if not use_deepseek_v4_fallback:
+    if not use_last_registered_draft_fallback:
         return
     last_layer = next(reversed(kv_cache_spec))
     for group in kv_cache_groups:
@@ -2016,7 +2038,14 @@ def get_kv_cache_groups(
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
 
-    _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
+    _annotate_eagle_groups(
+        vllm_config,
+        kv_cache_spec,
+        groups,
+        use_last_registered_draft_fallback=(
+            _uses_native_mtp_draft_layer_fallback(vllm_config)
+        ),
+    )
     _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 

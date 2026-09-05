@@ -8,11 +8,16 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
 )
-from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+    MambaHybridAttnMetadata,
+    MambaHybridModelState,
+)
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 
 
@@ -34,11 +39,70 @@ def test_add_request_seeds_state_with_scoped_block_size(
     state._use_flashinfer_replayssm = use_flashinfer_replayssm
     state.num_accepted_tokens_gpu = torch.full((2,), 9, dtype=torch.int32)
     state._mamba_state_idx_gpu = torch.full((2,), -1, dtype=torch.int32)
+    state._mamba_prev_last_scheduled_idx_gpu = torch.full((2,), 9, dtype=torch.int32)
 
     state.add_request(1, Mock(num_computed_tokens=17))
 
     assert state.num_accepted_tokens_gpu.tolist() == [9, 1]
     assert state._mamba_state_idx_gpu.tolist() == [-1, expected_state_idx]
+    assert state._mamba_prev_last_scheduled_idx_gpu.tolist() == [9, -1]
+
+
+def test_all_spec_tracks_previous_scheduled_page_by_request() -> None:
+    state = object.__new__(MambaHybridModelState)
+    state.cache_config = SimpleNamespace(mamba_block_size=16)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=3)
+    state._mamba_prev_last_scheduled_idx_gpu = torch.full((4,), -1, dtype=torch.int32)
+
+    first_batch = SimpleNamespace(
+        num_reqs=2,
+        idx_mapping=torch.tensor([2, 0], dtype=torch.int32),
+        seq_lens=torch.tensor([18, 33], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+    first_prev = state._stage_prev_last_scheduled_idx(first_batch, num_reqs=3)
+
+    assert first_prev is not None
+    assert first_prev.tolist() == [-1, -1, -1]
+    assert state._mamba_prev_last_scheduled_idx_gpu.tolist() == [2, -1, 1, -1]
+
+    # Request 2 previously started with N=14 tokens and scheduled q=4, so its
+    # state window is anchored at page 1. Accepting one token leaves N=15 and
+    # logical last-computed page 0, which must not replace that physical anchor.
+    logical_last_computed = (15 - 1) // 16
+    state._mamba_prev_last_scheduled_idx_gpu[1] = 7
+    second_batch = SimpleNamespace(
+        num_reqs=3,
+        idx_mapping=torch.tensor([0, 2, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([34, 19, 5], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 4, 8, 9], dtype=torch.int32),
+    )
+    second_prev = state._stage_prev_last_scheduled_idx(second_batch, num_reqs=4)
+
+    assert second_prev is not None
+    assert second_prev.tolist() == [2, 1, 7, -1]
+    assert second_prev[1].item() != logical_last_computed
+    # The one-token row may consume its old anchor in this step, but must clear
+    # it rather than advertising a speculative window to the following step.
+    assert state._mamba_prev_last_scheduled_idx_gpu.tolist() == [2, -1, 1, -1]
+
+
+def test_previous_scheduled_page_is_passed_only_to_mamba2() -> None:
+    prev_last_scheduled_idx = torch.tensor([3, 5], dtype=torch.int32)
+    metadata = MambaHybridAttnMetadata(
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+        prev_last_scheduled_idx=prev_last_scheduled_idx,
+    )
+
+    mamba2_args = metadata.get_extra_attn_kwargs(
+        Mock(spec=Mamba2AttentionMetadataBuilder), 2
+    )
+    gdn_args = metadata.get_extra_attn_kwargs(Mock(spec=GDNAttentionMetadataBuilder), 2)
+
+    mamba2_prev = mamba2_args["prev_last_scheduled_idx"]
+    assert torch.equal(mamba2_prev, prev_last_scheduled_idx)
+    assert mamba2_prev.data_ptr() == prev_last_scheduled_idx.data_ptr()
+    assert "prev_last_scheduled_idx" not in gdn_args
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")

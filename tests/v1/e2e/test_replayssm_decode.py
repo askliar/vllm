@@ -254,7 +254,7 @@ def _prefix_cache_hits(llm) -> int:
     )
 
 
-def _check_flashinfer_replayssm_prefix_caching(
+def _check_replayssm_prefix_caching(
     vllm_runner,
     model_name,
     monkeypatch: pytest.MonkeyPatch,
@@ -264,6 +264,7 @@ def _check_flashinfer_replayssm_prefix_caching(
     use_ngram: bool,
     use_v2: bool,
     tensor_parallel_size: int,
+    mamba_backend: str = "flashinfer",
 ):
     def run() -> None:
         # ReplaySSM materializes the exact SSM state at each cacheable block
@@ -274,7 +275,7 @@ def _check_flashinfer_replayssm_prefix_caching(
             enable_prefix_caching=True,
             enable_chunked_prefill=True,
             mamba_cache_mode=mamba_cache_mode,
-            mamba_backend="flashinfer",
+            mamba_backend=mamba_backend,
             disable_log_stats=False,  # required for llm.get_metrics()
             tensor_parallel_size=tensor_parallel_size,
         )
@@ -303,7 +304,13 @@ def _check_flashinfer_replayssm_prefix_caching(
         ) as llm:
             assert llm.llm.llm_engine.vllm_config.use_v2_model_runner is use_v2
             replay_block_size = llm.llm.llm_engine.vllm_config.cache_config.block_size
-            assert replay_block_size == baseline_block_size
+            if mamba_backend == "flashinfer":
+                # FlashInfer rings are auxiliary and cannot affect the shared page.
+                assert replay_block_size == baseline_block_size
+            else:
+                # Triton retains the original packed five-state page. Its rings may
+                # increase the attention block size needed to match that page.
+                assert replay_block_size >= baseline_block_size
             llm.generate_greedy_logprobs(
                 PREFIX_CACHING_PROMPTS, max_tokens=32, num_logprobs=5
             )
@@ -321,8 +328,8 @@ def _check_flashinfer_replayssm_prefix_caching(
         check_logprobs_close(
             outputs_0_lst=baseline,
             outputs_1_lst=replay,
-            name_0=f"flashinfer_baseline_{mamba_cache_mode}_pc",
-            name_1=f"flashinfer_replayssm_{mamba_cache_mode}_pc",
+            name_0=f"{mamba_backend}_baseline_{mamba_cache_mode}_pc",
+            name_1=f"{mamba_backend}_replayssm_{mamba_cache_mode}_pc",
         )
 
     try:
@@ -350,7 +357,7 @@ def test_flashinfer_replayssm_prefix_cache_tp1(
     use_v2: bool,
     use_ngram: bool,
 ):
-    _check_flashinfer_replayssm_prefix_caching(
+    _check_replayssm_prefix_caching(
         vllm_runner,
         model_name,
         monkeypatch,
@@ -361,11 +368,27 @@ def test_flashinfer_replayssm_prefix_cache_tp1(
     )
 
 
+@pytest.mark.parametrize("model_name", MODELS)
+def test_triton_replayssm_align_prefix_cache_matches_baseline_v1(
+    vllm_runner, model_name, monkeypatch: pytest.MonkeyPatch
+):
+    _check_replayssm_prefix_caching(
+        vllm_runner,
+        model_name,
+        monkeypatch,
+        mamba_cache_mode="align",
+        use_ngram=False,
+        use_v2=False,
+        tensor_parallel_size=1,
+        mamba_backend="triton",
+    )
+
+
 @requires_flashinfer_replayssm_materialization
 @large_gpu_mark(min_gb=40)
 @pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
 def test_flashinfer_replayssm_all_prefix_cache(vllm_runner, monkeypatch, use_v2: bool):
-    _check_flashinfer_replayssm_prefix_caching(
+    _check_replayssm_prefix_caching(
         vllm_runner,
         MAMBA2_PREFIX_MODEL,
         monkeypatch,

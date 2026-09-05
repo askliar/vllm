@@ -181,9 +181,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
         self.decode_replayssm_state_indices_d: torch.Tensor | None = None
-        # Canonical state is (conv, ssm). ReplaySSM auxiliaries are ordered as
-        # x=(nheads, ring, head_dim), dt=(nheads, ring),
-        # B=(ngroups, ring, dstate).
+        # FlashInfer keeps x/dt/B as auxiliary state. Triton retains its
+        # established packed (conv, ssm, x, dt, B) page layout.
         if self.use_replayssm and not self.use_flashinfer_replayssm:
             self.decode_write_pos_d: torch.Tensor = torch.empty(
                 (self.decode_cudagraph_max_bs,),
@@ -195,7 +194,9 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 dtype=torch.int8,
                 device=device,
             )
-            bc_ngroups = kv_cache_spec.replayssm_shapes[2][0]
+            triton_replayssm_shapes = kv_cache_spec.shapes[2:5]
+            assert len(triton_replayssm_shapes) == 3
+            bc_ngroups = triton_replayssm_shapes[2][0]
             bc_scratch_bs = max(
                 self.decode_cudagraph_max_bs, scheduler_config.max_num_seqs
             )

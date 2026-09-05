@@ -326,11 +326,7 @@ def test_block_idx_prev_step_persistent_buffer_allocated():
 
 
 def test_all_spec_decode_without_previous_anchor_leaves_metadata_unset():
-    """A step without a previous-step anchor keeps the optional field unset.
-
-    The mixer already falls back to the last computed block when this metadata
-    is absent; populating it here would change the baseline all-mode path.
-    """
+    """A step without a previous-step anchor keeps the optional field unset."""
     block_size = 16
     seq_lens = [33, 49]
     config = _make_vllm_config(

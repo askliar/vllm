@@ -1674,9 +1674,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             assert block_tables is not None
             attn_groups = self.attn_groups
-            if dummy_run and is_profile:
+            if dummy_run and is_profile and not valid_dummy_state_slots:
                 # Mamba layers take a cheap warmup path with no metadata;
                 # attention metadata is still built so those kernels tune.
+                # ReplaySSM autotuning supplies valid dummy state slots and
+                # needs Mamba metadata so checkpointing_ssu actually runs.
                 attn_groups = [
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups

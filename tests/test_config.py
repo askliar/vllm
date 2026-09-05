@@ -92,6 +92,13 @@ def test_kda_recoverssm_derivation_is_revalidated():
     with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
         VllmConfig.validate_mamba_cached_kernel(config)
 
+    # Ordinary Triton ReplaySSM keeps its pre-existing PP support surface.
+    config.model_config.architecture = "NemotronHForCausalLM"
+    config.num_speculative_tokens = 0
+    config.cache_config.use_kda_recoverssm = False
+    config.use_v2_model_runner = False
+    VllmConfig.validate_mamba_cached_kernel(config)
+
 
 def test_per_request_spec_decode_metrics_requires_spec_decode():
     # The flag only makes sense with speculative decoding configured; enabling

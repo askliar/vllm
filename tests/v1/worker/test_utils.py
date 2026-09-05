@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.config.mamba import MambaBackendEnum, MambaConfig
@@ -19,6 +20,7 @@ class _TestReplaySSMMixer(MambaMixer2):
     def __init__(self) -> None:
         torch.nn.Module.__init__(self)
         self.use_replayssm = True
+        self.use_flashinfer_replayssm = True
         self.mamba_config = MambaConfig(backend=MambaBackendEnum.FLASHINFER)
         self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
         self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
@@ -34,6 +36,25 @@ class _TestReplaySSMMixer(MambaMixer2):
 
     def get_replayssm_state_dtype(self) -> tuple[torch.dtype, ...]:
         return (torch.float32,) * 3
+
+
+class _TestTritonReplaySSMMixer(_TestReplaySSMMixer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.use_flashinfer_replayssm = False
+        self.mamba_config = MambaConfig(backend=MambaBackendEnum.TRITON)
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        return ((1,),) * 5
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        return (torch.float32,) * 5
+
+    def get_replayssm_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        return ()
+
+    def get_replayssm_state_dtype(self) -> tuple[torch.dtype, ...]:
+        return ()
 
 
 def _packed_replayssm_cache(num_blocks: int) -> torch.Tensor:
@@ -138,6 +159,85 @@ def test_replayssm_block_copy_includes_rings_and_group_trackers(monkeypatch):
     assert mixers[0]._replayssm_prev_num_accepted[dst].item() == 30
     assert mixers[1]._replayssm_ring_start[dst].item() == 21
     assert mixers[1]._replayssm_prev_num_accepted[dst].item() == 31
+
+
+def test_replayssm_block_copy_excludes_triton_auxiliary_state():
+    mixer = _TestReplaySSMMixer()
+    mixer.use_flashinfer_replayssm = False
+    mixer.mamba_config = MambaConfig(backend=MambaBackendEnum.TRITON)
+    mixer.replayssm_cache = tuple(torch.zeros((2, 1)) for _ in range(3))
+
+    assert get_replayssm_block_copy_tensors({"mixer": mixer}) == []
+
+
+def test_triton_replayssm_raw_page_copy_includes_all_five_states(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.v1.worker.utils.async_tensor_h2d",
+        lambda array, *, device, **_: torch.from_numpy(array).to(device),
+    )
+    mixer = _TestTritonReplaySSMMixer()
+    layer_name = "layers.0.mixer"
+    raw_cache = _packed_replayssm_cache(2)
+    runner_kv_caches: list[torch.Tensor] = []
+    bind_kv_cache(
+        {layer_name: raw_cache},
+        {layer_name: mixer},
+        runner_kv_caches,
+    )
+
+    src, dst = 0, 1
+    for state_idx, state in enumerate(mixer.kv_cache):
+        state[src].fill_(state_idx + 1)
+        state[dst].fill_(-1)
+
+    copy_kv_cache_blocks_inplace(
+        runner_kv_caches,
+        2,
+        [KVCacheBlockCopy(src, dst)],
+    )
+
+    assert len(mixer.kv_cache) == 5
+    for state_idx, state in enumerate(mixer.kv_cache):
+        assert state[dst].item() == state_idx + 1
+
+
+@pytest.mark.parametrize(
+    ("backend", "state_count", "auxiliary_count"),
+    [
+        (MambaBackendEnum.TRITON, 5, 0),
+        (MambaBackendEnum.FLASHINFER, 2, 3),
+    ],
+)
+def test_replayssm_cache_layout_is_backend_scoped(
+    monkeypatch, backend: MambaBackendEnum, state_count: int, auxiliary_count: int
+):
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.mamba.mamba_mixer2."
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    mixer = MambaMixer2.__new__(MambaMixer2)
+    torch.nn.Module.__init__(mixer)
+    mixer.use_replayssm = True
+    mixer.use_flashinfer_replayssm = backend == MambaBackendEnum.FLASHINFER
+    mixer.mamba_config = MambaConfig(backend=backend)
+    mixer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    mixer.cache_config = SimpleNamespace(
+        mamba_cache_dtype="auto", mamba_ssm_cache_dtype="auto"
+    )
+    mixer.intermediate_size = 32
+    mixer.n_groups = 2
+    mixer.num_heads = 4
+    mixer.head_dim = 8
+    mixer.ssm_state_size = 16
+    mixer.conv_kernel_size = 4
+    mixer.num_spec = 0
+    mixer.replayssm_buffer_len = 16
+
+    assert len(mixer.get_state_shape()) == state_count
+    assert len(mixer.get_state_dtype()) == state_count
+    assert len(mixer.get_replayssm_state_shape()) == auxiliary_count
+    assert len(mixer.get_replayssm_state_dtype()) == auxiliary_count
 
 
 def test_bind_kv_cache(default_vllm_config):

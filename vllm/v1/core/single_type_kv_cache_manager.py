@@ -113,6 +113,11 @@ class SingleTypeKVCacheManager(ABC):
         # aligned segment (SWA). Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
+        # Hybrid EAGLE/MTP drops one scheduler block from the common reusable
+        # prefix. Sparse Mamba retention must keep that shifted replay state,
+        # even though the Mamba group itself is not an EAGLE group. The hybrid
+        # coordinator sets this after it identifies the draft cache group.
+        self._sparse_replay_boundary_shift = 0
 
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
@@ -454,9 +459,16 @@ class SingleTypeKVCacheManager(ABC):
             return
 
         # Token boundaries whose reachable tail must be retained under sparse
-        # retention: the replay boundary (``num_prompt - 1``, capped by
-        # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries = [request.num_prompt_tokens - 1]
+        # retention: the replay boundary, capped by ``get_computed_blocks``, and
+        # any detected shared-prefix junction. The ordinary boundary is the
+        # prompt's last token; a shifted boundary is exclusive so an exact
+        # ``num_prompt - shift`` boundary remains representable.
+        replay_boundary = (
+            request.num_prompt_tokens - self._sparse_replay_boundary_shift
+            if self._sparse_replay_boundary_shift
+            else request.num_prompt_tokens - 1
+        )
+        reachable_boundaries = [max(replay_boundary, 0)]
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
@@ -1372,14 +1384,13 @@ class MambaManager(SingleTypeKVCacheManager):
         self.block_size = kv_cache_spec.block_size
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
-        # ``replayssm_shapes`` means that this group's temporal state includes
-        # ReplaySSM rings indexed by the scheduler's physical block IDs. When
-        # allocation moves a request's live block, those rings and their
-        # trackers must move with it; otherwise the next forward reads the new
-        # block ID with the previous live history left behind. Both Triton and
-        # FlashInfer ReplaySSM use this scheduler-level migration path.
-        self._copy_replayssm_live_state = bool(kv_cache_spec.replayssm_shapes)
-        if self._copy_replayssm_live_state:
+        # FlashInfer ReplaySSM rings and trackers live outside the canonical
+        # cache page, so explicitly migrate them when the live block moves.
+        # Triton's packed five-state page follows the normal copy path.
+        self._copy_flashinfer_replayssm_live_state = bool(
+            kv_cache_spec.replayssm_shapes
+        )
+        if self._copy_flashinfer_replayssm_live_state:
             # ReplaySSM stores speculative history inside its ring. It must not
             # also reserve the baseline Mamba speculative scratch blocks.
             assert self.num_speculative_blocks == 0, (
@@ -1680,7 +1691,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # speculative decoding (MTP/EAGLE) with linear attention.
             if self.num_speculative_blocks > 0:
                 num_tokens += self.block_size * self.num_speculative_blocks
-            if not self._copy_replayssm_live_state:
+            if not self._copy_flashinfer_replayssm_live_state:
                 return super().allocate_new_blocks(
                     request_id, num_tokens, num_tokens_main_model
                 )
@@ -1721,7 +1732,7 @@ class MambaManager(SingleTypeKVCacheManager):
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
             live_source = None
-            if self._copy_replayssm_live_state:
+            if self._copy_flashinfer_replayssm_live_state:
                 # Capture the live state owner before align-mode allocation
                 # relocates/nulls table entries. The eventual destination is
                 # the last new block, where the next forward writes state.
@@ -1815,7 +1826,7 @@ class MambaManager(SingleTypeKVCacheManager):
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
                 req_blocks.extend(new_blocks)
-                if self._copy_replayssm_live_state and new_blocks:
+                if self._copy_flashinfer_replayssm_live_state and new_blocks:
                     self._queue_replayssm_live_copy(live_source, req_blocks[-1])
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)

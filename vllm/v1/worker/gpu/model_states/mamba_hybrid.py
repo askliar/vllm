@@ -42,6 +42,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    prev_last_scheduled_idx: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -65,7 +66,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             ),
         ):
             return {}
-        return {
+        extra_args = {
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
             else self.num_accepted_tokens[:num_reqs],
@@ -73,6 +74,14 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             if self.num_decode_draft_tokens_cpu is None
             else self.num_decode_draft_tokens_cpu[:num_reqs],
         }
+        if (
+            isinstance(attn_metadata_builder, Mamba2AttentionMetadataBuilder)
+            and self.prev_last_scheduled_idx is not None
+        ):
+            extra_args["prev_last_scheduled_idx"] = self.prev_last_scheduled_idx[
+                :num_reqs
+            ]
+        return extra_args
 
 
 class MambaHybridModelState(DefaultModelState):
@@ -90,6 +99,15 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        self._mamba_prev_last_scheduled_idx_gpu: torch.Tensor | None = None
+        if (
+            self.cache_config.mamba_cache_mode == "all"
+            and vllm_config.num_speculative_tokens > 0
+            and not self.cache_config.use_replayssm
+        ):
+            self._mamba_prev_last_scheduled_idx_gpu = torch.full(
+                (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
+            )
         self._replayssm_query_start_loc: torch.Tensor | None = None
         # Pre-copy prefix-cache state (V2). The migration of each request's
         # mamba state across block boundaries runs as a fused GPU kernel reusing
@@ -131,6 +149,8 @@ class MambaHybridModelState(DefaultModelState):
         super().add_request(req_index, new_req_data)
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
+        if self._mamba_prev_last_scheduled_idx_gpu is not None:
+            self._mamba_prev_last_scheduled_idx_gpu[req_index].fill_(-1)
         if self._needs_prefix_state_migration:
             # Seed the running state block from the resumed/prefilled position.
             state_block_size = self.cache_config.block_size
@@ -288,6 +308,12 @@ class MambaHybridModelState(DefaultModelState):
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
             input_batch.is_prefilling_np
         )
+        prev_last_scheduled_idx = None
+        if not for_capture:
+            prev_last_scheduled_idx = self._stage_prev_last_scheduled_idx(
+                input_batch, num_reqs
+            )
+
         if self._use_flashinfer_replayssm:
             self._is_prefilling_gpu[:num_reqs].copy_(is_prefilling, non_blocking=True)
         # During CUDAGraph capture, num_decode_draft_tokens_cpu and num_accepted_tokens
@@ -346,6 +372,7 @@ class MambaHybridModelState(DefaultModelState):
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            prev_last_scheduled_idx=prev_last_scheduled_idx,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
@@ -372,6 +399,42 @@ class MambaHybridModelState(DefaultModelState):
                 for_capture=for_capture,
             )
         return attn_metadata
+
+    def _stage_prev_last_scheduled_idx(
+        self, input_batch: InputBatch, num_reqs: int
+    ) -> torch.Tensor | None:
+        state = self._mamba_prev_last_scheduled_idx_gpu
+        if state is None:
+            return None
+
+        num_actual_reqs = input_batch.num_reqs
+        prev_last_scheduled_idx = state.new_full((num_reqs,), -1)
+        if num_actual_reqs == 0:
+            return prev_last_scheduled_idx
+
+        idx_mapping = input_batch.idx_mapping[:num_actual_reqs]
+        # A non-full step can still consume the preceding speculative window.
+        # Gather that anchor before replacing it with this step's window state.
+        prev_last_scheduled_idx[:num_actual_reqs] = state[idx_mapping]
+
+        mamba_block_size = self.cache_config.mamba_block_size
+        assert mamba_block_size is not None
+        current_last_scheduled_idx = torch.div(
+            input_batch.seq_lens[:num_actual_reqs] - 1,
+            mamba_block_size,
+            rounding_mode="floor",
+        ).clamp_(min=0)
+        query_lens = (
+            input_batch.query_start_loc[1 : num_actual_reqs + 1]
+            - input_batch.query_start_loc[:num_actual_reqs]
+        )
+        full_spec_query_len = self.vllm_config.num_speculative_tokens + 1
+        state[idx_mapping] = torch.where(
+            query_lens == full_spec_query_len,
+            current_last_scheduled_idx,
+            -1,
+        )
+        return prev_last_scheduled_idx
 
     def postprocess_state(
         self,
