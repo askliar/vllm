@@ -61,7 +61,10 @@ def test_kda_recoverssm_derivation_is_revalidated():
             backend=MambaBackendEnum.TRITON,
             enable_stochastic_rounding=False,
         ),
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            use_ubatching=False,
+        ),
         kv_transfer_config=None,
         use_v2_model_runner=True,
     )
@@ -80,6 +83,13 @@ def test_kda_recoverssm_derivation_is_revalidated():
     with pytest.raises(ValueError, match="only none and align"):
         VllmConfig.validate_mamba_cached_kernel(config)
     config.cache_config.mamba_cache_mode = "none"
+
+    config.use_v2_model_runner = False
+    config.parallel_config.use_ubatching = True
+    with pytest.raises(ValueError, match="does not support microbatching"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+    config.parallel_config.use_ubatching = False
+    config.use_v2_model_runner = True
 
     config.model_config.architecture = "NemotronHForCausalLM"
     config.mamba_config.backend = MambaBackendEnum.FLASHINFER

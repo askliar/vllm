@@ -224,6 +224,7 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -1016,6 +1017,9 @@ class GPUModelRunner(
                 and self.cache_config.mamba_cache_mode == "all"
             )
         )
+        self.recoverssm = (
+            RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
+        )
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
         if (
             self.cache_config.mamba_cache_mode == "all"
@@ -1608,7 +1612,8 @@ class GPUModelRunner(
         based on the number of accepted tokens.
         """
         if not (
-            self._use_flashinfer_replayssm
+            self.recoverssm is not None
+            or self._use_flashinfer_replayssm
             or (self.speculative_config and self.model_config.is_hybrid)
         ):
             return
@@ -1620,6 +1625,14 @@ class GPUModelRunner(
             # and the input preparation already maintains that neutral value.
             self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(
                 dim=1
+            )
+
+        if self.recoverssm is not None:
+            self.recoverssm.commit_step(
+                self.num_accepted_tokens.gpu[:num_reqs],
+                None,
+                state_indices=None,
+                num_accepted_tokens=self.num_accepted_tokens.gpu,
             )
 
         if self._needs_prefix_state_migration or self._use_flashinfer_replayssm:
@@ -2683,6 +2696,14 @@ class GPUModelRunner(
             # padded attention metadata.
             spec_decode_common_attn_metadata = (
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
+            )
+
+        if self.recoverssm is not None:
+            assert isinstance(attn_metadata, dict)
+            self.recoverssm.record_step(
+                attn_metadata,
+                self.attn_groups,
+                for_capture=for_cudagraph_capture,
             )
 
         return attn_metadata, spec_decode_common_attn_metadata

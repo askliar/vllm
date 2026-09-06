@@ -170,25 +170,24 @@ def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
     assert state._replayssm_query_start_loc is None
 
 
-def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
+def test_recoverssm_commits_accepted_window_without_align_mapping() -> None:
     state = RecoverSSMState()
     metadata = Mock(spec=RecoverSSMMetadata)
     metadata.commit_recoverssm_state.return_value = None
     num_sampled = torch.tensor([3, 1], dtype=torch.int32)
-    idx_mapping = torch.tensor([0, 1], dtype=torch.int32)
     num_accepted_tokens = torch.ones(2, dtype=torch.int32)
     group = SimpleNamespace(layer_names=["layer"])
 
     state.record_step({"layer": metadata}, [[group]], for_capture=False)
     state.commit_step(
         num_sampled,
-        idx_mapping,
+        None,
         state_indices=None,
         num_accepted_tokens=num_accepted_tokens,
     )
     state.commit_step(
         num_sampled,
-        idx_mapping,
+        None,
         state_indices=None,
         num_accepted_tokens=num_accepted_tokens,
     )

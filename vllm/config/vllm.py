@@ -2895,6 +2895,10 @@ class VllmConfig:
                     raise ValueError(
                         "RecoverSSM with align mode requires VLLM_USE_V2_MODEL_RUNNER=1"
                     )
+                if not self.use_v2_model_runner and self.parallel_config.use_ubatching:
+                    raise ValueError(
+                        "RecoverSSM with Model Runner V1 does not support microbatching"
+                    )
                 if self.parallel_config.pipeline_parallel_size > 1:
                     raise ValueError(
                         "RecoverSSM currently requires pipeline_parallel_size=1"
