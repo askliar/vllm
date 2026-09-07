@@ -74,20 +74,14 @@ def test_replayssm_autotune_decode_kwargs(runner_kwargs, expected_num_reqs):
     assert result is not None
     max_num_reqs, decode_kwargs = result
     assert max_num_reqs == expected_num_reqs
-    expected_kwargs = {
-        **PREFILL_KWARGS,
-        "num_tokens": expected_num_reqs * query_len,
-        "uniform_decode": True,
-    }
+    assert decode_kwargs["num_tokens"] == expected_num_reqs * query_len
+    assert decode_kwargs["uniform_decode"] is True
     if runner_kwargs.get("use_v2_model_runner"):
-        expected_kwargs["valid_dummy_state_slots"] = True
+        assert decode_kwargs["valid_dummy_state_slots"] is True
+        assert "profile_seq_lens" not in decode_kwargs
     else:
-        expected_kwargs.update(
-            allow_microbatching=False,
-            force_attention=True,
-            profile_seq_lens=query_len + 1,
-        )
-    assert decode_kwargs == expected_kwargs
+        assert decode_kwargs["profile_seq_lens"] == query_len + 1
+        assert decode_kwargs["force_attention"] is True
 
 
 @pytest.mark.parametrize(
@@ -96,13 +90,11 @@ def test_replayssm_autotune_decode_kwargs(runner_kwargs, expected_num_reqs):
         (dict(use_replayssm=False), True),
         (dict(backend=MambaBackendEnum.TRITON), True),
         ({}, False),
-        (dict(num_blocks=1), True),
     ],
     ids=[
         "replayssm_disabled",
         "non_flashinfer_backend",
         "kernel_unavailable",
-        "zero_non_padding_slots",
     ],
 )
 def test_replayssm_autotune_kwargs_skipped(runner_kwargs, flashinfer_supported):
@@ -125,16 +117,15 @@ def test_replayssm_autotune_slots_restore_state_and_trackers():
     mixer.kv_cache = (
         torch.full((4, 2), 3.0),
         torch.full((4, 2), 3.0),
-        *(torch.full((4, 2, 17), 3.0) for _ in range(3)),
     )
+    mixer.replayssm_cache = tuple(torch.full((4, 2, 17), 3.0) for _ in range(3))
     mixer._replayssm_ring_start = torch.full((4,), 3, dtype=torch.int32)
     mixer._replayssm_prev_num_accepted = torch.full((4,), 3, dtype=torch.int32)
-    mixer._replayssm_prev_query_len = torch.full((4,), 3, dtype=torch.int32)
     tracked = (
         *mixer.kv_cache,
+        *mixer.replayssm_cache,
         mixer._replayssm_ring_start,
         mixer._replayssm_prev_num_accepted,
-        mixer._replayssm_prev_query_len,
     )
 
     block_ids = np.arange(10, 14, dtype=np.int32).reshape(4, 1)

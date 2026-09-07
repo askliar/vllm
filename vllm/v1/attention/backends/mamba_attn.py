@@ -181,7 +181,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
         self.decode_replayssm_state_indices_d: torch.Tensor | None = None
-        # ReplaySSM CUDA-graph buffers for the selected backend.
+        # FlashInfer keeps x/dt/B as auxiliary state. Triton retains its
+        # established packed (conv, ssm, x, dt, B) page layout.
         if self.use_replayssm and not self.use_flashinfer_replayssm:
             self.decode_write_pos_d: torch.Tensor = torch.empty(
                 (self.decode_cudagraph_max_bs,),
@@ -193,9 +194,9 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 dtype=torch.int8,
                 device=device,
             )
-            # B_cache shape = (ngroups, replayssm_buffer_len, dstate); the page
-            # layout is (conv_state, ssm_state, x_cache, dt_cache, B_cache).
-            bc_ngroups = kv_cache_spec.shapes[4][0]
+            triton_replayssm_shapes = kv_cache_spec.shapes[2:5]
+            assert len(triton_replayssm_shapes) == 3
+            bc_ngroups = triton_replayssm_shapes[2][0]
             bc_scratch_bs = max(
                 self.decode_cudagraph_max_bs, scheduler_config.max_num_seqs
             )
@@ -213,7 +214,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 allocate_checkpointing_ssu_scratch,
             )
 
-            nheads = kv_cache_spec.shapes[2][0]
+            nheads = kv_cache_spec.replayssm_shapes[0][0]
             self.decode_replayssm_scratch = allocate_checkpointing_ssu_scratch(
                 batch_size=scheduler_config.max_num_seqs,
                 num_heads=nheads,
@@ -549,12 +550,10 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 common_attn_metadata, mamba_block_size
             )
             if self.use_spec_decode and prev_last_scheduled_idx is not None:
-                fallback = (num_computed_tokens - 1) // mamba_block_size
-                fallback.clamp_(min=0)
                 block_idx_last_scheduled_token_prev_step = torch.where(
                     prev_last_scheduled_idx >= 0,
                     prev_last_scheduled_idx,
-                    fallback,
+                    block_idx_last_computed_token,
                 )
         else:
             state_indices_tensor = mamba_get_block_table_tensor(
@@ -845,8 +844,12 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     cb_old[:padded_bs],
                 )
                 assert self.decode_replayssm_state_indices_d is not None
+                live_state_indices = self._select_replayssm_state_indices(
+                    state_indices_tensor_d,
+                    block_idx_last_scheduled_token,
+                )
                 self.decode_replayssm_state_indices_d[:padded_bs].copy_(
-                    state_indices_tensor_d[:, 0], non_blocking=True
+                    live_state_indices, non_blocking=True
                 )
                 replayssm_state_indices_d = self.decode_replayssm_state_indices_d[
                     :padded_bs
@@ -857,7 +860,10 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             and state_indices_tensor_d is not None
             and replayssm_state_indices_d is None
         ):
-            replayssm_state_indices_d = state_indices_tensor_d[:, 0].contiguous()
+            replayssm_state_indices_d = self._select_replayssm_state_indices(
+                state_indices_tensor_d,
+                block_idx_last_scheduled_token,
+            ).contiguous()
 
         return replace(
             metadata,
@@ -875,6 +881,20 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 block_idx_last_scheduled_token_prev_step
             ),
         )
+
+    def _select_replayssm_state_indices(
+        self,
+        state_indices_tensor_d: torch.Tensor,
+        block_idx_last_scheduled_token: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.vllm_config.cache_config.mamba_cache_mode != "all":
+            return state_indices_tensor_d[:, 0]
+
+        assert block_idx_last_scheduled_token is not None
+        live_cols = block_idx_last_scheduled_token[: state_indices_tensor_d.size(0)].to(
+            torch.int64
+        )
+        return state_indices_tensor_d.gather(1, live_cols.unsqueeze(1)).squeeze(1)
 
     def update_block_table(
         self,

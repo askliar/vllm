@@ -194,23 +194,27 @@ def _make_mamba_spec(
     buffer_len: int,
     mamba_backend: MambaBackendEnum,
     num_speculative_tokens: int = 0,
+    mamba_cache_mode: str = "none",
 ) -> MambaSpec:
     ring_buffer_len = buffer_len + (
         1 + num_speculative_tokens
         if mamba_backend == MambaBackendEnum.FLASHINFER
         else 0
     )
-    shapes = (
-        (1, 1),
-        (1, 1, 1),
+    replayssm_shapes = (
         (1, ring_buffer_len, 1),
         (1, ring_buffer_len),
         (1, ring_buffer_len, 1),
     )
+    base_shapes = ((1, 1), (1, 1, 1))
+    flashinfer = mamba_backend == MambaBackendEnum.FLASHINFER
     return MambaSpec(
         block_size=BLOCK_SIZE,
-        shapes=shapes,
-        dtypes=(torch.float32,),
+        shapes=base_shapes if flashinfer else (*base_shapes, *replayssm_shapes),
+        dtypes=(torch.float32,) * (2 if flashinfer else 5),
+        replayssm_shapes=replayssm_shapes if flashinfer else (),
+        replayssm_dtypes=(torch.float32,) * 3 if flashinfer else (),
+        mamba_cache_mode=mamba_cache_mode,
     )
 
 
@@ -236,24 +240,25 @@ def _create_replayssm_builder(
             num_speculative_tokens=num_speculative_tokens,
         )
     return MockMambaBuilder(
-        _make_mamba_spec(buffer_len, mamba_backend, num_speculative_tokens),
+        _make_mamba_spec(
+            buffer_len,
+            mamba_backend,
+            num_speculative_tokens,
+            mamba_cache_mode,
+        ),
         ["layer0"],
         vllm_config,
         DEVICE,
     )
 
 
-def _build(
-    builder: MockMambaBuilder,
-    case: ReplaySSMBuildCase,
-    num_accepted_tokens: torch.Tensor | None = None,
-):
+def _build(builder: MockMambaBuilder, case: ReplaySSMBuildCase):
     batch = BatchSpec(seq_lens=case.seq_lens, query_lens=case.query_lens)
     common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
         is_prefilling=torch.tensor(case.is_prefilling, dtype=torch.bool),
         replayssm_decode_base_cpu=torch.tensor(case.decode_base, dtype=torch.int32),
     )
-    return builder.build(0, common, num_accepted_tokens=num_accepted_tokens)
+    return builder.build(0, common)
 
 
 @pytest.mark.parametrize(
