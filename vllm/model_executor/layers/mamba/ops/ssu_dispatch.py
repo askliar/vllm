@@ -119,6 +119,7 @@ def _postprocess_replayssm_kernel(
     HAS_IDX_MAPPING: tl.constexpr,
     MATERIALIZE_PREFIXES: tl.constexpr,
     LIVE_COL_IS_ZERO: tl.constexpr,
+    EXECUTED_QUERY_WIDTH: tl.constexpr,
 ) -> None:
     """Commit a completed step and prepare an optional prefix snapshot."""
     batch_idx = tl.program_id(0)
@@ -144,7 +145,8 @@ def _postprocess_replayssm_kernel(
         NUM_COMPUTED_IS_POST_STEP, computed - query_len, computed
     )
     # Staged from forward metadata using Mamba attention's classification.
-    prefilling = tl.load(is_prefilling + batch_idx)
+    valid_query = query_len > 0
+    prefilling = tl.load(is_prefilling + batch_idx) & valid_query
     accepted = tl.maximum(tl.load(num_accepted_tokens + req_idx), 1)
 
     # Derive this request's pre/post-step positions from ReplaySSM metadata.
@@ -192,28 +194,33 @@ def _postprocess_replayssm_kernel(
                 tl.where(materialize, dst_slot, PAD_SLOT_ID),
             )
     if prefilling:
-        first_col = computed_before // MAMBA_BLOCK_SIZE
-        last_col = tl.maximum(
-            (computed_after + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1,
-            0,
-        )
-        # Any block touched by prefill can later become another request's live
-        # source through a prefix-cache hit. Clear every such block's cursors,
-        # including intermediate blocks that are neither live_slot nor dst_slot.
-        for col in tl.range(first_col, last_col + 1):
-            prefill_slot = tl.load(
-                block_table + batch_idx * block_table_stride_req + col
+        if LIVE_COL_IS_ZERO:
+            tl.store(tracker_start + live_slot, 0, mask=valid_live)
+            tl.store(tracker_committed + live_slot, 0, mask=valid_live)
+        else:
+            first_col = computed_before // MAMBA_BLOCK_SIZE
+            last_col = tl.maximum(
+                (computed_after + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1,
+                0,
             )
-            valid_prefill_slot = prefill_slot != PAD_SLOT_ID
-            tl.store(tracker_start + prefill_slot, 0, mask=valid_prefill_slot)
-            tl.store(tracker_committed + prefill_slot, 0, mask=valid_prefill_slot)
+            # Prefix modes must clear every touched position-indexed state slot.
+            for col in tl.range(first_col, last_col + 1):
+                prefill_slot = tl.load(
+                    block_table + batch_idx * block_table_stride_req + col
+                )
+                valid_prefill_slot = prefill_slot != PAD_SLOT_ID
+                tl.store(tracker_start + prefill_slot, 0, mask=valid_prefill_slot)
+                tl.store(tracker_committed + prefill_slot, 0, mask=valid_prefill_slot)
         if materialize:
             # Prefill produced canonical state, so publish an exact copy.
             tl.store(plan_flush_count + batch_idx, 0)
-    elif valid_live:
+    elif valid_live & valid_query:
         old_start = tl.load(tracker_start + live_slot)
         old_committed = tl.load(tracker_committed + live_slot)
-        checkpointed = old_committed + query_len > LOGICAL_WINDOW
+        executed_query_len = query_len
+        if EXECUTED_QUERY_WIDTH > 0:
+            executed_query_len = EXECUTED_QUERY_WIDTH
+        checkpointed = old_committed + executed_query_len > LOGICAL_WINDOW
         next_start = tl.where(
             checkpointed,
             (old_start + old_committed) % RING_BUFFER_LEN,
@@ -288,7 +295,7 @@ class _ReplaySSMGroupContext:
     block_table: torch.Tensor
     ring_start: torch.Tensor
     num_committed: torch.Tensor
-    materialize_tables: _ReplaySSMMaterializeTables
+    materialize_tables: _ReplaySSMMaterializeTables | None
     src_slots: torch.Tensor
     dst_slots: torch.Tensor
     plan_ring_start: torch.Tensor
@@ -299,6 +306,7 @@ class _ReplaySSMGroupContext:
     logical_window: int
     ring_buffer_len: int
     materialize_prefixes: bool
+    executed_query_width: int
 
     @classmethod
     def create(
@@ -314,13 +322,11 @@ class _ReplaySSMGroupContext:
         first_x = first.replayssm_cache[0]
 
         device = first_ssm.device
-        zero_table = torch.zeros(len(mixers), dtype=torch.int64, device=device)
-        return cls(
-            mixers=mixers,
-            block_table=block_table,
-            ring_start=first._replayssm_ring_start,
-            num_committed=first._replayssm_prev_num_accepted,
-            materialize_tables=_ReplaySSMMaterializeTables(
+        materialize_prefixes = cache_mode in ("align", "all")
+        materialize_tables = None
+        if materialize_prefixes:
+            zero_table = torch.zeros(len(mixers), dtype=torch.int64, device=device)
+            materialize_tables = _ReplaySSMMaterializeTables(
                 state_ptrs=_cuda_i64_ptrs([m.kv_cache[1] for m in mixers]),
                 state_slot_strides=_cuda_i64_slot_strides(
                     [m.kv_cache[1] for m in mixers]
@@ -340,7 +346,13 @@ class _ReplaySSMGroupContext:
                 A_ptrs=_cuda_i64_ptrs([m.A for m in mixers]),
                 state_scale_ptrs=zero_table,
                 state_scale_slot_strides=zero_table,
-            ),
+            )
+        return cls(
+            mixers=mixers,
+            block_table=block_table,
+            ring_start=first._replayssm_ring_start,
+            num_committed=first._replayssm_prev_num_accepted,
+            materialize_tables=materialize_tables,
             src_slots=torch.full(
                 (len(mixers), max_num_reqs),
                 NULL_BLOCK_ID,
@@ -364,7 +376,10 @@ class _ReplaySSMGroupContext:
             mamba_block_size=mamba_block_size,
             logical_window=int(first.replayssm_buffer_len),
             ring_buffer_len=first_x.size(2),
-            materialize_prefixes=cache_mode in ("align", "all"),
+            materialize_prefixes=materialize_prefixes,
+            executed_query_width=int(
+                getattr(first, "replayssm_executed_query_width", 0) or 0
+            ),
         )
 
     def reset_new_slots(
@@ -432,6 +447,7 @@ class _ReplaySSMGroupContext:
             HAS_IDX_MAPPING=idx_mapping is not None,
             MATERIALIZE_PREFIXES=self.materialize_prefixes,
             LIVE_COL_IS_ZERO=live_cols is None,
+            EXECUTED_QUERY_WIDTH=self.executed_query_width,
         )
         if self.materialize_prefixes:
             _compact_replayssm_requests_kernel[(1,)](
@@ -445,6 +461,7 @@ class _ReplaySSMGroupContext:
     def materialize(self, materialize_fn: Callable[..., None]) -> None:
         """Publish the canonical prefix snapshots prepared by ``postprocess``."""
         first = self.mixers[0]
+        assert self.materialize_tables is not None
         mamba_config = first.mamba_config
         rand_seed = None
         philox_rounds = 0
@@ -918,12 +935,7 @@ def _flashinfer_replayssm_mixers_by_group(
             layer = forward_context.get(layer_name)
             if layer is None:
                 continue
-            mamba_config = getattr(layer, "mamba_config", None)
-            backend = getattr(mamba_config, "backend", None)
-            if (
-                getattr(layer, "use_replayssm", False)
-                and backend == MambaBackendEnum.FLASHINFER
-            ):
+            if getattr(layer, "use_flashinfer_replayssm", False):
                 mixers.append(layer)
         if mixers:
             grouped.append((gid, mixers))

@@ -74,11 +74,9 @@ def _replayssm_autotune_kwargs(
 def _temporary_replayssm_autotune_state(
     runner: "GPUModelRunner", max_num_reqs: int
 ) -> Iterator[None]:
-    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
-
     reset_tensors: dict[int, torch.Tensor] = {}
     for module in runner.get_model().modules():
-        if not isinstance(module, MambaMixer2) or not module.use_replayssm:
+        if not getattr(module, "use_flashinfer_replayssm", False):
             continue
         assert module.replayssm_buffer_len is not None
         ring_start = module._replayssm_ring_start
@@ -133,3 +131,45 @@ def replayssm_autotune_warmup(runner: "GPUModelRunner") -> None:
     max_num_reqs, decode_kwargs = autotune
     with _temporary_replayssm_autotune_state(runner, max_num_reqs):
         runner._dummy_run(**decode_kwargs)
+
+
+def gdn_replayssm_warmup(runner: "GPUModelRunner") -> None:
+    """Compile GDN replay for every intended uniform-decode graph bucket."""
+    config = runner.vllm_config
+    if not config.is_gdn_replayssm_enabled():
+        return
+    query_len = 1 + config.num_speculative_tokens
+    max_num_reqs = min(
+        runner.scheduler_config.max_num_seqs,
+        runner.max_num_tokens // query_len,
+        runner.kv_cache_config.num_blocks - 1,
+    )
+    if max_num_reqs <= 0:
+        raise ValueError(
+            "FlashInfer GDN ReplaySSM warmup requires a non-padding state slot"
+        )
+    capture_reqs = {
+        size // query_len
+        for size in runner.cudagraph_batch_sizes
+        if size % query_len == 0 and 0 < size // query_len <= max_num_reqs
+    }
+    if not capture_reqs:
+        capture_reqs.add(max_num_reqs)
+
+    decode_kwargs: dict[str, Any] = {
+        "uniform_decode": True,
+        "skip_eplb": True,
+        "is_profile": True,
+        "randomize_inputs": True,
+    }
+    if config.use_v2_model_runner:
+        decode_kwargs["valid_dummy_state_slots"] = True
+    else:
+        decode_kwargs.update(
+            allow_microbatching=False,
+            force_attention=True,
+            profile_seq_lens=query_len + 1,
+        )
+    with _temporary_replayssm_autotune_state(runner, max_num_reqs):
+        for num_reqs in sorted(capture_reqs):
+            runner._dummy_run(num_tokens=num_reqs * query_len, **decode_kwargs)

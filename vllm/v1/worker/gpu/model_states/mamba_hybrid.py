@@ -9,7 +9,6 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.config.mamba import MambaBackendEnum
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -114,10 +113,7 @@ class MambaHybridModelState(DefaultModelState):
         # the postprocess copy machinery, so the per-step src columns and the
         # running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
-        self._use_flashinfer_replayssm = (
-            self.cache_config.use_replayssm
-            and vllm_config.mamba_config.backend == MambaBackendEnum.FLASHINFER
-        )
+        self._use_flashinfer_replayssm = vllm_config.is_flashinfer_replayssm_enabled()
         self._needs_prefix_state_migration = self._align_mode or (
             self.cache_config.mamba_cache_mode == "all"
             and self._use_flashinfer_replayssm

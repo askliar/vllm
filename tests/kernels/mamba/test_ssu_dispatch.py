@@ -7,7 +7,10 @@ import pytest
 import torch
 
 from vllm.config.mamba import MambaBackendEnum, MambaConfig, MambaSSUAlgorithm
-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     FlashInferSSUBackend,
     TritonSSUBackend,
@@ -230,6 +233,22 @@ def test_replayssm_physical_ring_shape(
     )
 
 
+def test_gdn_replayssm_physical_ring_layout():
+    shapes = MambaStateShapeCalculator.gated_delta_net_replayssm_ring_shapes(
+        tp_world_size=2,
+        num_k_heads=4,
+        num_v_heads=8,
+        head_k_dim=128,
+        head_v_dim=128,
+    )
+    dtypes = MambaStateDtypeCalculator.gated_delta_net_replayssm_ring_dtypes(
+        torch.bfloat16
+    )
+
+    assert shapes == ((4, 32, 128), (2, 32, 128), (4, 32))
+    assert dtypes == (torch.bfloat16, torch.bfloat16, torch.float32)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("post_step", [False, True])
 @pytest.mark.parametrize(
@@ -284,6 +303,53 @@ def test_replayssm_postprocess_commits_staged_transition(
         HAS_IDX_MAPPING=post_step,
         MATERIALIZE_PREFIXES=False,
         LIVE_COL_IS_ZERO=True,
+        EXECUTED_QUERY_WIDTH=0,
     )
     assert committed.item() == expected
     assert ring_start.item() == (0 if prefilling else 3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("executed_width", "old_committed", "expected_start"),
+    [(4, 13, 16), (8, 9, 12)],
+)
+def test_gdn_replayssm_postprocess_uses_executed_width(
+    executed_width, old_committed, expected_start
+):
+    def tensor(values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    ring_start = tensor([3])
+    committed = tensor([old_committed])
+    slots = tensor([[0]])
+    _postprocess_replayssm_kernel[(1,)](
+        tensor([0]),
+        tensor([1]),
+        tensor([256]),
+        tensor([1]),
+        torch.tensor([False], device="cuda"),
+        None,
+        slots,
+        ring_start,
+        committed,
+        slots,
+        slots,
+        tensor([0]),
+        tensor([-1]),
+        1,
+        1,
+        MAMBA_BLOCK_SIZE=256,
+        LOGICAL_WINDOW=16,
+        RING_BUFFER_LEN=32,
+        NUM_LAYERS=1,
+        PAD_SLOT_ID=-1,
+        QUERY_METADATA_IS_CUMULATIVE=False,
+        NUM_COMPUTED_IS_POST_STEP=False,
+        HAS_IDX_MAPPING=False,
+        MATERIALIZE_PREFIXES=False,
+        LIVE_COL_IS_ZERO=True,
+        EXECUTED_QUERY_WIDTH=executed_width,
+    )
+    assert ring_start.item() == expected_start
+    assert committed.item() == 1

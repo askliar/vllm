@@ -8,7 +8,6 @@ from typing import Any, NamedTuple
 import torch
 
 from vllm.config import CacheConfig
-from vllm.config.mamba import MambaBackendEnum
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncsByType,
@@ -1022,9 +1021,8 @@ class MambaSpecDecodeGPUContext:
                 state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
                 attention = forward_context[layer_name]
                 kv_caches: list[torch.Tensor] = attention.kv_cache
-                is_flashinfer_replayssm = (
-                    getattr(attention, "use_replayssm", False)
-                    and attention.mamba_config.backend == MambaBackendEnum.FLASHINFER
+                is_flashinfer_replayssm = getattr(
+                    attention, "use_flashinfer_replayssm", False
                 )
                 has_replayssm_layer |= bool(is_flashinfer_replayssm)
                 has_baseline_layer |= not is_flashinfer_replayssm

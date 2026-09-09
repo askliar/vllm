@@ -196,16 +196,18 @@ class CacheConfig:
       caching is enabled.
     """
     replayssm_buffer_len: int = Field(default=16, gt=0)
-    """ReplaySSM logical history length B for Mamba2. Triton uses B physical
-    rows and FlashInfer uses B+T, where T is the target verification length.
+    """ReplaySSM logical history length B. Mamba2 Triton uses B physical rows
+    and Mamba2 FlashInfer uses B+T, where T is the verification length. GDN
+    FlashInfer currently requires B=16 and uses a fixed 32-row physical ring.
     Kimi-K3 speculative decode does not use B. Default 16."""
     use_replayssm: bool = False
-    """Use the ReplaySSM Mamba2 decode kernel: cache recent SSM inputs and skip
-    the per-step full-state store, writing the checkpoint back only on flush.
+    """Use a supported ReplaySSM decode kernel: cache recent recurrent inputs
+    and skip the per-step full-state store, writing the checkpoint only on flush.
     Triton supports 'none' and 'align' on Model Runner V1. FlashInfer supports
     'none', 'align', and 'all' on Model Runner V1 and V2. Mamba2 speculative
     decoding requires FlashInfer. With prefix caching enabled, Triton supports
-    'align'; FlashInfer supports 'align' and 'all'. Pipeline parallelism is not
+    'align'; FlashInfer Mamba2 supports 'align' and 'all'. The opt-in GDN
+    FlashInfer path supports only mode 'none'. Pipeline parallelism is not
     supported."""
     use_kda_recoverssm: bool = field(default=False, init=False)
     """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""

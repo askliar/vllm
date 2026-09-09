@@ -65,6 +65,11 @@ class GDNAttentionMetadata:
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
 
+    # FlashInfer GDN ReplaySSM packs ragged real-token rows into a fixed T=4/8
+    # launch and gathers these dense output positions back afterward.
+    replayssm_output_indices: torch.Tensor | None = None
+    replayssm_executed_query_width: int | None = None
+
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
     chunk_offsets: torch.Tensor | None = None
@@ -108,6 +113,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
+        self.use_gdn_replayssm = vllm_config.is_gdn_replayssm_enabled()
+        self.replayssm_executed_query_width = (
+            8 if self.num_spec == 7 else 4 if self.use_gdn_replayssm else None
+        )
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 
         self.use_full_cuda_graph: bool = (
@@ -123,8 +132,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 self.compilation_config.max_cudagraph_capture_size,
             )
 
+        self.state_table_width = 1 if self.use_gdn_replayssm else self.num_spec + 1
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
-            (self.decode_cudagraph_max_bs, self.num_spec + 1),
+            (self.decode_cudagraph_max_bs, self.state_table_width),
             dtype=torch.int32,
             device=device,
         )
@@ -163,6 +173,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        self.replayssm_output_indices: torch.Tensor | None = None
+        if self.use_gdn_replayssm:
+            self.replayssm_output_indices = torch.empty(
+                (self.decode_cudagraph_max_bs,), dtype=torch.int32, device=device
+            )
 
     def _build_chunk_metadata(
         self,
@@ -227,7 +242,46 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
-        if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
+        if self.use_gdn_replayssm:
+            if m.is_prefilling is None or m.seq_lens_cpu_upper_bound is None:
+                raise ValueError(
+                    "FlashInfer GDN ReplaySSM requires prefill and sequence-length "
+                    "metadata"
+                )
+            query_lens_cpu_all = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            decode_rows = query_lens_cpu_all == 1
+            if num_decode_draft_tokens_cpu is not None:
+                decode_rows |= (num_decode_draft_tokens_cpu >= 0) & (
+                    query_lens_cpu_all == num_decode_draft_tokens_cpu + 1
+                )
+            replayssm_prefilling = m.is_prefilling & ~(
+                (m.seq_lens_cpu_upper_bound > query_lens_cpu_all) & decode_rows
+            )
+            spec_sequence_masks_cpu = ~replayssm_prefilling & (query_lens_cpu_all > 0)
+            num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
+            if num_spec_decodes == 0:
+                spec_sequence_masks = None
+                spec_sequence_masks_cpu = None
+            else:
+                assert self.replayssm_executed_query_width is not None
+                replay_query_lens = query_lens_cpu_all[spec_sequence_masks_cpu]
+                if int(replay_query_lens.max().item()) > (
+                    self.replayssm_executed_query_width
+                ):
+                    raise ValueError(
+                        "FlashInfer GDN ReplaySSM decode row exceeds its fixed "
+                        f"T={self.replayssm_executed_query_width} launch width"
+                    )
+                spec_sequence_masks = async_tensor_h2d(
+                    spec_sequence_masks_cpu, device=query_start_loc.device
+                )
+                if num_accepted_tokens is None:
+                    num_accepted_tokens = torch.ones(
+                        m.num_reqs,
+                        dtype=torch.int32,
+                        device=query_start_loc.device,
+                    )
+        elif not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
         else:
@@ -246,6 +300,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     spec_sequence_masks_cpu, device=query_start_loc.device
                 )
 
+        replayssm_output_indices = None
         if spec_sequence_masks is None:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(m, decode_threshold=1)
@@ -304,7 +359,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
                 # Filter by spec_sequence_masks to exclude padded sequences
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
+                    spec_sequence_masks_cpu, : self.state_table_width
                 ]
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
@@ -325,7 +380,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_token_indx = index[num_non_spec_tokens:]
 
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
+                    spec_sequence_masks_cpu, : self.state_table_width
                 ]
                 non_spec_state_indices_tensor = block_table_tensor[
                     non_spec_sequence_masks_cpu, 0
@@ -363,6 +418,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             assert num_accepted_tokens is not None
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+            if self.use_gdn_replayssm:
+                assert self.replayssm_executed_query_width is not None
+                replay_query_lens_cpu = query_lens_cpu[spec_sequence_masks_cpu]
+                row_offsets = torch.arange(
+                    self.replayssm_executed_query_width, dtype=torch.int32
+                ).unsqueeze(0)
+                dense_indices = (
+                    torch.arange(num_spec_decodes, dtype=torch.int32).unsqueeze(1)
+                    * self.replayssm_executed_query_width
+                    + row_offsets
+                )
+                replayssm_output_indices = async_tensor_h2d(
+                    dense_indices[row_offsets < replay_query_lens_cpu.unsqueeze(1)],
+                    device=query_start_loc.device,
+                )
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -472,6 +542,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
+            if self.use_gdn_replayssm:
+                assert replayssm_output_indices is not None
+                assert self.replayssm_output_indices is not None
+                output_count = replayssm_output_indices.numel()
+                self.replayssm_output_indices[:output_count].copy_(
+                    replayssm_output_indices, non_blocking=True
+                )
+                replayssm_output_indices = self.replayssm_output_indices[:output_count]
+
         if (
             self.use_full_cuda_graph
             and num_prefills == 0
@@ -515,6 +594,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
+            replayssm_output_indices=replayssm_output_indices,
+            replayssm_executed_query_width=self.replayssm_executed_query_width,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,

@@ -127,6 +127,15 @@ class MambaStateDtypeCalculator:
         )
 
     @classmethod
+    def gated_delta_net_replayssm_ring_dtypes(
+        cls,
+        model_dtype: ModelDType | torch.dtype,
+    ) -> tuple[torch.dtype, torch.dtype, torch.dtype]:
+        """Return FlashInfer GDN ``(u, k, G)`` ring dtypes."""
+        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
+        return (activation_dtype, activation_dtype, torch.float32)
+
+    @classmethod
     def kda_state_dtype(
         cls,
         model_dtype: ModelDType | torch.dtype,
@@ -278,6 +287,25 @@ class MambaStateShapeCalculator:
             head_k_dim,
         )
         return conv_state_shape, temporal_state_shape
+
+    @classmethod
+    def gated_delta_net_replayssm_ring_shapes(
+        cls,
+        tp_world_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        ring_slots: int = 32,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        """Return FlashInfer GDN ``(u, k, G)`` ring shapes."""
+        local_k_heads = divide(num_k_heads, tp_world_size)
+        local_v_heads = divide(num_v_heads, tp_world_size)
+        return (
+            (local_v_heads, ring_slots, head_v_dim),
+            (local_k_heads, ring_slots, head_k_dim),
+            (local_v_heads, ring_slots),
+        )
 
     @classmethod
     def kda_state_shape(
