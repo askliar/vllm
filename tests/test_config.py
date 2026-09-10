@@ -162,10 +162,19 @@ def test_gdn_replayssm_validation(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "flashinfer_replayssm")
 
     config.cache_config.mamba_cache_mode = "align"
-    with pytest.raises(ValueError, match="mamba-cache-mode=none"):
+    config.cache_config.enable_prefix_caching = True
+    VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.cache_config.mamba_cache_mode = "none"
+    with pytest.raises(ValueError, match="prefix caching requires.*align"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.cache_config.mamba_cache_mode = "all"
+    with pytest.raises(ValueError, match="only none and align"):
         VllmConfig.validate_mamba_cached_kernel(config)
 
     config.cache_config.mamba_cache_mode = "none"
+    config.cache_config.enable_prefix_caching = False
     config.num_speculative_tokens = 1
     with pytest.raises(ValueError, match="0, 3, or 7"):
         VllmConfig.validate_mamba_cached_kernel(config)

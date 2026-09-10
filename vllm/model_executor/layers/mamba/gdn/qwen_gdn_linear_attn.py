@@ -383,6 +383,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.num_v_heads,
             self.head_k_dim,
             self.head_v_dim,
+            ring_slots=self.replayssm_ring_slots,
         )
 
     def __init__(

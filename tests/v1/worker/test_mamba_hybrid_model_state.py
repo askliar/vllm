@@ -93,6 +93,7 @@ def test_previous_scheduled_page_is_passed_only_to_mamba2() -> None:
     prev_last_scheduled_idx = torch.tensor([3, 5], dtype=torch.int32)
     metadata = MambaHybridAttnMetadata(
         is_prefilling=torch.zeros(2, dtype=torch.bool),
+        is_last_prefill=torch.zeros(2, dtype=torch.bool),
         prev_last_scheduled_idx=prev_last_scheduled_idx,
     )
 
@@ -108,18 +109,29 @@ def test_previous_scheduled_page_is_passed_only_to_mamba2() -> None:
 
 
 @pytest.mark.parametrize(
-    ("computed", "scheduled", "drafts", "prefilling", "expected_prefilling"),
+    (
+        "num_spec",
+        "computed",
+        "scheduled",
+        "drafts",
+        "prefilling",
+        "expected_prefilling",
+    ),
     [
-        (256, 4, 3, True, False),  # Cached prompt tail plus placeholders.
-        (1, 4, 3, True, False),  # Rejection can exceed the cached prefix length.
-        (256, 1, 0, True, False),
-        (0, 4, 3, True, True),  # No prior state: must stay a prefill.
-        (256, 4, 0, True, True),
-        (256, 4, 3, False, False),
+        (3, 256, 4, 3, True, False),  # Cached prompt tail plus placeholders.
+        (3, 1, 4, 3, True, False),  # Rejection can exceed cached prefix length.
+        (3, 256, 1, 0, True, False),
+        (3, 0, 4, 3, True, True),  # No prior state: must stay a prefill.
+        (3, 256, 4, 0, True, True),
+        (3, 256, 4, 3, False, False),
+        (3, 256, 8, 0, False, True),  # Wide PIECEWISE capture dummy.
+        (0, 256, 1, 0, True, False),  # Native STP final prompt tail.
+        (0, 256, 2, 0, False, True),  # Wider graph dummy stays canonical.
     ],
 )
 def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
     monkeypatch: pytest.MonkeyPatch,
+    num_spec,
     computed,
     scheduled,
     drafts,
@@ -127,7 +139,7 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
     expected_prefilling,
 ) -> None:
     state = object.__new__(MambaHybridModelState)
-    state.vllm_config = SimpleNamespace(num_speculative_tokens=3)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=num_spec)
     state.max_model_len = 8192
     state._align_mode = False
     state._use_flashinfer_replayssm = True
@@ -152,6 +164,8 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
         seq_lens_cpu_upper_bound=torch.tensor([computed + scheduled]),
         seq_lens=torch.tensor([computed + scheduled]),
         is_prefilling_np=torch.tensor([prefilling]).numpy(),
+        num_computed_prefill_tokens_np=torch.tensor([computed]).numpy(),
+        prefill_len_np=torch.tensor([computed + (1 if drafts else scheduled)]).numpy(),
         dcp_local_seq_lens=None,
         positions=positions,
         prompt_lens=torch.tensor([1024], dtype=torch.int32),

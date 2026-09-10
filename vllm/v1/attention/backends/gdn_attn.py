@@ -65,8 +65,8 @@ class GDNAttentionMetadata:
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
 
-    # FlashInfer GDN ReplaySSM packs ragged real-token rows into a fixed T=4/8
-    # launch and gathers these dense output positions back afterward.
+    # FlashInfer GDN ReplaySSM packs real-token rows into T=1/4/8 launches and
+    # gathers these dense output positions back afterward.
     replayssm_output_indices: torch.Tensor | None = None
     replayssm_executed_query_width: int | None = None
 
@@ -115,7 +115,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.use_spec_decode: bool = self.num_spec > 0
         self.use_gdn_replayssm = vllm_config.is_gdn_replayssm_enabled()
         self.replayssm_executed_query_width = (
-            8 if self.num_spec == 7 else 4 if self.use_gdn_replayssm else None
+            1
+            if self.use_gdn_replayssm and self.num_spec == 0
+            else 8
+            if self.num_spec == 7
+            else 4
+            if self.use_gdn_replayssm
+            else None
         )
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 
@@ -243,10 +249,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
         if self.use_gdn_replayssm:
-            if m.is_prefilling is None or m.seq_lens_cpu_upper_bound is None:
+            if (
+                m.is_prefilling is None
+                or m.is_last_prefill is None
+                or m.seq_lens_cpu_upper_bound is None
+            ):
                 raise ValueError(
-                    "FlashInfer GDN ReplaySSM requires prefill and sequence-length "
-                    "metadata"
+                    "FlashInfer GDN ReplaySSM requires prefill, final-prompt, and "
+                    "sequence-length metadata"
                 )
             query_lens_cpu_all = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
             decode_rows = query_lens_cpu_all == 1
@@ -254,24 +264,23 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 decode_rows |= (num_decode_draft_tokens_cpu >= 0) & (
                     query_lens_cpu_all == num_decode_draft_tokens_cpu + 1
                 )
+            assert self.replayssm_executed_query_width is not None
             replayssm_prefilling = m.is_prefilling & ~(
-                (m.seq_lens_cpu_upper_bound > query_lens_cpu_all) & decode_rows
+                m.is_last_prefill
+                & (m.seq_lens_cpu_upper_bound > query_lens_cpu_all)
+                & decode_rows
             )
-            spec_sequence_masks_cpu = ~replayssm_prefilling & (query_lens_cpu_all > 0)
+            replay_width = self.replayssm_executed_query_width
+            spec_sequence_masks_cpu = (
+                ~replayssm_prefilling
+                & (query_lens_cpu_all > 0)
+                & (query_lens_cpu_all <= replay_width)
+            )
             num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
             if num_spec_decodes == 0:
                 spec_sequence_masks = None
                 spec_sequence_masks_cpu = None
             else:
-                assert self.replayssm_executed_query_width is not None
-                replay_query_lens = query_lens_cpu_all[spec_sequence_masks_cpu]
-                if int(replay_query_lens.max().item()) > (
-                    self.replayssm_executed_query_width
-                ):
-                    raise ValueError(
-                        "FlashInfer GDN ReplaySSM decode row exceeds its fixed "
-                        f"T={self.replayssm_executed_query_width} launch width"
-                    )
                 spec_sequence_masks = async_tensor_h2d(
                     spec_sequence_masks_cpu, device=query_start_loc.device
                 )
@@ -303,7 +312,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         replayssm_output_indices = None
         if spec_sequence_masks is None:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(m, decode_threshold=1)
+                split_decodes_and_prefills(
+                    m,
+                    decode_threshold=1,
+                    treat_short_extends_as_decodes=not self.use_gdn_replayssm,
+                )
             )
             num_spec_decode_tokens = 0
             spec_token_indx = None
@@ -345,9 +358,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_decode_tokens = 0
 
             if num_prefills == 0 and num_decodes == 0:
-                spec_token_size = min(
-                    num_spec_decodes * (self.num_spec + 1),
-                    query_start_loc_cpu[-1].item(),
+                spec_token_size = (
+                    query_start_loc_cpu[-1].item()
+                    if self.use_gdn_replayssm
+                    else min(
+                        num_spec_decodes * (self.num_spec + 1),
+                        query_start_loc_cpu[-1].item(),
+                    )
                 )
                 spec_token_indx = torch.arange(
                     spec_token_size,

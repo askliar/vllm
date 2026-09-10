@@ -1799,10 +1799,14 @@ def stage_postprocess_inputs_to_gpu(
         scheduled_np[i] = scheduled
         computed_np[i] = computed
         draft_np[i] = num_draft
-        # Match Mamba attention: stateful one-token prompt tails, including
-        # those padded with speculative placeholders, run the decode kernels.
+        # Only a final stateful one-token prompt tail may use ReplaySSM. An
+        # intermediate one-token chunk must update the canonical checkpoint so
+        # a following multi-token prefill does not read stale recurrent state.
+        is_last_prefill = computed + scheduled >= req_state.num_prompt_tokens
         prefill_np[i] = computed < req_state.num_prompt_tokens and not (
-            computed > 0 and (scheduled == 1 or scheduled == num_draft + 1)
+            computed > 0
+            and is_last_prefill
+            and (scheduled == 1 or scheduled == num_draft + 1)
         )
     if run_prefix_state_migration:
         assert ctx.mamba_state_idx_buf is not None

@@ -2955,16 +2955,18 @@ class VllmConfig:
             return self
 
         if use_gdn_replayssm:
-            if self.cache_config.mamba_cache_mode != "none":
+            if self.cache_config.mamba_cache_mode not in ("none", "align"):
                 raise ValueError(
-                    "FlashInfer GDN ReplaySSM supports only "
-                    "--mamba-cache-mode=none; prefix modes require a GDN "
-                    "ReplaySSM materialization API"
+                    "FlashInfer GDN ReplaySSM supports only none and align "
+                    "Mamba cache modes; Qwen3.5 does not support all mode"
                 )
-            if self.cache_config.enable_prefix_caching:
+            if (
+                self.cache_config.enable_prefix_caching
+                and self.cache_config.mamba_cache_mode != "align"
+            ):
                 raise ValueError(
-                    "FlashInfer GDN ReplaySSM does not support prefix caching; "
-                    "a GDN ReplaySSM materialization API is required"
+                    "FlashInfer GDN ReplaySSM prefix caching requires "
+                    "--mamba-cache-mode=align"
                 )
             if self.cache_config.replayssm_buffer_len != 16:
                 raise ValueError(
@@ -2973,7 +2975,7 @@ class VllmConfig:
             if self.num_speculative_tokens not in (0, 3, 7):
                 raise ValueError(
                     "FlashInfer GDN ReplaySSM supports 0, 3, or 7 speculative "
-                    "tokens (executed width 4 or 8)"
+                    "tokens (executed width 1, 4, or 8)"
                 )
             if self.model_config is not None:
                 if self.model_config.dtype != torch.bfloat16:

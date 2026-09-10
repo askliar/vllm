@@ -39,6 +39,7 @@ from vllm.v1.worker.utils import AttentionGroup
 @dataclass
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
+    is_last_prefill: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
     prev_last_scheduled_idx: torch.Tensor | None = None
@@ -48,7 +49,10 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
         kv_cache_group_id: int,
         num_reqs: int,
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        return {
+            "is_prefilling": self.is_prefilling[:num_reqs],
+            "is_last_prefill": self.is_last_prefill[:num_reqs],
+        }
 
     def get_extra_attn_kwargs(
         self,
@@ -306,6 +310,15 @@ class MambaHybridModelState(DefaultModelState):
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
             input_batch.is_prefilling_np
         )
+        is_last_prefill = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
+        is_last_prefill[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.is_prefilling_np
+            & (
+                input_batch.num_computed_prefill_tokens_np
+                + input_batch.num_scheduled_tokens
+                >= input_batch.prefill_len_np
+            )
+        )
         prev_last_scheduled_idx = None
         if not for_capture:
             prev_last_scheduled_idx = self._stage_prev_last_scheduled_idx(
@@ -349,9 +362,16 @@ class MambaHybridModelState(DefaultModelState):
                 decode_rows |= (num_decode_draft_tokens_cpu >= 0) & (
                     query_lens == num_decode_draft_tokens_cpu + 1
                 )
-            replayssm_prefilling = is_prefilling & ~(
-                (seq_lens_cpu_upper_bound[:num_reqs] > query_lens) & decode_rows
-            )
+            num_spec = self.vllm_config.num_speculative_tokens
+            replay_width = 1 if num_spec == 0 else 8 if num_spec == 7 else 4
+            replayssm_prefilling = (
+                is_prefilling
+                & ~(
+                    is_last_prefill
+                    & (seq_lens_cpu_upper_bound[:num_reqs] > query_lens)
+                    & decode_rows
+                )
+            ) | (query_lens > replay_width)
             self._is_prefilling_gpu[:num_reqs].copy_(
                 replayssm_prefilling, non_blocking=True
             )
@@ -380,6 +400,7 @@ class MambaHybridModelState(DefaultModelState):
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
+            is_last_prefill=is_last_prefill,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
             prev_last_scheduled_idx=prev_last_scheduled_idx,

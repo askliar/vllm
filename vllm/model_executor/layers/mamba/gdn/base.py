@@ -50,13 +50,22 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         self.replayssm_buffer_len = (
             self.cache_config.replayssm_buffer_len if self.use_replayssm else None
         )
-        self.replayssm_executed_query_width = (
-            8 if self.num_spec == 7 else 4 if self.use_replayssm else None
+        if not self.use_replayssm:
+            self.replayssm_executed_query_width = None
+        elif self.num_spec == 0:
+            self.replayssm_executed_query_width = 1
+        elif self.num_spec == 7:
+            self.replayssm_executed_query_width = 8
+        else:
+            self.replayssm_executed_query_width = 4
+        self.replayssm_ring_slots = (
+            16 if self.use_replayssm and self.num_spec == 0 else 32
         )
         if self.replayssm_executed_query_width is not None:
+            packed_width = max(self.replayssm_executed_query_width, 4)
             self.register_buffer(
                 "_replayssm_offsets",
-                torch.arange(self.replayssm_executed_query_width, dtype=torch.int32),
+                torch.arange(packed_width, dtype=torch.int32),
                 persistent=False,
             )
         self.replayssm_cache = (
