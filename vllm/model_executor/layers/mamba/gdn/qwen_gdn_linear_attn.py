@@ -30,6 +30,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.replayssm import (
+    check_gdn_replayssm_dependencies,
+    run_gdn_replayssm,
+)
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
@@ -362,7 +366,7 @@ class ChunkGatedDeltaRule(CustomOp):
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_shape(
         self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    ) -> tuple[tuple[int, ...], ...]:
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
             self.num_k_heads,
@@ -371,6 +375,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.head_v_dim,
             self.conv_kernel_size,
             self.num_spec,
+        )
+
+    def get_replayssm_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        if not self.use_replayssm:
+            return ()
+        assert self.replayssm_ring_slots is not None
+        return MambaStateShapeCalculator.gated_delta_net_replayssm_ring_shapes(
+            self.tp_size,
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            ring_slots=self.replayssm_ring_slots,
         )
 
     def __init__(
@@ -502,7 +519,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
         self.gdn_decode_kernel = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
-        if self.gdn_decode_kernel == "cuda" and current_platform.is_cuda_alike():
+        if self.use_replayssm:
+            reason = self._flashinfer_replayssm_unsupported_reason(vllm_config)
+            if reason is not None:
+                raise ValueError(
+                    "VLLM_GDN_DECODE_KERNEL=flashinfer_replayssm is not "
+                    f"supported: {reason}"
+                )
+            assert self.replayssm_executed_query_width is not None
+            check_gdn_replayssm_dependencies(
+                self.replayssm_executed_query_width,
+                needs_materializer=self.cache_config.mamba_cache_mode == "align",
+            )
+        elif self.gdn_decode_kernel == "cuda" and current_platform.is_cuda_alike():
             reason = self._fused_gdn_decode_unsupported_reason(vllm_config)
             if reason is not None:
                 if "VLLM_GDN_DECODE_KERNEL" in os.environ:
@@ -523,6 +552,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def _flashinfer_replayssm_unsupported_reason(
+        self, vllm_config: VllmConfig
+    ) -> str | None:
+        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
+        if self.gqa_interleaved_layout:
+            return "Qwen3-Next's interleaved GQA layout has not been validated"
+        if self.head_k_dim != 128 or self.head_v_dim != 128:
+            return "the FlashInfer kernel requires K=V=128"
+        if self.num_k_heads % self.tp_size or self.num_v_heads % self.tp_size:
+            return "tensor-parallel head counts must divide evenly"
+        if self.num_v_heads % self.num_k_heads:
+            return "value heads must be an integer multiple of key heads"
+        if vllm_config.model_config.dtype != torch.bfloat16:
+            return "model activations must use bfloat16"
+        if (
+            conv_state_dtype != torch.bfloat16
+            or recurrent_state_dtype != torch.bfloat16
+        ):
+            return "convolution and recurrent state must use bfloat16"
+        if not current_platform.has_device_capability(90):
+            return "the initial integration requires an SM90+ CUDA device"
+        return None
 
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
@@ -906,6 +958,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         use_fused_gdn_decode = (
             self.enable_fused_gdn_decode
+            and not self.use_replayssm
             and hidden_states.dtype == torch.bfloat16
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
         )
@@ -1286,6 +1339,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         if (
             self.enable_packed_recurrent_decode
+            and not self.use_replayssm
             and attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
@@ -1357,7 +1411,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                max_query_len=(
+                    attn_metadata.replayssm_executed_query_width
+                    or spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
 
@@ -1394,7 +1451,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        if self.use_replayssm and spec_sequence_masks is not None:
+            query_spec, key_spec, value_spec = None, None, None
+        else:
+            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
@@ -1457,7 +1517,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if spec_sequence_masks is not None and self.use_replayssm:
+            assert mixed_qkv_spec is not None
+            assert a_spec is not None and b_spec is not None
+            assert spec_state_indices_tensor is not None
+            assert spec_query_start_loc is not None
+            assert attn_metadata.replayssm_output_indices is not None
+            assert attn_metadata.replayssm_executed_query_width is not None
+            num_replay_rows = attn_metadata.num_spec_decodes
+            core_attn_out_spec = run_gdn_replayssm(
+                mixed_qkv=mixed_qkv_spec,
+                a=a_spec,
+                b=b_spec,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                checkpoint_state=ssm_state,
+                replayssm_cache=self.replayssm_cache,
+                ring_start=self._replayssm_ring_start,
+                num_committed=self._replayssm_prev_num_accepted,
+                query_start_loc=spec_query_start_loc[: num_replay_rows + 1],
+                state_indices=spec_state_indices_tensor[:num_replay_rows, 0],
+                output_indices=attn_metadata.replayssm_output_indices,
+                executed_query_width=(attn_metadata.replayssm_executed_query_width),
+                num_k_heads=self.num_k_heads // self.tp_size,
+                num_v_heads=self.num_v_heads // self.tp_size,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+                offsets=self._replayssm_offsets,
+            ).unsqueeze(0)
+            last_recurrent_state = None
+        elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -1576,7 +1665,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            if self.use_replayssm:
+                # FULL graphs may include padded token lanes after all real
+                # replay rows. Scatter only the gathered real-token outputs.
+                assert spec_token_indx is not None
+                core_attn_out.index_copy_(
+                    0, spec_token_indx.long(), core_attn_out_spec.squeeze(0)
+                )
+            else:
+                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
@@ -1819,7 +1916,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> bool:
         state_indices = attn_metadata.spec_state_indices_tensor
         return (
-            attn_metadata.spec_sequence_masks is not None
+            not self.use_replayssm
+            and attn_metadata.spec_sequence_masks is not None
             and attn_metadata.num_decodes == 0
             and attn_metadata.num_spec_decodes > 0
             and self.kv_cache[1].dtype in FUSED_GDN_STATE_DTYPES

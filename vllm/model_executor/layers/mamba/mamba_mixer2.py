@@ -3,6 +3,7 @@
 
 
 from collections.abc import Sequence
+from typing import Any
 
 import torch
 from torch import nn
@@ -1300,14 +1301,10 @@ def share_replayssm_ring_trackers(
     only consume the shared values.
     """
 
-    replayssm_mixers: dict[str, MambaMixer2] = {}
+    replayssm_mixers: dict[str, Any] = {}
     for layer_name in ordered_layer_names:
         layer = forward_context[layer_name]
-        if (
-            isinstance(layer, MambaMixer2)
-            and layer.use_replayssm
-            and layer.use_flashinfer_replayssm
-        ):
+        if getattr(layer, "use_flashinfer_replayssm", False):
             replayssm_mixers[layer_name] = layer
 
     layer_to_group: dict[str, int] = {}
@@ -1327,11 +1324,24 @@ def share_replayssm_ring_trackers(
         first_mixer = replayssm_mixers[group_layer_names[0]]
         first_state = first_mixer.kv_cache[1]
         num_blocks, device = first_state.shape[0], first_state.device
+        first_policy = (
+            first_mixer.replayssm_buffer_len,
+            getattr(first_mixer, "replayssm_executed_query_width", None),
+        )
         for layer_name in group_layer_names:
-            state = replayssm_mixers[layer_name].kv_cache[1]
+            mixer = replayssm_mixers[layer_name]
+            state = mixer.kv_cache[1]
             if (state.shape[0], state.device) != (num_blocks, device):
                 raise ValueError(
                     "ReplaySSM layers in one cache group must share cache capacity"
+                )
+            policy = (
+                mixer.replayssm_buffer_len,
+                getattr(mixer, "replayssm_executed_query_width", None),
+            )
+            if policy != first_policy:
+                raise ValueError(
+                    "ReplaySSM layers in one cache group must share replay geometry"
                 )
 
         ring_start = torch.zeros(num_blocks, dtype=torch.int32, device=device)

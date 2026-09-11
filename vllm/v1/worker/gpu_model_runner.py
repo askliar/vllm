@@ -38,7 +38,6 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheConfig
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
-from vllm.config.mamba import MambaBackendEnum
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -1007,8 +1006,7 @@ class GPUModelRunner(
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
         self._use_flashinfer_replayssm = (
-            self.cache_config.use_replayssm
-            and self.vllm_config.mamba_config.backend == MambaBackendEnum.FLASHINFER
+            self.vllm_config.is_flashinfer_replayssm_enabled()
         )
         self._needs_prefix_state_migration = (
             self.cache_config.mamba_cache_mode == "align"
@@ -2454,9 +2452,13 @@ class GPUModelRunner(
         # Used by mamba backends to distinguish actual decodes from
         # short extends.
         is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
+        is_last_prefill = is_prefilling & (
+            seq_lens_cpu_upper_bound >= num_prompt_tokens_cpu
+        )
         # Zero out padded rows so stale data from condense() doesn't
         # misclassify padding as prefill in CUDA graph mode.
         is_prefilling[num_reqs:] = False
+        is_last_prefill[num_reqs:] = False
 
         if self.use_async_spec_decode:
             # GPU tensors are authoritative in async mode.
@@ -2548,6 +2550,7 @@ class GPUModelRunner(
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
+            is_last_prefill=is_last_prefill,
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
@@ -4544,6 +4547,7 @@ class GPUModelRunner(
                     self.requests,
                     self.mamba_state_idx,
                     run_prefix_state_migration=self._needs_prefix_state_migration,
+                    use_gdn_replayssm=self.vllm_config.is_gdn_replayssm_enabled(),
                 )
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0

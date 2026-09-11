@@ -128,7 +128,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
-    VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+    VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton", "flashinfer_replayssm"] = "cuda"
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1225,13 +1225,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
     ),
-    # Select the GDN MTP decode implementation. "cuda" uses the fused decode
-    # kernel where supported and falls back to "triton" otherwise; setting it
-    # explicitly to "cuda" raises when unsupported.
+    # Select the GDN decode implementation. ``flashinfer_replayssm`` uses the
+    # opt-in checkpoint-and-replay path and requires ``--use-replayssm``.
     "VLLM_GDN_DECODE_KERNEL": env_with_choices(
         "VLLM_GDN_DECODE_KERNEL",
         "cuda",
-        ["cuda", "triton"],
+        ["cuda", "triton", "flashinfer_replayssm"],
         case_sensitive=False,
     ),
     # Disable pynccl (using torch.distributed instead)

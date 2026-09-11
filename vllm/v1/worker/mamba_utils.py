@@ -8,7 +8,6 @@ from typing import Any, NamedTuple
 import torch
 
 from vllm.config import CacheConfig
-from vllm.config.mamba import MambaBackendEnum
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncsByType,
@@ -1022,9 +1021,8 @@ class MambaSpecDecodeGPUContext:
                 state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
                 attention = forward_context[layer_name]
                 kv_caches: list[torch.Tensor] = attention.kv_cache
-                is_flashinfer_replayssm = (
-                    getattr(attention, "use_replayssm", False)
-                    and attention.mamba_config.backend == MambaBackendEnum.FLASHINFER
+                is_flashinfer_replayssm = getattr(
+                    attention, "use_flashinfer_replayssm", False
                 )
                 has_replayssm_layer |= bool(is_flashinfer_replayssm)
                 has_baseline_layer |= not is_flashinfer_replayssm
@@ -1760,6 +1758,7 @@ def stage_postprocess_inputs_to_gpu(
     requests: dict[str, CachedRequestState],
     mamba_state_idx: dict[str, int],
     run_prefix_state_migration: bool,
+    use_gdn_replayssm: bool = False,
 ) -> None:
     """Stage the per-request decisions consumed after token acceptance.
 
@@ -1801,10 +1800,14 @@ def stage_postprocess_inputs_to_gpu(
         scheduled_np[i] = scheduled
         computed_np[i] = computed
         draft_np[i] = num_draft
-        # Match Mamba attention: stateful one-token prompt tails, including
-        # those padded with speculative placeholders, run the decode kernels.
+        # GDN keeps intermediate prompt chunks canonical. Mamba2's forward
+        # builder routes every stateful one-token chunk through decode, so its
+        # postprocess must preserve that chunk's replay history as well.
+        is_last_prefill = computed + scheduled >= req_state.num_prompt_tokens
         prefill_np[i] = computed < req_state.num_prompt_tokens and not (
-            computed > 0 and (scheduled == 1 or scheduled == num_draft + 1)
+            computed > 0
+            and (not use_gdn_replayssm or is_last_prefill)
+            and (scheduled == 1 or scheduled == num_draft + 1)
         )
     if run_prefix_state_migration:
         assert ctx.mamba_state_idx_buf is not None

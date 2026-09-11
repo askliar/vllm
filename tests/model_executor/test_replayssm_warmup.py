@@ -113,6 +113,7 @@ def test_replayssm_autotune_slots_restore_state_and_trackers():
     mixer = MambaMixer2.__new__(MambaMixer2)
     torch.nn.Module.__init__(mixer)
     mixer.use_replayssm = True
+    mixer.use_flashinfer_replayssm = True
     mixer.replayssm_buffer_len = 16
     mixer.kv_cache = (
         torch.full((4, 2), 3.0),

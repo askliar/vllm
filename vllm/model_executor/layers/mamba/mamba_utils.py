@@ -25,6 +25,21 @@ logger = init_logger(__name__)
 ConvStateLayoutType = Literal["SD", "DS"]
 
 
+def gdn_replayssm_geometry(num_speculative_tokens: int) -> tuple[int, int]:
+    """Return GDN's executed query width and physical replay ring slots."""
+    if num_speculative_tokens == 0:
+        return 1, 16
+    if 1 <= num_speculative_tokens <= 3:
+        return 4, 32
+    if 4 <= num_speculative_tokens <= 7:
+        return 8, 32
+    raise ValueError(
+        "FlashInfer GDN ReplaySSM supports 0 through 7 speculative "
+        "tokens by padding MTP launches to width 4 or 8; got "
+        f"{num_speculative_tokens}"
+    )
+
+
 @functools.lru_cache
 def get_conv_state_layout() -> ConvStateLayoutType:
     """Return the SSM conv state layout.
@@ -125,6 +140,15 @@ class MambaStateDtypeCalculator:
         return cls._mamba_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
+
+    @classmethod
+    def gated_delta_net_replayssm_ring_dtypes(
+        cls,
+        model_dtype: ModelDType | torch.dtype,
+    ) -> tuple[torch.dtype, torch.dtype, torch.dtype]:
+        """Return FlashInfer GDN ``(u, k, G)`` ring dtypes."""
+        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
+        return (activation_dtype, activation_dtype, torch.float32)
 
     @classmethod
     def kda_state_dtype(
@@ -278,6 +302,25 @@ class MambaStateShapeCalculator:
             head_k_dim,
         )
         return conv_state_shape, temporal_state_shape
+
+    @classmethod
+    def gated_delta_net_replayssm_ring_shapes(
+        cls,
+        tp_world_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        ring_slots: int = 32,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        """Return FlashInfer GDN ``(u, k, G)`` ring shapes."""
+        local_k_heads = divide(num_k_heads, tp_world_size)
+        local_v_heads = divide(num_v_heads, tp_world_size)
+        return (
+            (local_v_heads, ring_slots, head_v_dim),
+            (local_k_heads, ring_slots, head_k_dim),
+            (local_v_heads, ring_slots),
+        )
 
     @classmethod
     def kda_state_shape(

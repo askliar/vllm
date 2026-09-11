@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pydantic
 import pytest
+import torch
 from huggingface_hub import ResolvedRevision
 from pydantic import ValidationError
 
@@ -119,6 +120,77 @@ def test_kda_recoverssm_derivation_is_revalidated():
     config.cache_config.use_kda_recoverssm = False
     config.use_v2_model_runner = False
     VllmConfig.validate_mamba_cached_kernel(config)
+
+
+def test_gdn_replayssm_validation(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "flashinfer_replayssm")
+    monkeypatch.setenv("SGLANG_GDN_WY_STRIDED_QKV", "1")
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            use_replayssm=True,
+            use_kda_recoverssm=False,
+            mamba_cache_mode="none",
+            enable_prefix_caching=False,
+            replayssm_buffer_len=16,
+            mamba_cache_dtype="auto",
+            mamba_ssm_cache_dtype="auto",
+        ),
+        num_speculative_tokens=3,
+        model_config=SimpleNamespace(
+            architecture="Qwen3_5ForCausalLM",
+            dtype=torch.bfloat16,
+            hf_text_config=SimpleNamespace(
+                linear_key_head_dim=128,
+                linear_value_head_dim=128,
+            ),
+        ),
+        mamba_config=SimpleNamespace(backend=MambaBackendEnum.TRITON),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            use_ubatching=False,
+        ),
+        kv_transfer_config=None,
+    )
+
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert VllmConfig.is_gdn_replayssm_enabled(config)
+    assert VllmConfig.is_flashinfer_replayssm_enabled(config)
+
+    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "cuda")
+    with pytest.raises(ValueError, match="on Qwen3.5 requires"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "flashinfer_replayssm")
+
+    config.cache_config.mamba_cache_mode = "align"
+    config.cache_config.enable_prefix_caching = True
+    VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.cache_config.mamba_cache_mode = "none"
+    with pytest.raises(ValueError, match="prefix caching requires.*align"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.cache_config.mamba_cache_mode = "all"
+    with pytest.raises(ValueError, match="only none and align"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.cache_config.mamba_cache_mode = "none"
+    config.cache_config.enable_prefix_caching = False
+    for num_speculative_tokens in range(8):
+        config.num_speculative_tokens = num_speculative_tokens
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.num_speculative_tokens = 8
+    with pytest.raises(ValueError, match="0 through 7"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.num_speculative_tokens = 3
+    config.model_config.architecture = "NemotronHForCausalLM"
+    with pytest.raises(ValueError, match="only Qwen3.5"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.cache_config.use_replayssm = False
+    with pytest.raises(ValueError, match="requires --use-replayssm"):
+        VllmConfig.validate_mamba_cached_kernel(config)
 
 
 def test_per_request_spec_decode_metrics_requires_spec_decode():
