@@ -129,6 +129,7 @@ def test_previous_scheduled_page_is_passed_only_to_mamba2() -> None:
         (3, 0, 4, 3, True, True, True, 1),
         (3, 256, 4, 0, True, True, True, 260),
         (3, 256, 4, 3, False, False, True, 256),
+        (5, 256, 6, 5, False, False, True, 256),
         (3, 256, 8, 0, False, True, True, 256),
         (0, 256, 1, 0, True, False, True, 257),
         (0, 256, 2, 0, False, True, True, 256),

@@ -225,6 +225,37 @@ def test_gdn_replayssm_routes_stateful_decode_rows(monkeypatch: pytest.MonkeyPat
     assert meta.num_accepted_tokens.tolist() == [1, 2]
 
 
+def test_gdn_replayssm_dl5_pads_six_tokens_to_t8(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "flashinfer_replayssm")
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
+        lambda tensor, *, device: tensor.to(device),
+    )
+    builder = _create_minimal_gdn_builder(num_spec=5)
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[80], query_lens=[6]), BLOCK_SIZE, DEVICE
+    ).replace(
+        is_prefilling=torch.tensor([False]),
+        is_last_prefill=torch.tensor([False]),
+    )
+    meta = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_decode_draft_tokens_cpu=torch.tensor([5], dtype=torch.int32),
+        num_accepted_tokens=torch.tensor([4], dtype=torch.int32),
+    )
+
+    assert meta.num_spec_decodes == 1
+    assert meta.num_spec_decode_tokens == 6
+    assert meta.replayssm_executed_query_width == 8
+    assert meta.spec_query_start_loc is not None
+    assert meta.spec_query_start_loc.tolist() == [0, 6]
+    assert meta.replayssm_output_indices is not None
+    assert meta.replayssm_output_indices.tolist() == list(range(6))
+
+
 def test_gdn_replayssm_full_graph_padding_uses_stable_request_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ):

@@ -218,6 +218,47 @@ def test_gdn_replayssm_warmup_runs_fixed_width_decode():
     assert block_ids[:, 0].tolist() == [0, 1, 2, 3, 4]
 
 
+def test_gdn_replayssm_warmup_uses_real_dl5_query_length():
+    layer = _gdn_layer(num_blocks=5, executed_query_width=8)
+    block_ids = np.arange(5, dtype=np.int32).reshape(5, 1)
+    multi_group_block_table = SimpleNamespace(
+        block_tables=[SimpleNamespace(block_table=SimpleNamespace(np=block_ids))],
+        commit_block_table=Mock(),
+    )
+    dummy_run = Mock()
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            is_gdn_replayssm_enabled=lambda: True,
+            num_speculative_tokens=5,
+            use_v2_model_runner=False,
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        max_num_tokens=24,
+        cudagraph_batch_sizes=[6, 12, 24],
+        kv_cache_config=SimpleNamespace(num_blocks=10),
+        input_batch=SimpleNamespace(block_table=multi_group_block_table),
+        get_model=lambda: SimpleNamespace(modules=lambda: (layer,)),
+        _dummy_run=dummy_run,
+    )
+
+    gdn_replayssm_warmup(runner)
+
+    assert dummy_run.call_args_list == [
+        call(
+            num_tokens=num_tokens,
+            uniform_decode=True,
+            skip_eplb=True,
+            is_profile=True,
+            randomize_inputs=True,
+            allow_microbatching=False,
+            force_attention=True,
+            profile_seq_lens=7,
+        )
+        for num_tokens in (6, 12, 24)
+    ]
+
+
 def test_gdn_replayssm_warmup_uses_v2_capture_descriptors():
     layer = _gdn_layer(num_blocks=5)
     dummy_run = Mock()

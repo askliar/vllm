@@ -379,6 +379,8 @@ def _check_gdn_replayssm_parity(
         pytest.param(False, "ngram", 3, id="v1-ngram-t4"),
         pytest.param(False, "mtp", 3, id="v1-mtp-t4"),
         pytest.param(True, "mtp", 3, id="v2-mtp-t4"),
+        pytest.param(False, "mtp", 5, id="v1-mtp-dl5-padded-t8"),
+        pytest.param(True, "mtp", 5, id="v2-mtp-dl5-padded-t8"),
         pytest.param(False, "mtp", 7, id="v1-mtp-t8"),
         pytest.param(True, "mtp", 7, id="v2-mtp-t8"),
     ],
@@ -598,6 +600,7 @@ def _check_gdn_replayssm_prefix_caching(
         pytest.param(False, 0, id="v1-stp"),
         pytest.param(True, 0, id="v2-stp"),
         pytest.param(True, 3, id="v2-mtp-t4"),
+        pytest.param(True, 5, id="v2-mtp-dl5-padded-t8"),
     ],
 )
 def test_gdn_replayssm_align_prefix_cache_matches_baseline(

@@ -175,8 +175,12 @@ def test_gdn_replayssm_validation(monkeypatch: pytest.MonkeyPatch):
 
     config.cache_config.mamba_cache_mode = "none"
     config.cache_config.enable_prefix_caching = False
-    config.num_speculative_tokens = 1
-    with pytest.raises(ValueError, match="0, 3, or 7"):
+    for num_speculative_tokens in range(8):
+        config.num_speculative_tokens = num_speculative_tokens
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+    config.num_speculative_tokens = 8
+    with pytest.raises(ValueError, match="0 through 7"):
         VllmConfig.validate_mamba_cached_kernel(config)
 
     config.num_speculative_tokens = 3

@@ -350,6 +350,7 @@ def test_gdn_canonical_prefill_64_1_4_matches_unchunked():
         (8, 8, 30, [8, 8, 8], [5, 2, 7]),
         (4, 12, 28, [1, 3, 2], [1, 2, 1]),
         (8, 8, 30, [1, 5, 2], [1, 3, 2]),
+        (8, 8, 30, [6, 3, 5], [4, 2, 3]),
     ],
 )
 def test_gdn_replayssm_multistep_matches_accepted_state_reference(

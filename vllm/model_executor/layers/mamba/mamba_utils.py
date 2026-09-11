@@ -29,11 +29,13 @@ def gdn_replayssm_geometry(num_speculative_tokens: int) -> tuple[int, int]:
     """Return GDN's executed query width and physical replay ring slots."""
     if num_speculative_tokens == 0:
         return 1, 16
-    if num_speculative_tokens in (3, 7):
-        return num_speculative_tokens + 1, 32
+    if 1 <= num_speculative_tokens <= 3:
+        return 4, 32
+    if 4 <= num_speculative_tokens <= 7:
+        return 8, 32
     raise ValueError(
-        "FlashInfer GDN ReplaySSM supports 0, 3, or 7 speculative "
-        "tokens (executed width 1, 4, or 8); got "
+        "FlashInfer GDN ReplaySSM supports 0 through 7 speculative "
+        "tokens by padding MTP launches to width 4 or 8; got "
         f"{num_speculative_tokens}"
     )
 

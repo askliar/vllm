@@ -189,7 +189,9 @@ def gdn_replayssm_warmup(runner: "GPUModelRunner") -> None:
     config = runner.vllm_config
     if not config.is_gdn_replayssm_enabled():
         return
-    query_len, _ = gdn_replayssm_geometry(config.num_speculative_tokens)
+    executed_query_width, _ = gdn_replayssm_geometry(config.num_speculative_tokens)
+    query_len = config.num_speculative_tokens + 1
+    assert query_len <= executed_query_width
     max_num_reqs = min(
         runner.scheduler_config.max_num_seqs,
         runner.max_num_tokens // query_len,

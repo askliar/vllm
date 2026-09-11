@@ -10,14 +10,26 @@ from vllm.model_executor.layers.mamba.mamba_utils import gdn_replayssm_geometry
 from vllm.model_executor.layers.mamba.ops import ssu_dispatch
 
 
-@pytest.mark.parametrize("drafts,expected", [(0, (1, 16)), (3, (4, 32)), (7, (8, 32))])
+@pytest.mark.parametrize(
+    "drafts,expected",
+    [
+        (0, (1, 16)),
+        (1, (4, 32)),
+        (2, (4, 32)),
+        (3, (4, 32)),
+        (4, (8, 32)),
+        (5, (8, 32)),
+        (6, (8, 32)),
+        (7, (8, 32)),
+    ],
+)
 def test_gdn_replayssm_geometry(drafts, expected):
     assert gdn_replayssm_geometry(drafts) == expected
 
 
-@pytest.mark.parametrize("drafts", [-1, 1, 2, 4, 6, 8, 12])
+@pytest.mark.parametrize("drafts", [-1, 8, 12])
 def test_gdn_replayssm_geometry_rejects_unsupported(drafts):
-    with pytest.raises(ValueError, match="supports 0, 3, or 7"):
+    with pytest.raises(ValueError, match="supports 0 through 7"):
         gdn_replayssm_geometry(drafts)
 
 
