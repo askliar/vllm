@@ -30,7 +30,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.gdn.replayssm import run_gdn_replayssm
+from vllm.model_executor.layers.mamba.gdn.replayssm import (
+    check_gdn_replayssm_dependencies,
+    run_gdn_replayssm,
+)
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
@@ -377,6 +380,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_replayssm_state_shape(self) -> tuple[tuple[int, ...], ...]:
         if not self.use_replayssm:
             return ()
+        assert self.replayssm_ring_slots is not None
         return MambaStateShapeCalculator.gated_delta_net_replayssm_ring_shapes(
             self.tp_size,
             self.num_k_heads,
@@ -522,6 +526,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     "VLLM_GDN_DECODE_KERNEL=flashinfer_replayssm is not "
                     f"supported: {reason}"
                 )
+            assert self.replayssm_executed_query_width is not None
+            check_gdn_replayssm_dependencies(
+                self.replayssm_executed_query_width,
+                needs_materializer=self.cache_config.mamba_cache_mode == "align",
+            )
         elif self.gdn_decode_kernel == "cuda" and current_platform.is_cuda_alike():
             reason = self._fused_gdn_decode_unsupported_reason(vllm_config)
             if reason is not None:

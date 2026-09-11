@@ -297,7 +297,9 @@ def test_gdn_replayssm_full_graph_padding_uses_stable_request_buffers(
         assert getattr(first, name).data_ptr() == getattr(second, name).data_ptr()
 
 
-def _create_replayssm_builder_without_spec_decode() -> GDNAttentionMetadataBuilder:
+def _create_minimal_gdn_builder(
+    *, use_replayssm: bool = True, num_spec: int = 0
+) -> GDNAttentionMetadataBuilder:
     vllm_config = SimpleNamespace(
         additional_config={},
         cache_config=SimpleNamespace(mamba_cache_mode="none"),
@@ -305,10 +307,14 @@ def _create_replayssm_builder_without_spec_decode() -> GDNAttentionMetadataBuild
             hf_text_config=SimpleNamespace(linear_key_head_dim=128)
         ),
         compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
-        speculative_config=None,
+        speculative_config=(
+            SpeculativeConfig(method="ngram", num_speculative_tokens=num_spec)
+            if num_spec
+            else None
+        ),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
-        is_gdn_replayssm_enabled=lambda: True,
+        is_gdn_replayssm_enabled=lambda: use_replayssm,
     )
     return GDNAttentionMetadataBuilder(
         kv_cache_spec=MambaSpec(
@@ -322,6 +328,19 @@ def _create_replayssm_builder_without_spec_decode() -> GDNAttentionMetadataBuild
     )
 
 
+def test_gdn_replay_disabled_seven_draft_metadata(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
+        lambda tensor, *, device: tensor.to(device),
+    )
+    builder = _create_minimal_gdn_builder(use_replayssm=False, num_spec=7)
+    assert builder.replayssm_executed_query_width is None
+    meta = _build(builder, BatchSpec(seq_lens=[80], query_lens=[8]), [7])
+    assert meta.num_spec_decodes == 1
+    assert meta.replayssm_executed_query_width is None
+    assert meta.replayssm_output_indices is None
+
+
 def test_gdn_replayssm_keeps_intermediate_prompt_tail_canonical(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -331,7 +350,7 @@ def test_gdn_replayssm_keeps_intermediate_prompt_tail_canonical(
         "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
         lambda tensor, *, device: tensor.to(device),
     )
-    builder = _create_replayssm_builder_without_spec_decode()
+    builder = _create_minimal_gdn_builder()
 
     intermediate = create_common_attn_metadata(
         BatchSpec(seq_lens=[65], query_lens=[1]), BLOCK_SIZE, DEVICE
@@ -372,7 +391,7 @@ def test_gdn_stp_routes_final_one_token_prompt_tail_to_replay(
         "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
         lambda tensor, *, device: tensor.to(device),
     )
-    builder = _create_replayssm_builder_without_spec_decode()
+    builder = _create_minimal_gdn_builder()
     common = create_common_attn_metadata(
         BatchSpec(seq_lens=[65], query_lens=[1]), BLOCK_SIZE, DEVICE
     ).replace(
@@ -399,7 +418,7 @@ def test_gdn_stp_piecewise_capture_routes_multitoken_rows_to_prefill(
         "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
         lambda tensor, *, device: tensor.to(device),
     )
-    builder = _create_replayssm_builder_without_spec_decode()
+    builder = _create_minimal_gdn_builder()
     common = create_common_attn_metadata(
         BatchSpec(seq_lens=[64 + query_len] * 8, query_lens=[query_len] * 8),
         BLOCK_SIZE,

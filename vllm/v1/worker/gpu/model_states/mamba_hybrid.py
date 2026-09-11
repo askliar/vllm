@@ -9,7 +9,10 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFuncsByType,
+    gdn_replayssm_geometry,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
@@ -372,8 +375,9 @@ class MambaHybridModelState(DefaultModelState):
             if self._use_gdn_replayssm:
                 # GDN alone uses fixed-width replay kernels. Mamba2 supports
                 # other speculative widths and intermediate one-token chunks.
-                num_spec = self.vllm_config.num_speculative_tokens
-                replay_width = 1 if num_spec == 0 else 8 if num_spec == 7 else 4
+                replay_width, _ = gdn_replayssm_geometry(
+                    self.vllm_config.num_speculative_tokens
+                )
                 replayssm_prefilling |= query_lens > replay_width
             self._is_prefilling_gpu[:num_reqs].copy_(
                 replayssm_prefilling, non_blocking=True

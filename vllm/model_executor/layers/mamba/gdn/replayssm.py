@@ -11,8 +11,6 @@ import torch
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 GDN_REPLAY_LOGICAL_WINDOW = 16
-GDN_REPLAY_STP_RING_SLOTS = 16
-GDN_REPLAY_MTP_RING_SLOTS = 32
 
 
 @cache
@@ -53,6 +51,41 @@ def _load_gdn_replayssm_stp_kernel() -> Callable[..., torch.Tensor]:
             "gated_delta_rule_stp_ucache_flush"
         ) from e
     return gated_delta_rule_stp_ucache_flush
+
+
+def check_gdn_replayssm_dependencies(
+    executed_width: int, needs_materializer: bool
+) -> None:
+    """Check selected FlashInfer exports during GPU worker layer construction."""
+    if executed_width == 1:
+        loader = _load_gdn_replayssm_stp_kernel
+        api = "gated_delta_rule_stp_ucache_flush"
+    elif executed_width in (4, 8):
+        loader = _load_gdn_replayssm_mtp_kernel
+        api = "gated_delta_rule_mtp_ucache_flush"
+    else:
+        raise ValueError(f"Unsupported GDN ReplaySSM executed width: {executed_width}")
+    mode = f"executed width={executed_width}, cache mode=" + (
+        "align" if needs_materializer else "none"
+    )
+    try:
+        loader()
+    except ImportError as e:
+        raise ImportError(
+            f"FlashInfer GDN ReplaySSM ({mode}) requires {api}: {e}"
+        ) from e
+    if needs_materializer:
+        from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+            _load_gdn_replayssm_materialize,
+        )
+
+        try:
+            _load_gdn_replayssm_materialize()
+        except ImportError as e:
+            raise ImportError(
+                f"FlashInfer GDN ReplaySSM ({mode}) requires "
+                f"gdn_prefix_materialize: {e}"
+            ) from e
 
 
 def pack_replayssm_rows(
@@ -227,8 +260,7 @@ def run_gdn_replayssm(
 
 __all__ = [
     "GDN_REPLAY_LOGICAL_WINDOW",
-    "GDN_REPLAY_MTP_RING_SLOTS",
-    "GDN_REPLAY_STP_RING_SLOTS",
+    "check_gdn_replayssm_dependencies",
     "pack_replayssm_rows",
     "run_gdn_replayssm",
 ]

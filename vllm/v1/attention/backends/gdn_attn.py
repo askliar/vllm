@@ -8,6 +8,7 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.mamba_utils import gdn_replayssm_geometry
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -115,13 +116,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.use_spec_decode: bool = self.num_spec > 0
         self.use_gdn_replayssm = vllm_config.is_gdn_replayssm_enabled()
         self.replayssm_executed_query_width = (
-            1
-            if self.use_gdn_replayssm and self.num_spec == 0
-            else 8
-            if self.num_spec == 7
-            else 4
-            if self.use_gdn_replayssm
-            else None
+            gdn_replayssm_geometry(self.num_spec)[0] if self.use_gdn_replayssm else None
         )
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 

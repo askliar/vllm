@@ -25,6 +25,19 @@ logger = init_logger(__name__)
 ConvStateLayoutType = Literal["SD", "DS"]
 
 
+def gdn_replayssm_geometry(num_speculative_tokens: int) -> tuple[int, int]:
+    """Return GDN's executed query width and physical replay ring slots."""
+    if num_speculative_tokens == 0:
+        return 1, 16
+    if num_speculative_tokens in (3, 7):
+        return num_speculative_tokens + 1, 32
+    raise ValueError(
+        "FlashInfer GDN ReplaySSM supports 0, 3, or 7 speculative "
+        "tokens (executed width 1, 4, or 8); got "
+        f"{num_speculative_tokens}"
+    )
+
+
 @functools.lru_cache
 def get_conv_state_layout() -> ConvStateLayoutType:
     """Return the SSM conv state layout.

@@ -9,6 +9,7 @@ import torch
 
 from vllm.config.mamba import MambaBackendEnum
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.mamba_utils import gdn_replayssm_geometry
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     _load_gdn_replayssm_materialize,
     flashinfer_replayssm_autotune_supported,
@@ -188,7 +189,7 @@ def gdn_replayssm_warmup(runner: "GPUModelRunner") -> None:
     config = runner.vllm_config
     if not config.is_gdn_replayssm_enabled():
         return
-    query_len = 1 + config.num_speculative_tokens
+    query_len, _ = gdn_replayssm_geometry(config.num_speculative_tokens)
     max_num_reqs = min(
         runner.scheduler_config.max_num_seqs,
         runner.max_num_tokens // query_len,

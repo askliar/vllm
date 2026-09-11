@@ -100,6 +100,9 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     }
 )
 
+# SupportsReplaySSM advertises support for some ReplaySSM implementation. This
+# allowlist selects architectures validated for the FlashInfer GDN integration:
+# sharing a layer or inheriting the marker does not validate the model lifecycle.
 _GDN_REPLAYSSM_ARCHITECTURES = frozenset(
     {
         "Qwen3_5ForCausalLM",
@@ -2955,6 +2958,10 @@ class VllmConfig:
             return self
 
         if use_gdn_replayssm:
+            from vllm.model_executor.layers.mamba.mamba_utils import (
+                gdn_replayssm_geometry,
+            )
+
             if self.cache_config.mamba_cache_mode not in ("none", "align"):
                 raise ValueError(
                     "FlashInfer GDN ReplaySSM supports only none and align "
@@ -2972,11 +2979,7 @@ class VllmConfig:
                 raise ValueError(
                     "FlashInfer GDN ReplaySSM requires --replayssm-buffer-len=16"
                 )
-            if self.num_speculative_tokens not in (0, 3, 7):
-                raise ValueError(
-                    "FlashInfer GDN ReplaySSM supports 0, 3, or 7 speculative "
-                    "tokens (executed width 1, 4, or 8)"
-                )
+            gdn_replayssm_geometry(self.num_speculative_tokens)
             if self.model_config is not None:
                 if self.model_config.dtype != torch.bfloat16:
                     raise ValueError(
@@ -3023,6 +3026,8 @@ class VllmConfig:
                     "(P/D disaggregation, KV cache offload)"
                 )
             self.cache_config.use_kda_recoverssm = False
+            # The GDN allowlist above validates this integration's lifecycle;
+            # the generic SupportsReplaySSM marker alone is not sufficient.
             return self
 
         kda_architectures = (

@@ -14,6 +14,7 @@ from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
+    gdn_replayssm_geometry,
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -50,18 +51,14 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         self.replayssm_buffer_len = (
             self.cache_config.replayssm_buffer_len if self.use_replayssm else None
         )
-        if not self.use_replayssm:
-            self.replayssm_executed_query_width = None
-        elif self.num_spec == 0:
-            self.replayssm_executed_query_width = 1
-        elif self.num_spec == 7:
-            self.replayssm_executed_query_width = 8
-        else:
-            self.replayssm_executed_query_width = 4
-        self.replayssm_ring_slots = (
-            16 if self.use_replayssm and self.num_spec == 0 else 32
-        )
+        self.replayssm_executed_query_width: int | None = None
+        self.replayssm_ring_slots: int | None = None
+        if self.use_replayssm:
+            self.replayssm_executed_query_width, self.replayssm_ring_slots = (
+                gdn_replayssm_geometry(self.num_spec)
+            )
         if self.replayssm_executed_query_width is not None:
+            # STP executes one token but still uses four staging rows.
             packed_width = max(self.replayssm_executed_query_width, 4)
             self.register_buffer(
                 "_replayssm_offsets",
