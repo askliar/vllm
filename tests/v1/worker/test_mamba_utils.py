@@ -760,10 +760,14 @@ def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
         (0, 4, 3, 1, True),
         (256, 4, 0, 260, True),
         (256, 4, 3, 256, False),
+        (64, 1, 0, 67, False),
+        (65, 1, 0, 67, False),
+        (66, 1, 0, 67, False),
     ],
 )
+@pytest.mark.parametrize("use_gdn_replayssm", [False, True])
 def test_stage_replayssm_prefill_classification(
-    computed, scheduled, drafts, prompt_len, expected_prefilling
+    computed, scheduled, drafts, prompt_len, expected_prefilling, use_gdn_replayssm
 ):
     ctx = _make_staging_ctx(1, torch.device("cpu"))
     stage_postprocess_inputs_to_gpu(
@@ -783,7 +787,10 @@ def test_stage_replayssm_prefill_classification(
         ),
         {},
         run_prefix_state_migration=False,
+        use_gdn_replayssm=use_gdn_replayssm,
     )
+    if use_gdn_replayssm and computed + scheduled < prompt_len:
+        expected_prefilling = True
     assert ctx.is_prefilling_buf.gpu.item() == expected_prefilling
 
 

@@ -8,6 +8,9 @@ import pytest
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+    _postprocess_replayssm_kernel,
+)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
@@ -116,17 +119,41 @@ def test_previous_scheduled_page_is_passed_only_to_mamba2() -> None:
         "drafts",
         "prefilling",
         "expected_prefilling",
+        "use_gdn_replayssm",
+        "prompt_len",
     ),
     [
-        (3, 256, 4, 3, True, False),  # Cached prompt tail plus placeholders.
-        (3, 1, 4, 3, True, False),  # Rejection can exceed cached prefix length.
-        (3, 256, 1, 0, True, False),
-        (3, 0, 4, 3, True, True),  # No prior state: must stay a prefill.
-        (3, 256, 4, 0, True, True),
-        (3, 256, 4, 3, False, False),
-        (3, 256, 8, 0, False, True),  # Wide PIECEWISE capture dummy.
-        (0, 256, 1, 0, True, False),  # Native STP final prompt tail.
-        (0, 256, 2, 0, False, True),  # Wider graph dummy stays canonical.
+        (3, 256, 4, 3, True, False, True, 257),
+        (3, 1, 4, 3, True, False, True, 2),
+        (3, 256, 1, 0, True, False, True, 257),
+        (3, 0, 4, 3, True, True, True, 1),
+        (3, 256, 4, 0, True, True, True, 260),
+        (3, 256, 4, 3, False, False, True, 256),
+        (3, 256, 8, 0, False, True, True, 256),
+        (0, 256, 1, 0, True, False, True, 257),
+        (0, 256, 2, 0, False, True, True, 256),
+        # Mamba2 supports widths beyond GDN's fixed T=4/8 kernels.
+        (4, 256, 5, 4, False, False, False, 256),
+        (12, 256, 13, 12, False, False, False, 256),
+        # Consecutive intermediate chunks follow each model's forward routing.
+        (0, 64, 1, 0, True, False, False, 67),
+        (0, 65, 1, 0, True, False, False, 67),
+        (0, 66, 1, 0, True, False, False, 67),
+        (0, 64, 1, 0, True, True, True, 67),
+        (0, 65, 1, 0, True, True, True, 67),
+        (0, 66, 1, 0, True, False, True, 67),
+    ],
+)
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda(), reason="Requires CUDA"
+            ),
+        ),
     ],
 )
 def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
@@ -137,13 +164,17 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
     drafts,
     prefilling,
     expected_prefilling,
+    use_gdn_replayssm,
+    prompt_len,
+    device,
 ) -> None:
     state = object.__new__(MambaHybridModelState)
     state.vllm_config = SimpleNamespace(num_speculative_tokens=num_spec)
     state.max_model_len = 8192
     state._align_mode = False
     state._use_flashinfer_replayssm = True
-    state._is_prefilling_gpu = torch.zeros(1, dtype=torch.bool)
+    state._use_gdn_replayssm = use_gdn_replayssm
+    state._is_prefilling_gpu = torch.zeros(1, dtype=torch.bool, device=device)
     state.num_accepted_tokens_gpu = torch.ones(1, dtype=torch.int32)
     state._get_mamba_group_info = Mock(return_value=([], None))
     state._ensure_mamba_postprocess_ctx = Mock()
@@ -165,7 +196,7 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
         seq_lens=torch.tensor([computed + scheduled]),
         is_prefilling_np=torch.tensor([prefilling]).numpy(),
         num_computed_prefill_tokens_np=torch.tensor([computed]).numpy(),
-        prefill_len_np=torch.tensor([computed + (1 if drafts else scheduled)]).numpy(),
+        prefill_len_np=torch.tensor([prompt_len]).numpy(),
         dcp_local_seq_lens=None,
         positions=positions,
         prompt_lens=torch.tensor([1024], dtype=torch.int32),
@@ -186,6 +217,50 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
     assert metadata is expected_metadata
     assert build_attn_metadata.call_args.kwargs["positions"] is positions
     assert state._is_prefilling_gpu.item() == expected_prefilling
+
+    if device == "cuda" and not use_gdn_replayssm:
+        # Exercise the actual tracker publisher over partial acceptances. A
+        # false prefill classification would erase the accepted history here.
+        def ints(values):
+            return torch.tensor(values, dtype=torch.int32, device=device)
+
+        starts = ints([0, 0])
+        committed = ints([0, 0])
+        scratch = ints([0])
+        accepted_total = 0
+        for accepted in (1, min(2, scheduled), 1):
+            _postprocess_replayssm_kernel[(1,)](
+                None,
+                ints([scheduled]),
+                ints([computed + accepted_total]),
+                ints([accepted]),
+                state._is_prefilling_gpu,
+                None,
+                ints([[1]]),
+                starts,
+                committed,
+                scratch,
+                scratch,
+                ints([0]),
+                ints([-1]),
+                1,
+                1,
+                MAMBA_BLOCK_SIZE=64,
+                LOGICAL_WINDOW=16,
+                RING_BUFFER_LEN=32,
+                NUM_LAYERS=1,
+                PAD_SLOT_ID=0,
+                QUERY_METADATA_IS_CUMULATIVE=False,
+                NUM_COMPUTED_IS_POST_STEP=False,
+                HAS_IDX_MAPPING=False,
+                MATERIALIZE_PREFIXES=False,
+                LIVE_COL_IS_ZERO=True,
+                EXECUTED_QUERY_WIDTH=0,
+                GDN_STP=False,
+            )
+            accepted_total += accepted
+            assert starts[1].item() == 0
+            assert committed[1].item() == accepted_total
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")

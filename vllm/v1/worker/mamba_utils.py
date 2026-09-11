@@ -1758,6 +1758,7 @@ def stage_postprocess_inputs_to_gpu(
     requests: dict[str, CachedRequestState],
     mamba_state_idx: dict[str, int],
     run_prefix_state_migration: bool,
+    use_gdn_replayssm: bool = False,
 ) -> None:
     """Stage the per-request decisions consumed after token acceptance.
 
@@ -1799,13 +1800,13 @@ def stage_postprocess_inputs_to_gpu(
         scheduled_np[i] = scheduled
         computed_np[i] = computed
         draft_np[i] = num_draft
-        # Only a final stateful one-token prompt tail may use ReplaySSM. An
-        # intermediate one-token chunk must update the canonical checkpoint so
-        # a following multi-token prefill does not read stale recurrent state.
+        # GDN keeps intermediate prompt chunks canonical. Mamba2's forward
+        # builder routes every stateful one-token chunk through decode, so its
+        # postprocess must preserve that chunk's replay history as well.
         is_last_prefill = computed + scheduled >= req_state.num_prompt_tokens
         prefill_np[i] = computed < req_state.num_prompt_tokens and not (
             computed > 0
-            and is_last_prefill
+            and (not use_gdn_replayssm or is_last_prefill)
             and (scheduled == 1 or scheduled == num_draft + 1)
         )
     if run_prefix_state_migration:

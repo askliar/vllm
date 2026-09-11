@@ -118,6 +118,7 @@ class MambaHybridModelState(DefaultModelState):
         # running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
         self._use_flashinfer_replayssm = vllm_config.is_flashinfer_replayssm_enabled()
+        self._use_gdn_replayssm = vllm_config.is_gdn_replayssm_enabled()
         self._needs_prefix_state_migration = self._align_mode or (
             self.cache_config.mamba_cache_mode == "all"
             and self._use_flashinfer_replayssm
@@ -362,16 +363,18 @@ class MambaHybridModelState(DefaultModelState):
                 decode_rows |= (num_decode_draft_tokens_cpu >= 0) & (
                     query_lens == num_decode_draft_tokens_cpu + 1
                 )
-            num_spec = self.vllm_config.num_speculative_tokens
-            replay_width = 1 if num_spec == 0 else 8 if num_spec == 7 else 4
-            replayssm_prefilling = (
-                is_prefilling
-                & ~(
-                    is_last_prefill
-                    & (seq_lens_cpu_upper_bound[:num_reqs] > query_lens)
-                    & decode_rows
-                )
-            ) | (query_lens > replay_width)
+            stateful_decode_rows = (
+                seq_lens_cpu_upper_bound[:num_reqs] > query_lens
+            ) & decode_rows
+            if self._use_gdn_replayssm:
+                stateful_decode_rows &= is_last_prefill
+            replayssm_prefilling = is_prefilling & ~stateful_decode_rows
+            if self._use_gdn_replayssm:
+                # GDN alone uses fixed-width replay kernels. Mamba2 supports
+                # other speculative widths and intermediate one-token chunks.
+                num_spec = self.vllm_config.num_speculative_tokens
+                replay_width = 1 if num_spec == 0 else 8 if num_spec == 7 else 4
+                replayssm_prefilling |= query_lens > replay_width
             self._is_prefilling_gpu[:num_reqs].copy_(
                 replayssm_prefilling, non_blocking=True
             )
