@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor.models.qwen3_dflash import (
+    _add_global_draft_layer_exclusions,
+)
 from vllm.model_executor.models.qwen3_dflash2 import _grouped_conv, _score_edges
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
@@ -33,6 +36,24 @@ def test_grouped_conv_matches_reference(block_size: int):
             ) * hidden_blocks[:, position - tap]
 
     torch.testing.assert_close(actual, expected.flatten(0, 1).flatten(-2))
+
+
+def test_draft_quant_exclusions_include_global_layer_indices():
+    quant_config = SimpleNamespace(
+        exclude_modules=[
+            "layers.0.mlp_conv*",
+            "*layers.4.self_attn.q_proj",
+            "layers.88.already_global",
+            "lilicorr.layers.0.mlp.0",
+        ]
+    )
+
+    _add_global_draft_layer_exclusions(quant_config, 88, 5)
+
+    assert "layers.88.mlp_conv*" in quant_config.exclude_modules
+    assert "*layers.92.self_attn.q_proj" in quant_config.exclude_modules
+    assert quant_config.exclude_modules.count("layers.88.already_global") == 1
+    assert "lilicorr.layers.88.mlp.0" not in quant_config.exclude_modules
 
 
 def test_selector_edges_match_sequential_reference():
@@ -119,14 +140,17 @@ def test_selector_asks_for_fp32_proposal_logits():
 
 
 @pytest.mark.skip_global_cleanup
-def test_dflash2_model_decoder_layer_cls(monkeypatch):
+@pytest.mark.parametrize("variant", ["dflash2", "lilicorr", "lilicorr_plain"])
+def test_candidate_model_decoder_layer_cls(monkeypatch, variant):
     from types import SimpleNamespace
 
     from vllm.config import set_current_vllm_config
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3DecoderLayer
     from vllm.model_executor.models.qwen3_dflash2 import (
         DFlash2Qwen3DecoderLayer,
         DFlash2Qwen3Model,
     )
+    from vllm.model_executor.models.qwen3_lilicorr import LiLiCorrQwen3Model
 
     # 1. Mock get_current_vllm_config and TP groups
     mock_current_vllm_config = SimpleNamespace(
@@ -199,8 +223,17 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
         dflash_config={
             "selector_rank": 4,
             "selector_top_k": 3,
-            "conv_kernel_size": 3,
-            "conv_group_size": 2,
+            "conv_kernel_size": 0 if variant == "lilicorr_plain" else 3,
+            "conv_group_size": 0 if variant == "lilicorr_plain" else 2,
+            "block_size": 5,
+            "lilicorr_candidate_topk": 4,
+            "lilicorr_hidden_size": 8,
+            "lilicorr_num_layers": 2,
+            "lilicorr_num_heads": 2,
+            "lilicorr_mlp_ratio": 2.0,
+            "lilicorr_factor_dim": 4,
+            "lilicorr_vector_eps": 1e-6,
+            "lilicorr_logit_scale": 3.0,
             "use_aux_hidden_state": False,
         },
     )
@@ -227,8 +260,162 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
 
     # 3. Instantiate the model under meta device to avoid parameter allocation issues
     with set_current_vllm_config(mock_current_vllm_config), torch.device("meta"):
-        model = DFlash2Qwen3Model(vllm_config=vllm_config)
+        model_cls = DFlash2Qwen3Model if variant == "dflash2" else LiLiCorrQwen3Model
+        model = model_cls(vllm_config=vllm_config)
 
     # 4. Assert that the layers are DFlash2Qwen3DecoderLayer (the subclass)
     assert len(model.layers) == 2
-    assert isinstance(model.layers[0], DFlash2Qwen3DecoderLayer)
+    expected = (
+        DFlashQwen3DecoderLayer
+        if variant == "lilicorr_plain"
+        else DFlash2Qwen3DecoderLayer
+    )
+    assert type(model.layers[0]) is expected
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_conv_projection_loads_packed_weights_with_draft_quant_config(
+    monkeypatch, quantized
+):
+    from torch import nn
+
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.layers import linear
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3DecoderLayer
+    from vllm.model_executor.models.qwen3_dflash2 import DFlash2Qwen3DecoderLayer
+    from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    monkeypatch.setattr(
+        DFlashQwen3DecoderLayer,
+        "__init__",
+        lambda self, *a, **kw: nn.Module.__init__(self),
+    )
+    quant_config = (
+        SimpleNamespace(
+            get_cache_scale_mapper=WeightsMapper,
+            get_checkpoint_weight_mapper=WeightsMapper,
+            _ignore_unexpected_suffixes=(),
+        )
+        if quantized
+        else None
+    )
+    selected = []
+
+    class PackedMethod(linear.LinearMethodBase):
+        def create_weights(
+            self,
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            *args,
+            **kwargs,
+        ):
+            layer.register_parameter(
+                "weight",
+                nn.Parameter(
+                    torch.empty(
+                        sum(output_partition_sizes),
+                        input_size_per_partition // 2,
+                        dtype=torch.uint8,
+                    ),
+                    requires_grad=False,
+                ),
+            )
+
+        def apply(self, layer, x, bias=None):
+            raise AssertionError("Loading test does not execute quantized kernels")
+
+    def resolve(config, layer, prefix):
+        assert config is quant_config
+        selected.append(prefix)
+        return PackedMethod()
+
+    monkeypatch.setattr(linear, "resolve_quant_method", resolve)
+    layer = DFlash2Qwen3DecoderLayer(
+        SimpleNamespace(
+            speculative_config=SimpleNamespace(num_speculative_tokens=7),
+            model_config=SimpleNamespace(dtype=torch.bfloat16),
+        ),
+        config=SimpleNamespace(
+            hidden_size=4096,
+            dflash_config={
+                "conv_kernel_size": 2,
+                "conv_group_size": 16,
+            },
+        ),
+        layer_idx=0,
+        prefix="model.layers.0",
+        quant_config=quant_config,
+    )
+    width = 2048 if quantized else 4096
+    dtype = torch.uint8 if quantized else torch.bfloat16
+    for name in ("attention_conv", "mlp_conv"):
+        module = getattr(layer, name)
+        weight = torch.ones(1024, width, dtype=dtype)
+        AutoWeightsLoader(module).load_weights([("kernel_projection.weight", weight)])
+        torch.testing.assert_close(module.kernel_projection.weight, weight)
+        assert module.base_kernel.dtype == torch.bfloat16
+    assert selected == (
+        [
+            "model.layers.0.attention_conv.kernel_projection",
+            "model.layers.0.mlp_conv.kernel_projection",
+        ]
+        if quantized
+        else []
+    )
+
+
+def test_context_kv_uses_quantized_projection_methods(monkeypatch):
+    from torch import nn
+
+    from vllm.model_executor.models import qwen3_dflash
+
+    class Projection(nn.Module):
+        def __init__(self, weight):
+            super().__init__()
+            self.register_buffer("weight", weight)
+            self.output_sizes = [2, 2, 2]
+
+        def forward(self, hidden_states):
+            return torch.nn.functional.linear(hidden_states, self.weight), None
+
+    monkeypatch.setattr(
+        qwen3_dflash.ops,
+        "rms_norm",
+        lambda output, hidden_states, weight, eps: output.copy_(hidden_states),
+    )
+    context_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+    projections = [
+        Projection(torch.arange(24, dtype=torch.float32).view(6, 4)),
+        Projection(torch.arange(24, 48, dtype=torch.float32).view(6, 4)),
+    ]
+    model = SimpleNamespace(
+        _hidden_norm_weight=torch.ones(4),
+        _rms_norm_eps=1e-6,
+        _fused_kv_weight=None,
+        _fused_kv_bias=None,
+        _context_qkv_projs=projections,
+        _context_q_sizes=[2, 2],
+    )
+
+    actual_k, actual_v = qwen3_dflash.DFlashQwen3Model._project_context_kv(
+        model,
+        context_states,
+        num_ctx=3,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=2,
+    )
+    expected = torch.stack(
+        [
+            projection(context_states)[0][:, 2:].view(3, 2, 1, 2)
+            for projection in projections
+        ],
+        dim=1,
+    ).permute(2, 1, 0, 3, 4)
+
+    torch.testing.assert_close(actual_k, expected[0])
+    torch.testing.assert_close(actual_v, expected[1])
