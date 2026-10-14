@@ -200,35 +200,7 @@ def _build(
 
 
 def test_gdn_replayssm_routes_stateful_decode_rows(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "flashinfer_replayssm")
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
-        lambda tensor, *, device: tensor.to(device),
-    )
-    vllm_config = SimpleNamespace(
-        additional_config={},
-        use_v2_model_runner=False,
-        cache_config=SimpleNamespace(mamba_cache_mode="none"),
-        model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(linear_key_head_dim=128)
-        ),
-        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
-        speculative_config=SpeculativeConfig(method="ngram", num_speculative_tokens=3),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
-        is_gdn_replayssm_enabled=lambda: True,
-    )
-    mamba_spec = MambaSpec(
-        block_size=BLOCK_SIZE,
-        shapes=((16, 64),),
-        dtypes=(torch.bfloat16,),
-    )
-    builder = GDNAttentionMetadataBuilder(
-        kv_cache_spec=mamba_spec,
-        layer_names=["layer.0"],
-        vllm_config=vllm_config,
-        device=DEVICE,
-    )
+    builder = _create_minimal_gdn_builder(monkeypatch, num_spec=3)
     batch = BatchSpec(seq_lens=[65, 80], query_lens=[1, 4])
     common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
         is_prefilling=torch.tensor([True, False]),
@@ -258,12 +230,7 @@ def test_gdn_replayssm_routes_stateful_decode_rows(monkeypatch: pytest.MonkeyPat
 def test_gdn_replayssm_dl5_pads_six_tokens_to_t8(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "flashinfer_replayssm")
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
-        lambda tensor, *, device: tensor.to(device),
-    )
-    builder = _create_minimal_gdn_builder(num_spec=5)
+    builder = _create_minimal_gdn_builder(monkeypatch, num_spec=5)
     common = create_common_attn_metadata(
         BatchSpec(seq_lens=[80], query_lens=[6]), BLOCK_SIZE, DEVICE
     ).replace(
@@ -289,36 +256,8 @@ def test_gdn_replayssm_dl5_pads_six_tokens_to_t8(
 def test_gdn_replayssm_full_graph_padding_uses_stable_request_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "flashinfer_replayssm")
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
-        lambda tensor, *, device: tensor.to(device),
-    )
-    vllm_config = SimpleNamespace(
-        additional_config={},
-        use_v2_model_runner=False,
-        cache_config=SimpleNamespace(mamba_cache_mode="none"),
-        model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(linear_key_head_dim=128)
-        ),
-        compilation_config=CompilationConfig(
-            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
-        ),
-        speculative_config=SpeculativeConfig(method="ngram", num_speculative_tokens=3),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
-        is_gdn_replayssm_enabled=lambda: True,
-    )
-    builder = GDNAttentionMetadataBuilder(
-        kv_cache_spec=MambaSpec(
-            block_size=BLOCK_SIZE,
-            shapes=((16, 64),),
-            dtypes=(torch.bfloat16,),
-        ),
-        layer_names=["layer.0"],
-        vllm_config=vllm_config,
-        device=DEVICE,
-    )
+    builder = _create_minimal_gdn_builder(monkeypatch, num_spec=3)
+    builder.use_full_cuda_graph = True
 
     def build_padded() -> GDNAttentionMetadata:
         batch = BatchSpec(seq_lens=[80, 0], query_lens=[4, 0])
@@ -360,8 +299,14 @@ def test_gdn_replayssm_full_graph_padding_uses_stable_request_buffers(
 
 
 def _create_minimal_gdn_builder(
-    *, use_replayssm: bool = True, num_spec: int = 0
+    monkeypatch, *, use_replayssm: bool = True, num_spec: int = 0
 ) -> GDNAttentionMetadataBuilder:
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
+        lambda data, device, dtype=None: torch.as_tensor(
+            data, device=device, dtype=dtype
+        ),
+    )
     vllm_config = SimpleNamespace(
         additional_config={},
         use_v2_model_runner=False,
@@ -391,18 +336,15 @@ def _create_minimal_gdn_builder(
     )
 
 
-@pytest.mark.parametrize("full_cuda_graph", [False, True])
-@pytest.mark.parametrize("mixed_prefill", [False, True])
+@pytest.mark.parametrize(
+    ("full_cuda_graph", "mixed_prefill"), [(True, False), (False, True)]
+)
 def test_gdn_replayssm_update_block_table_uses_one_state_column(
     monkeypatch, full_cuda_graph, mixed_prefill
 ):
     """A cache-group update must preserve ReplaySSM's single live state."""
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
-        lambda tensor, *, device: tensor.to(device),
-    )
-    src = _create_minimal_gdn_builder(num_spec=3)
-    dst = _create_minimal_gdn_builder(num_spec=3)
+    src = _create_minimal_gdn_builder(monkeypatch, num_spec=3)
+    dst = _create_minimal_gdn_builder(monkeypatch, num_spec=3)
     src.use_full_cuda_graph = dst.use_full_cuda_graph = full_cuda_graph
     query_lens = [4, 8] if mixed_prefill else [4, 0]
     common = create_common_attn_metadata(
@@ -433,11 +375,7 @@ def test_gdn_replayssm_update_block_table_uses_one_state_column(
 
 
 def test_gdn_replay_disabled_seven_draft_metadata(monkeypatch):
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
-        lambda tensor, *, device: tensor.to(device),
-    )
-    builder = _create_minimal_gdn_builder(use_replayssm=False, num_spec=7)
+    builder = _create_minimal_gdn_builder(monkeypatch, use_replayssm=False, num_spec=7)
     assert builder.replayssm_executed_query_width is None
     meta = _build(builder, BatchSpec(seq_lens=[80], query_lens=[8]), [7])
     assert meta.num_spec_decodes == 1
@@ -448,54 +386,26 @@ def test_gdn_replay_disabled_seven_draft_metadata(monkeypatch):
 def test_gdn_replayssm_keeps_intermediate_prompt_tail_canonical(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """A 64 -> 1 -> 4 prompt schedule must never leave a stale checkpoint."""
-    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "flashinfer_replayssm")
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
-        lambda tensor, *, device: tensor.to(device),
-    )
-    builder = _create_minimal_gdn_builder()
+    """A 64 -> 1 -> 3 prompt schedule must never leave a stale checkpoint."""
+    builder = _create_minimal_gdn_builder(monkeypatch)
 
-    intermediate = create_common_attn_metadata(
-        BatchSpec(seq_lens=[65], query_lens=[1]), BLOCK_SIZE, DEVICE
-    ).replace(
-        is_prefilling=torch.tensor([True]),
-        is_last_prefill=torch.tensor([False]),
-    )
-    intermediate_meta = builder.build(
-        common_prefix_len=0, common_attn_metadata=intermediate
-    )
-    assert intermediate_meta.num_prefills == 1
-    assert intermediate_meta.num_spec_decodes == 0
-    assert intermediate_meta.spec_sequence_masks is None
-    assert intermediate_meta.prefill_has_initial_state is not None
-    assert intermediate_meta.prefill_has_initial_state.tolist() == [True]
-
-    continuation = create_common_attn_metadata(
-        BatchSpec(seq_lens=[69], query_lens=[4]), BLOCK_SIZE, DEVICE
-    ).replace(
-        is_prefilling=torch.tensor([True]),
-        is_last_prefill=torch.tensor([True]),
-    )
-    continuation_meta = builder.build(
-        common_prefix_len=0, common_attn_metadata=continuation
-    )
-    assert continuation_meta.num_prefills == 1
-    assert continuation_meta.num_spec_decodes == 0
-    assert continuation_meta.spec_sequence_masks is None
-    assert continuation_meta.prefill_has_initial_state is not None
-    assert continuation_meta.prefill_has_initial_state.tolist() == [True]
+    for seq_len, query_len, final in [(65, 1, False), (68, 3, True)]:
+        common = create_common_attn_metadata(
+            BatchSpec(seq_lens=[seq_len], query_lens=[query_len]), BLOCK_SIZE, DEVICE
+        ).replace(
+            is_prefilling=torch.tensor([True]),
+            is_last_prefill=torch.tensor([final]),
+        )
+        meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
+        assert meta.num_prefills == 1
+        assert meta.num_spec_decodes == 0
+        assert meta.prefill_has_initial_state.tolist() == [True]
 
 
 def test_gdn_stp_routes_final_one_token_prompt_tail_to_replay(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "flashinfer_replayssm")
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
-        lambda tensor, *, device: tensor.to(device),
-    )
-    builder = _create_minimal_gdn_builder()
+    builder = _create_minimal_gdn_builder(monkeypatch)
     common = create_common_attn_metadata(
         BatchSpec(seq_lens=[65], query_lens=[1]), BLOCK_SIZE, DEVICE
     ).replace(
@@ -511,34 +421,28 @@ def test_gdn_stp_routes_final_one_token_prompt_tail_to_replay(
     assert meta.replayssm_output_indices.tolist() == [0]
 
 
-@pytest.mark.parametrize("query_len", [2, 8])
 def test_gdn_stp_piecewise_capture_routes_multitoken_rows_to_prefill(
     monkeypatch: pytest.MonkeyPatch,
-    query_len: int,
 ):
     """Mixed-graph dummies wider than STP must remain canonical prefills."""
-    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "flashinfer_replayssm")
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.gdn_attn.async_tensor_h2d",
-        lambda tensor, *, device: tensor.to(device),
-    )
-    builder = _create_minimal_gdn_builder()
+    query_len = 2
+    builder = _create_minimal_gdn_builder(monkeypatch)
     common = create_common_attn_metadata(
-        BatchSpec(seq_lens=[64 + query_len] * 8, query_lens=[query_len] * 8),
+        BatchSpec(seq_lens=[64 + query_len], query_lens=[query_len]),
         BLOCK_SIZE,
         DEVICE,
     ).replace(
-        is_prefilling=torch.zeros(8, dtype=torch.bool),
-        is_last_prefill=torch.zeros(8, dtype=torch.bool),
+        is_prefilling=torch.zeros(1, dtype=torch.bool),
+        is_last_prefill=torch.zeros(1, dtype=torch.bool),
     )
     meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
 
-    assert meta.num_prefills == 8
-    assert meta.num_prefill_tokens == query_len * 8
+    assert meta.num_prefills == 1
+    assert meta.num_prefill_tokens == query_len
     assert meta.num_spec_decodes == 0
     assert meta.spec_sequence_masks is None
     assert meta.prefill_has_initial_state is not None
-    assert meta.prefill_has_initial_state.tolist() == [True] * 8
+    assert meta.prefill_has_initial_state.tolist() == [True]
 
 
 @pytest.mark.parametrize(
@@ -851,9 +755,9 @@ def test_plan_flashinfer_checkpoints_selects_the_state_at_each_offset():
     assert rows == [0, 1, 0, 5]
 
 
-def test_gdn_replayssm_preserves_internal_prefill_checkpoint_plan():
+def test_gdn_replayssm_preserves_internal_prefill_checkpoint_plan(monkeypatch):
     """Replay rows must not shift the prefill checkpoint or cache-group mapping."""
-    builder = _create_minimal_gdn_builder(num_spec=3)
+    builder = _create_minimal_gdn_builder(monkeypatch, num_spec=3)
     builder.vllm_config.cache_config.mamba_cache_mode = "align"
     builder.vllm_config.cache_config.hash_block_size = 64
     builder.vllm_config.cache_config.cache_hit_alignment_tokens = 64

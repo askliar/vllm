@@ -1135,9 +1135,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         3. Output projection
         """
         num_tokens = hidden_states.size(0)
-        # =====================================================
+        # ============================================================
         # Part 1: Input Projection
-        # =====================================================
+        # ============================================================
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
         ba, _ = self.in_proj_ba(hidden_states)
 
@@ -1179,9 +1179,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = self.split_ba(ba)
 
-        # =====================================================
+        # ============================================================
         # Part 2: Core Attention (Custom Op)
-        # =====================================================
+        # ============================================================
         # Note: we should not use torch.empty here like other attention backends,
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
         core_attn_out = torch.zeros(
@@ -1198,9 +1198,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             layer_name=_encode_layer_name(self.prefix),
         )
 
-        # =====================================================
+        # ============================================================
         # Part 3: Output Projection
-        # =====================================================
+        # ============================================================
         return self._output_projection(core_attn_out, z)
 
     def forward_xpu(
@@ -1214,15 +1214,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_tokens = hidden_states.size(0)
 
-        # =====================================================
+        # ============================================================
         # Part 1: Input Projection
-        # =====================================================
+        # ============================================================
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
         projected_states_ba, _ = self.in_proj_ba(hidden_states)
 
-        # =====================================================
+        # ============================================================
         # Part 2: Core Attention
-        # =====================================================
+        # ============================================================
         core_attn_out = torch.zeros(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
             dtype=hidden_states.dtype,
@@ -1238,9 +1238,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.prefix,
         )
 
-        # =====================================================
+        # ============================================================
         # Part 3: Output Projection
-        # =====================================================
+        # ============================================================
         return self._output_projection(core_attn_out, z)
 
     def forward_cpu(

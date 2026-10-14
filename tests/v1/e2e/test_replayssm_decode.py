@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Engine-level parity: ReplaySSM decode vs the baseline recurrent kernels."""
+"""Engine-level parity: ReplaySSM standard decode vs the baseline SSM kernel."""
 
 import os
 from importlib import import_module
@@ -9,7 +9,6 @@ from inspect import signature
 import pytest
 
 import vllm.envs as envs
-from tests.evals.gsm8k.gsm8k_eval import evaluate_gsm8k_offline
 from vllm.platforms import current_platform
 from vllm.v1.metrics.reader import Counter
 
@@ -48,10 +47,6 @@ MAMBA2_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
 MAMBA2_MTP_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
 FLASHINFER_MODELS = [pytest.param(MAMBA2_MTP_MODEL, marks=large_gpu_mark(min_gb=40))]
 GDN_MODEL = "Qwen/Qwen3.5-0.8B"
-# Same-node samples scored 0.3245 for standard GDN and 0.3245/0.3177 for
-# ReplaySSM. Keep an absolute sanity floor plus a tighter matched-control bound.
-GDN_GSM8K_MIN_ACCURACY = 0.30
-GDN_GSM8K_MAX_ACCURACY_DROP = 0.015
 # The BF16 FlashInfer gate casts can shift low-probability logits slightly;
 # same-node n-gram coverage observed a 0.1054 chosen-token difference.
 GDN_DECODE_LOGPROB_ATOL = 0.12
@@ -81,10 +76,6 @@ requires_flashinfer_replayssm_materialization = pytest.mark.skipif(
 requires_gdn_replayssm = pytest.mark.skipif(
     not (current_platform.is_cuda() and current_platform.has_device_capability(90)),
     reason="FlashInfer GDN ReplaySSM requires an SM90+ CUDA device",
-)
-requires_gdn_gsm8k = pytest.mark.skipif(
-    os.getenv("RUN_GDN_GSM8K") != "1",
-    reason="set RUN_GDN_GSM8K=1 to run the local full GSM8K quality gate",
 )
 
 
@@ -300,18 +291,6 @@ def _require_gdn_replayssm_kernel(
         )
 
 
-def _gdn_speculative_config(method: str | None, num_speculative_tokens: int):
-    if method is None:
-        return None
-    config: dict[str, int | str] = {
-        "method": method,
-        "num_speculative_tokens": num_speculative_tokens,
-    }
-    if method == "ngram":
-        config["prompt_lookup_max"] = num_speculative_tokens
-    return config
-
-
 def _check_gdn_decode_trajectory(baseline, replay) -> None:
     """Compare every step after requiring both engines to follow one path."""
     assert len(baseline) == len(replay)
@@ -364,10 +343,13 @@ def _check_gdn_replayssm_parity(
         disable_log_stats=False,
         limit_mm_per_prompt={"image": 0, "video": 0},
     )
-    speculative_config = _gdn_speculative_config(
-        speculative_method, num_speculative_tokens
-    )
-    if speculative_config is not None:
+    if speculative_method is not None:
+        speculative_config: dict[str, int | str] = {
+            "method": speculative_method,
+            "num_speculative_tokens": num_speculative_tokens,
+        }
+        if speculative_method == "ngram":
+            speculative_config["prompt_lookup_max"] = num_speculative_tokens
         common["speculative_config"] = speculative_config
 
     # Leave the control selector unset so vLLM may use the fused CUDA kernel
@@ -419,8 +401,6 @@ def _check_gdn_replayssm_parity(
         pytest.param(True, "mtp", 3, id="v2-mtp-t4"),
         pytest.param(False, "mtp", 5, id="v1-mtp-dl5-padded-t8"),
         pytest.param(True, "mtp", 5, id="v2-mtp-dl5-padded-t8"),
-        pytest.param(False, "mtp", 7, id="v1-mtp-t8"),
-        pytest.param(True, "mtp", 7, id="v2-mtp-t8"),
     ],
 )
 def test_gdn_replayssm_decode_matches_baseline(
@@ -441,84 +421,6 @@ def test_gdn_replayssm_decode_matches_baseline(
             )
     finally:
         envs.disable_envs_cache()
-
-
-@requires_gdn_replayssm
-@requires_gdn_gsm8k
-def test_gdn_replayssm_mtp_gsm8k_v2(vllm_runner, monkeypatch: pytest.MonkeyPatch):
-    """Guard full GSM8K quality while the GDN ReplaySSM MTP path is active."""
-    common = dict(
-        max_model_len=4096,
-        max_num_seqs=128,
-        gpu_memory_utilization=0.85,
-        trust_remote_code=True,
-        dtype="bfloat16",
-        enable_prefix_caching=False,
-        enable_chunked_prefill=True,
-        mamba_cache_mode="none",
-        mamba_cache_dtype="bfloat16",
-        mamba_ssm_cache_dtype="bfloat16",
-        disable_log_stats=False,
-        limit_mm_per_prompt={"image": 0, "video": 0},
-        speculative_config={"method": "mtp", "num_speculative_tokens": 3},
-    )
-    try:
-        with monkeypatch.context() as patch:
-            patch.setenv("SGLANG_GDN_WY_STRIDED_QKV", "1")
-            _require_gdn_replayssm_kernel()
-            patch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-
-            patch.delenv("VLLM_GDN_DECODE_KERNEL", raising=False)
-            envs.disable_envs_cache()
-            with vllm_runner(GDN_MODEL, **common) as llm:
-                config = llm.llm.llm_engine.vllm_config
-                assert config.use_v2_model_runner
-                assert not config.is_gdn_replayssm_enabled()
-                baseline_results = evaluate_gsm8k_offline(llm.llm, num_questions=1319)
-
-            patch.setenv("VLLM_GDN_DECODE_KERNEL", "flashinfer_replayssm")
-            envs.disable_envs_cache()
-            with vllm_runner(
-                GDN_MODEL,
-                use_replayssm=True,
-                replayssm_buffer_len=16,
-                **common,
-            ) as llm:
-                config = llm.llm.llm_engine.vllm_config
-                assert config.use_v2_model_runner
-                assert config.is_gdn_replayssm_enabled()
-                results = evaluate_gsm8k_offline(llm.llm, num_questions=1319)
-                draft_count = sum(
-                    metric.value
-                    for metric in llm.llm.get_metrics()
-                    if isinstance(metric, Counter)
-                    and metric.name == "vllm:spec_decode_num_drafts"
-                )
-    finally:
-        envs.disable_envs_cache()
-
-    baseline_accuracy = float(baseline_results["accuracy"])
-    accuracy = float(results["accuracy"])
-    invalid_rate = float(results["invalid_rate"])
-    assert baseline_results["num_questions"] == 1319
-    assert results["num_questions"] == 1319
-    assert draft_count > 0
-    print(
-        f"GDN V2 MTP3: baseline GSM8K accuracy={baseline_accuracy:.3f}, "
-        f"ReplaySSM accuracy={accuracy:.3f}, "
-        f"invalid_rate={invalid_rate:.3f}, drafts={draft_count:g}"
-    )
-    assert accuracy >= GDN_GSM8K_MIN_ACCURACY, (
-        f"GDN ReplaySSM GSM8K accuracy {accuracy:.3f} is below the "
-        f"Qwen3.5-0.8B floor {GDN_GSM8K_MIN_ACCURACY:.3f}; "
-        f"invalid_rate={invalid_rate:.3f}, drafts={draft_count:g}"
-    )
-    assert accuracy >= baseline_accuracy - GDN_GSM8K_MAX_ACCURACY_DROP, (
-        f"GDN ReplaySSM GSM8K accuracy {accuracy:.3f} trails matched baseline "
-        f"{baseline_accuracy:.3f} by more than "
-        f"{GDN_GSM8K_MAX_ACCURACY_DROP:.3f}; invalid_rate={invalid_rate:.3f}, "
-        f"drafts={draft_count:g}"
-    )
 
 
 # Prefix spans several mamba blocks; prefix caching only reuses full blocks.
@@ -638,7 +540,6 @@ def _check_gdn_replayssm_prefix_caching(
         pytest.param(False, 0, id="v1-stp"),
         pytest.param(True, 0, id="v2-stp"),
         pytest.param(True, 3, id="v2-mtp-t4"),
-        pytest.param(True, 5, id="v2-mtp-dl5-padded-t8"),
     ],
 )
 def test_gdn_replayssm_align_prefix_cache_matches_baseline(

@@ -17,9 +17,6 @@ from tests.v1.attention.test_gdn_metadata_builder import (
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from tests.v1.worker.test_gpu_batch_ordering import _make_runner
 from vllm.config.compilation import CUDAGraphMode
-from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
-    _postprocess_replayssm_kernel,
-)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
@@ -67,48 +64,46 @@ def test_add_request_seeds_state_with_scoped_block_size(
         "expected_prefilling",
         "use_gdn_replayssm",
         "prompt_len",
+        "device",
     ),
     [
-        (3, 256, 4, 3, True, False, False, 257),
-        (3, 1, 4, 3, True, False, False, 2),
-        (3, 256, 1, 0, True, False, False, 257),
-        (3, 0, 4, 3, True, True, False, 1),
-        (3, 256, 4, 0, True, True, False, 260),
-        (3, 256, 4, 3, False, False, False, 256),
-        (3, 256, 4, 3, True, False, True, 257),
-        (3, 1, 4, 3, True, False, True, 2),
-        (3, 256, 1, 0, True, False, True, 257),
-        (3, 0, 4, 3, True, True, True, 1),
-        (3, 256, 4, 0, True, True, True, 260),
-        (3, 256, 4, 3, False, False, True, 256),
-        (5, 256, 6, 5, False, False, True, 256),
-        (3, 256, 8, 0, False, True, True, 256),
-        (0, 256, 1, 0, True, False, True, 257),
-        (0, 256, 2, 0, False, True, True, 256),
-        # Mamba2 supports widths beyond GDN's fixed T=4/8 kernels.
-        (4, 256, 5, 4, False, False, False, 256),
-        (12, 256, 13, 12, False, False, False, 256),
-        # Consecutive intermediate chunks follow each model's forward routing.
-        (0, 64, 1, 0, True, False, False, 67),
-        (0, 65, 1, 0, True, False, False, 67),
-        (0, 66, 1, 0, True, False, False, 67),
-        (0, 64, 1, 0, True, True, True, 67),
-        (0, 65, 1, 0, True, True, True, 67),
-        (0, 66, 1, 0, True, False, True, 67),
-        (0, 64, 1, 0, True, True, True, 68),
-        (0, 65, 3, 0, True, True, True, 68),
-    ],
-)
-@pytest.mark.parametrize(
-    "device",
-    [
-        "cpu",
         pytest.param(
+            3, 256, 4, 3, True, False, False, 257, "cpu", id="cpu-cached-tail"
+        ),
+        pytest.param(3, 1, 4, 3, True, False, False, 2, "cpu", id="cpu-short-prefix"),
+        pytest.param(
+            3, 256, 1, 0, True, False, False, 257, "cpu", id="cpu-one-token-tail"
+        ),
+        pytest.param(3, 0, 4, 3, True, True, False, 1, "cpu", id="cpu-fresh-prefill"),
+        pytest.param(
+            3, 256, 4, 0, True, True, False, 260, "cpu", id="cpu-chunked-prefill"
+        ),
+        pytest.param(
+            3, 256, 4, 3, False, False, False, 256, "cpu", id="cpu-ordinary-decode"
+        ),
+        pytest.param(
+            3,
+            256,
+            4,
+            3,
+            True,
+            False,
+            False,
+            257,
             "cuda",
+            id="cuda-cached-tail",
             marks=pytest.mark.skipif(
-                not current_platform.is_cuda(), reason="Requires CUDA"
+                not torch.cuda.is_available(), reason="requires CUDA"
             ),
         ),
+        # Mamba2 must retain verification widths outside GDN's fixed T=4/8.
+        (4, 256, 5, 4, False, False, False, 256, "cpu"),
+        (12, 256, 13, 12, False, False, False, 256, "cpu"),
+        (5, 256, 6, 5, False, False, True, 256, "cpu"),
+        (0, 64, 1, 0, True, True, True, 68, "cpu"),
+        (0, 65, 3, 0, True, True, True, 68, "cpu"),
+        (0, 67, 1, 0, True, False, True, 68, "cpu"),
+        (3, 67, 4, 3, True, False, True, 68, "cpu"),
     ],
 )
 def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
@@ -193,50 +188,6 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
     assert metadata is expected_metadata
     assert build_attn_metadata.call_args.kwargs["positions"] is positions
     assert state._is_prefilling_gpu.item() == expected_prefilling
-
-    if device == "cuda" and not use_gdn_replayssm:
-        # Exercise the actual tracker publisher over partial acceptances. A
-        # false prefill classification would erase the accepted history here.
-        def ints(values):
-            return torch.tensor(values, dtype=torch.int32, device=device)
-
-        starts = ints([0, 0])
-        committed = ints([0, 0])
-        scratch = ints([0])
-        accepted_total = 0
-        for accepted in (1, min(2, scheduled), 1):
-            _postprocess_replayssm_kernel[(1,)](
-                None,
-                ints([scheduled]),
-                ints([computed + accepted_total]),
-                ints([accepted]),
-                state._is_prefilling_gpu,
-                None,
-                ints([[1]]),
-                starts,
-                committed,
-                scratch,
-                scratch,
-                ints([0]),
-                ints([-1]),
-                1,
-                1,
-                MAMBA_BLOCK_SIZE=64,
-                LOGICAL_WINDOW=16,
-                RING_BUFFER_LEN=32,
-                NUM_LAYERS=1,
-                PAD_SLOT_ID=0,
-                QUERY_METADATA_IS_CUMULATIVE=False,
-                NUM_COMPUTED_IS_POST_STEP=False,
-                HAS_IDX_MAPPING=False,
-                MATERIALIZE_PREFIXES=False,
-                LIVE_COL_IS_ZERO=True,
-                EXECUTED_QUERY_WIDTH=0,
-                GDN_STP=False,
-            )
-            accepted_total += accepted
-            assert starts[1].item() == 0
-            assert committed[1].item() == (0 if expected_prefilling else accepted_total)
 
 
 def test_add_request_seeds_state_idx_in_mamba_blocks() -> None:

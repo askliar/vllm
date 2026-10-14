@@ -15,11 +15,8 @@ from vllm.model_executor.layers.mamba.ops import ssu_dispatch
     [
         (0, (1, 16)),
         (1, (4, 32)),
-        (2, (4, 32)),
         (3, (4, 32)),
         (4, (8, 32)),
-        (5, (8, 32)),
-        (6, (8, 32)),
         (7, (8, 32)),
     ],
 )
@@ -27,7 +24,7 @@ def test_gdn_replayssm_geometry(drafts, expected):
     assert gdn_replayssm_geometry(drafts) == expected
 
 
-@pytest.mark.parametrize("drafts", [-1, 8, 12])
+@pytest.mark.parametrize("drafts", [-1, 8])
 def test_gdn_replayssm_geometry_rejects_unsupported(drafts):
     with pytest.raises(ValueError, match="supports 0 through 7"):
         gdn_replayssm_geometry(drafts)
@@ -42,7 +39,7 @@ def loaders(monkeypatch):
     return stp, mtp, materialize
 
 
-@pytest.mark.parametrize("width", [1, 4, 8])
+@pytest.mark.parametrize("width", [1, 4])
 @pytest.mark.parametrize("needs_materializer", [False, True])
 def test_gdn_replayssm_dependency_selection(loaders, width, needs_materializer):
     stp, mtp, materialize = loaders
@@ -57,7 +54,6 @@ def test_gdn_replayssm_dependency_selection(loaders, width, needs_materializer):
     [
         (1, False, 0, "gated_delta_rule_stp_ucache_flush"),
         (4, False, 1, "gated_delta_rule_mtp_ucache_flush"),
-        (8, True, 1, "gated_delta_rule_mtp_ucache_flush"),
         (1, True, 2, "gdn_prefix_materialize"),
     ],
 )

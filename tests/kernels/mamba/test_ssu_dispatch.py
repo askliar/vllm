@@ -685,12 +685,13 @@ def test_gdn_replayssm_postprocess_uses_executed_width(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("materialize", [False, True])
 @pytest.mark.parametrize(
     ("old_committed", "expected_committed"),
     [(14, 15), (15, 0)],
 )
 def test_gdn_stp_postprocess_matches_fold_absorb_commit(
-    old_committed, expected_committed
+    old_committed, expected_committed, materialize
 ):
     def tensor(values):
         return torch.tensor(values, dtype=torch.int32, device="cuda")
@@ -725,69 +726,17 @@ def test_gdn_stp_postprocess_matches_fold_absorb_commit(
         QUERY_METADATA_IS_CUMULATIVE=False,
         NUM_COMPUTED_IS_POST_STEP=False,
         HAS_IDX_MAPPING=False,
-        MATERIALIZE_PREFIXES=False,
+        MATERIALIZE_PREFIXES=materialize,
         LIVE_COL_IS_ZERO=False,
         EXECUTED_QUERY_WIDTH=1,
         GDN_STP=True,
     )
     assert ring_start[1].item() == 0
-    assert committed[1].item() == expected_committed
+    assert committed[1].item() == (0 if materialize else expected_committed)
     assert plan_start.item() == 0
-    assert plan_count.item() == -1
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize(
-    ("old_committed", "expected_count"),
-    [(14, 15), (15, 0)],
-)
-def test_gdn_stp_prefix_plan_resets_canonical_destination(
-    old_committed, expected_count
-):
-    def tensor(values):
-        return torch.tensor(values, dtype=torch.int32, device="cuda")
-
-    ring_start = tensor([0, 0])
-    committed = tensor([0, old_committed])
-    src_slots = tensor([[0]])
-    dst_slots = tensor([[0]])
-    plan_start = tensor([-1])
-    plan_count = tensor([-1])
-    _postprocess_replayssm_kernel[(1,)](
-        tensor([0]),
-        tensor([1]),
-        tensor([15]),
-        tensor([1]),
-        torch.tensor([False], device="cuda"),
-        tensor([0]),
-        tensor([[1, 1]]),
-        ring_start,
-        committed,
-        src_slots,
-        dst_slots,
-        plan_start,
-        plan_count,
-        2,
-        1,
-        MAMBA_BLOCK_SIZE=16,
-        LOGICAL_WINDOW=16,
-        RING_BUFFER_LEN=16,
-        NUM_LAYERS=1,
-        PAD_SLOT_ID=-1,
-        QUERY_METADATA_IS_CUMULATIVE=False,
-        NUM_COMPUTED_IS_POST_STEP=False,
-        HAS_IDX_MAPPING=False,
-        MATERIALIZE_PREFIXES=True,
-        LIVE_COL_IS_ZERO=False,
-        EXECUTED_QUERY_WIDTH=1,
-        GDN_STP=True,
-    )
-    assert src_slots.item() == 1
-    assert dst_slots.item() == 1
-    assert ring_start[1].item() == 0
-    assert committed[1].item() == 0
-    assert plan_start.item() == 0
-    assert plan_count.item() == expected_count
+    assert plan_count.item() == (expected_committed if materialize else -1)
+    if materialize:
+        assert src_slots.item() == dst_slots.item() == 1
 
 
 def test_replayssm_ring_shape_extends_groups_for_head_shards():

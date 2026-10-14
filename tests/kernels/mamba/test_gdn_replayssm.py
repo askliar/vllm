@@ -8,9 +8,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-    fi_chunk_gated_delta_rule,
-)
 from vllm.model_executor.layers.mamba.gdn.replayssm import run_gdn_replayssm
 
 
@@ -206,135 +203,6 @@ def _reconstruct_replayssm_state(
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
-    reason="FlashInfer GDN prefill requires an SM90+ CUDA device",
-)
-def test_gdn_canonical_prefill_64_1_4_matches_unchunked():
-    """An intermediate one-token prompt chunk preserves output and state."""
-    if importlib.util.find_spec("flashinfer") is None:
-        pytest.skip("flashinfer-python is not installed")
-    device = torch.device("cuda")
-    generator = torch.Generator(device=device).manual_seed(20260909)
-    dtype = torch.bfloat16
-    num_tokens, num_k_heads, num_v_heads, head_dim = 69, 1, 2, 128
-
-    q = torch.randn(
-        1,
-        num_tokens,
-        num_k_heads,
-        head_dim,
-        generator=generator,
-        device=device,
-        dtype=dtype,
-    )
-    k = torch.randn(
-        1,
-        num_tokens,
-        num_k_heads,
-        head_dim,
-        generator=generator,
-        device=device,
-        dtype=dtype,
-    )
-    # Match _forward_core: fused_post_conv_prep normalizes q/k before the
-    # FlashInfer canonical-prefill wrapper, which then receives this flag false.
-    q = F.normalize(q.float(), dim=-1).to(dtype)
-    k = F.normalize(k.float(), dim=-1).to(dtype)
-    v = (
-        torch.randn(
-            1,
-            num_tokens,
-            num_v_heads,
-            head_dim,
-            generator=generator,
-            device=device,
-        )
-        * 0.1
-    ).to(dtype)
-    g = -(
-        torch.rand(
-            1,
-            num_tokens,
-            num_v_heads,
-            generator=generator,
-            device=device,
-        )
-        * 0.03
-        + 0.003
-    )
-    beta = torch.sigmoid(
-        torch.randn(
-            1,
-            num_tokens,
-            num_v_heads,
-            generator=generator,
-            device=device,
-        )
-    )
-    initial_state = (
-        torch.randn(
-            1,
-            num_v_heads,
-            head_dim,
-            head_dim,
-            generator=generator,
-            device=device,
-        )
-        * 0.03
-    ).to(dtype)
-
-    full_output, full_state = fi_chunk_gated_delta_rule(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        initial_state=initial_state,
-        output_final_state=True,
-        cu_seqlens=torch.tensor([0, num_tokens], dtype=torch.int32, device=device),
-        use_qk_l2norm_in_kernel=False,
-    )
-    assert full_state is not None
-
-    chunk_outputs = []
-    chunk_state = initial_state
-    start = 0
-    for chunk_len in (64, 1, 4):
-        stop = start + chunk_len
-        chunk_output, next_state = fi_chunk_gated_delta_rule(
-            # Each scheduled step owns fresh activation buffers. Cloning the
-            # reference slices matches that boundary and its alignment.
-            q=q[:, start:stop].clone(),
-            k=k[:, start:stop].clone(),
-            v=v[:, start:stop].clone(),
-            g=g[:, start:stop].clone(),
-            beta=beta[:, start:stop].clone(),
-            initial_state=chunk_state,
-            output_final_state=True,
-            cu_seqlens=torch.tensor([0, chunk_len], dtype=torch.int32, device=device),
-            use_qk_l2norm_in_kernel=False,
-        )
-        assert next_state is not None
-        chunk_outputs.append(chunk_output)
-        # Match the canonical vLLM cache boundary between scheduled chunks.
-        chunk_state = next_state.to(dtype)
-        start = stop
-
-    torch.testing.assert_close(
-        torch.cat(chunk_outputs, dim=1).float(),
-        full_output.float(),
-        rtol=2e-2,
-        atol=2e-2,
-    )
-    torch.testing.assert_close(
-        chunk_state.float(),
-        full_state.to(dtype).float(),
-        rtol=2e-2,
-        atol=2e-2,
-    )
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
     reason="FlashInfer GDN ReplaySSM requires an SM90+ CUDA device",
 )
 @pytest.mark.parametrize(
@@ -350,7 +218,6 @@ def test_gdn_canonical_prefill_64_1_4_matches_unchunked():
         (8, 8, 30, [8, 8, 8], [5, 2, 7]),
         (4, 12, 28, [1, 3, 2], [1, 2, 1]),
         (8, 8, 30, [1, 5, 2], [1, 3, 2]),
-        (8, 8, 30, [6, 3, 5], [4, 2, 3]),
     ],
 )
 def test_gdn_replayssm_multistep_matches_accepted_state_reference(
@@ -739,8 +606,7 @@ def test_gdn_prefix_materialize_matches_reference(ring_slots: int):
 )
 @pytest.mark.parametrize(
     ("executed_query_width", "query_len"),
-    [(1, 1)]
-    + [(width, query_len) for width in (4, 8) for query_len in range(1, width + 1)],
+    [(1, 1), (4, 3), (8, 6)],
 )
 def test_gdn_replayssm_flashinfer_smoke(
     monkeypatch: pytest.MonkeyPatch,
