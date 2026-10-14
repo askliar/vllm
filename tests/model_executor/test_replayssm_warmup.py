@@ -44,6 +44,7 @@ def _autotune_runner(
                 use_replayssm and backend == MambaBackendEnum.FLASHINFER
             ),
             use_v2_model_runner=use_v2_model_runner,
+            is_gdn_replayssm_enabled=lambda: False,
         ),
         uniform_decode_query_len=query_len,
         decode_query_len=query_len,
@@ -133,6 +134,7 @@ def test_replayssm_autotune_slots_restore_state_and_trackers(use_v2, fail_warmup
         mixer = MambaMixer2.__new__(MambaMixer2)
         torch.nn.Module.__init__(mixer)
         mixer.use_replayssm = True
+        mixer.use_flashinfer_replayssm = True
         mixer.replayssm_buffer_len = 16
         mixer.kv_cache = tuple(torch.full((5, 2), 3.0) for _ in range(2))
         mixer.replayssm_cache = tuple(tensor[:, :, :width] for tensor in raw)

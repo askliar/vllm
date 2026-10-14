@@ -2423,9 +2423,13 @@ class GPUModelRunner(
         # Used by mamba backends to distinguish actual decodes from
         # short extends.
         is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
+        is_last_prefill = is_prefilling & (
+            seq_lens_cpu_upper_bound >= num_prompt_tokens_cpu
+        )
         # Zero out padded rows so stale data from condense() doesn't
         # misclassify padding as prefill in CUDA graph mode.
         is_prefilling[num_reqs:] = False
+        is_last_prefill[num_reqs:] = False
 
         # Compute mm_prefix bidirectional ranges before building
         # attention metadata so builders handle them during build().
@@ -2510,6 +2514,7 @@ class GPUModelRunner(
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
+            is_last_prefill=is_last_prefill,
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
@@ -4383,6 +4388,7 @@ class GPUModelRunner(
                     self.input_batch.req_ids,
                     num_reqs,
                     self.requests,
+                    use_gdn_replayssm=self.vllm_config.is_gdn_replayssm_enabled(),
                 )
 
             use_spec_decode = self.speculative_config is not None

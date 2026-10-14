@@ -9,7 +9,10 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFuncsByType,
+    gdn_replayssm_geometry,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -41,13 +44,17 @@ from vllm.v1.worker.utils import AttentionGroup
 @dataclass
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
+    is_last_prefill: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self, kv_cache_group_id: int, num_reqs: int
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        return {
+            "is_prefilling": self.is_prefilling[:num_reqs],
+            "is_last_prefill": self.is_last_prefill[:num_reqs],
+        }
 
     def get_extra_attn_kwargs(
         self, attn_metadata_builder: Any, num_reqs: int
@@ -94,6 +101,7 @@ class MambaHybridModelState(DefaultModelState):
         # running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
         self._use_flashinfer_replayssm = vllm_config.use_flashinfer_replayssm
+        self._use_gdn_replayssm = vllm_config.is_gdn_replayssm_enabled()
         if self._use_flashinfer_replayssm:
             self._is_prefilling_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.bool, device=self.device
@@ -283,6 +291,15 @@ class MambaHybridModelState(DefaultModelState):
             is_prefilling_np = is_prefilling_np & ~input_batch.prefill_runs_as_decode_np
         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(is_prefilling_np)
+        is_last_prefill = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
+        is_last_prefill[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.is_prefilling_np
+            & (
+                input_batch.num_computed_prefill_tokens_np
+                + input_batch.num_scheduled_tokens
+                >= input_batch.prefill_len_np
+            )
+        )
         # During CUDAGraph capture, num_decode_draft_tokens_cpu and num_accepted_tokens
         # are created by attn_metadata_builder.build_for_cudagraph_capture, so we only
         # compute them during actual (non-capture) forward execution.
@@ -327,9 +344,19 @@ class MambaHybridModelState(DefaultModelState):
                 decode_rows |= (num_decode_draft_tokens_cpu >= 0) & (
                     query_lens == num_decode_draft_tokens_cpu + 1
                 )
-            replayssm_prefilling = is_prefilling & ~(
-                (seq_lens_cpu_upper_bound[:num_reqs] > query_lens) & decode_rows
-            )
+            stateful_decode_rows = (
+                seq_lens_cpu_upper_bound[:num_reqs] > query_lens
+            ) & decode_rows
+            if self._use_gdn_replayssm:
+                stateful_decode_rows &= is_last_prefill
+            replayssm_prefilling = is_prefilling & ~stateful_decode_rows
+            if self._use_gdn_replayssm:
+                # GDN alone uses fixed-width replay kernels. Mamba2 supports
+                # other speculative widths and intermediate one-token chunks.
+                replay_width, _ = gdn_replayssm_geometry(
+                    self.vllm_config.num_speculative_tokens
+                )
+                replayssm_prefilling |= query_lens > replay_width
             async_tensor_h2d(
                 replayssm_prefilling, out=self._is_prefilling_gpu[:num_reqs]
             )
@@ -352,6 +379,7 @@ class MambaHybridModelState(DefaultModelState):
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
+            is_last_prefill=is_last_prefill,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )

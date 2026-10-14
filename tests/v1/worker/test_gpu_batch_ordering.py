@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -48,13 +49,18 @@ def _make_common_attn_metadata(query_lens: list[int]) -> CommonAttentionMetadata
 
 
 def _make_runner(
-    req_states: dict[str, tuple[int, int]], decode_query_len: int = 8
+    req_states: dict[str, tuple[int, int]],
+    decode_query_len: int = 8,
+    use_gdn_replayssm: bool = False,
 ) -> Any:
     """Build a runner stub from {req_id: (num_computed_tokens, prefill_len)}."""
     prefill_lens = np.array([s[1] for s in req_states.values()], dtype=np.int32)
     num_computed = np.array([s[0] for s in req_states.values()], dtype=np.int32)
     runner: Any = GPUModelRunner.__new__(GPUModelRunner)
     runner.decode_query_len = decode_query_len
+    runner.vllm_config = SimpleNamespace(
+        is_gdn_replayssm_enabled=lambda: use_gdn_replayssm
+    )
     runner.adaptive_verification = None
     runner.pcp_manager = None
     runner.use_pp = False
@@ -154,6 +160,39 @@ def test_one_new_prompt_token_over_context_runs_as_decode():
     }
 
 
+@pytest.mark.parametrize("use_gdn_replayssm", [False, True])
+def test_intermediate_single_token_then_multi_token_prompt_chunk(use_gdn_replayssm):
+    # Token 65 must enter GDN's canonical state before the final three-token
+    # prefill reads that state. Mamba2 retains its existing one-token routing.
+    runner = _make_runner({"prompt": (0, 68)}, 1, use_gdn_replayssm)
+    for computed, scheduled in [(0, 64), (64, 1), (65, 3)]:
+        runner.req_states.num_computed_prefill_tokens[0] = computed
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={"prompt": scheduled},
+            total_num_scheduled_tokens=scheduled,
+            scheduled_spec_decode_tokens={},
+        )
+        state, uniform = runner.gather_batch_req_state(scheduler_output, False)
+        expected_decode = computed == 64 and not use_gdn_replayssm
+        assert state.prefill_runs_as_decode_np.tolist() == [expected_decode]
+        assert state.decode_graph_eligible == expected_decode
+        assert uniform == (1 if expected_decode else None)
+
+
+@pytest.mark.parametrize("drafts", [0, 3])
+def test_gdn_final_single_token_prompt_chunk_remains_decode(drafts):
+    runner = _make_runner({"prompt": (67, 68)}, drafts + 1, True)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"prompt": drafts + 1},
+        total_num_scheduled_tokens=drafts + 1,
+        scheduled_spec_decode_tokens={"prompt": [-1] * drafts} if drafts else {},
+    )
+    state, uniform = runner.gather_batch_req_state(scheduler_output, False)
+    assert state.prefill_runs_as_decode_np.tolist() == [True]
+    assert state.decode_graph_eligible
+    assert uniform == drafts + 1
+
+
 def test_one_token_prompt_tail_with_prior_context_is_uniform_decode():
     # Replaying the last prompt token over existing context (full prefix-cache
     # hit or P/D KV import) computes exactly like a decode.
@@ -245,6 +284,7 @@ def test_uniform_decode_uses_state_index_not_batch_position():
     """
     runner: Any = GPUModelRunner.__new__(GPUModelRunner)
     runner.decode_query_len = 8
+    runner.vllm_config = SimpleNamespace(is_gdn_replayssm_enabled=lambda: False)
     runner.adaptive_verification = None
     runner.pcp_manager = None
     runner.use_pp = False
