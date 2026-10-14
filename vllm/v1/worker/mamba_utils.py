@@ -1722,6 +1722,7 @@ def stage_postprocess_inputs_to_gpu(
     req_ids: list[str],
     num_reqs: int,
     requests: dict[str, CachedRequestState],
+    use_gdn_replayssm: bool = False,
 ) -> None:
     """Stage the per-request decisions consumed after token acceptance.
 
@@ -1749,10 +1750,14 @@ def stage_postprocess_inputs_to_gpu(
         scheduled_np[i] = scheduled
         computed_np[i] = computed
         draft_np[i] = num_draft
-        # Match Mamba attention: stateful one-token prompt tails, including
-        # those padded with speculative placeholders, run the decode kernels.
+        # GDN keeps intermediate prompt chunks canonical. Mamba2's forward
+        # builder routes every stateful one-token chunk through decode, so its
+        # postprocess must preserve that chunk's replay history as well.
+        is_last_prefill = computed + scheduled >= req_state.num_prompt_tokens
         prefill_np[i] = computed < req_state.num_prompt_tokens and not (
-            computed > 0 and (scheduled == 1 or scheduled == num_draft + 1)
+            computed > 0
+            and (not use_gdn_replayssm or is_last_prefill)
+            and (scheduled == 1 or scheduled == num_draft + 1)
         )
     ctx.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_computed_tokens_buf.copy_to_gpu(num_reqs)

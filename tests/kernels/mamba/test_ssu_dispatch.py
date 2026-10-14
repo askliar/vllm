@@ -146,6 +146,7 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(post_
                 [NULL_BLOCK_ID, NULL_BLOCK_ID],
             ]
         ),
+        MambaAttentionBackendEnum.MAMBA2,
         "align",
         16,
         4,
@@ -170,7 +171,7 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(post_
     )
     assert group.active_request_indices.tolist() == [0, -1, -1, -1]
     assert group.plan_flush_count.tolist() == [4, -1, -1, -1]
-    group.materialize()
+    group.materialize_mamba()
 
     expected = original[3].clone()
     for offset in range(4):
@@ -223,6 +224,7 @@ def test_replayssm_skips_canonical_self_copy_but_resets_prefill_trackers(post_st
                 [NULL_BLOCK_ID] * 3,
             ]
         ),
+        MambaAttentionBackendEnum.MAMBA2,
         "align",
         16,
         4,
@@ -494,6 +496,8 @@ def test_replayssm_postprocess_commits_staged_transition(
         HAS_IDX_MAPPING=post_step,
         MATERIALIZE_PREFIXES=False,
         LIVE_COL_IS_ZERO=True,
+        EXECUTED_QUERY_WIDTH=0,
+        GDN_STP=False,
     )
     assert committed.tolist() == [expected_committed, 9]
     assert ring_start.tolist() == [expected_start, 7]

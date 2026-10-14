@@ -69,6 +69,8 @@ def test_add_request_seeds_state_with_scoped_block_size(
         pytest.param(0, 4, 3, True, True, "cpu", id="cpu-fresh-prefill"),
         pytest.param(256, 4, 0, True, True, "cpu", id="cpu-chunked-prefill"),
         pytest.param(256, 4, 3, False, False, "cpu", id="cpu-ordinary-decode"),
+        pytest.param(256, 5, 4, False, False, "cpu", id="mamba-width-5"),
+        pytest.param(256, 13, 12, False, False, "cpu", id="mamba-width-13"),
         pytest.param(
             256,
             4,
@@ -93,10 +95,11 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
     staging_device,
 ) -> None:
     state = object.__new__(MambaHybridModelState)
-    state.vllm_config = SimpleNamespace(num_speculative_tokens=3)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=max(3, drafts))
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
     state._use_flashinfer_replayssm = True
+    state._use_gdn_replayssm = False
     if staging_device == "cpu":
         monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     state._is_prefilling_gpu = torch.zeros(1, dtype=torch.bool, device=staging_device)
@@ -123,6 +126,8 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
         seq_lens_cpu_upper_bound=torch.tensor([computed + scheduled]),
         seq_lens=torch.tensor([computed + scheduled]),
         is_prefilling_np=torch.tensor([prefilling]).numpy(),
+        num_computed_prefill_tokens_np=np.array([computed]),
+        prefill_len_np=np.array([computed + scheduled if prefilling else computed]),
         dcp_local_seq_lens=None,
         positions=positions,
         prompt_lens=torch.tensor([1024], dtype=torch.int32),
@@ -205,6 +210,8 @@ def test_padded_prompt_tail_builds_as_spec_decode(
         seq_lens_cpu_upper_bound=torch.tensor(seq_lens, dtype=torch.int32),
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
         is_prefilling_np=np.array(is_prefilling),
+        num_computed_prefill_tokens_np=np.array([46, 128, 0]),
+        prefill_len_np=np.array([40, 129, 8]),
         prefill_runs_as_decode_np=np.array([False, True, False]),
         dcp_local_seq_lens=None,
         positions=torch.zeros(12, dtype=torch.int64),
@@ -278,6 +285,8 @@ def _input_batch(
         max_query_len=None,
         seq_lens_cpu_upper_bound=seq_lens,
         is_prefilling_np=np.array(is_prefilling),
+        num_computed_prefill_tokens_np=np.where(is_prefilling, 0, 10),
+        prefill_len_np=np.where(is_prefilling, 16, 10),
         prefill_runs_as_decode_np=None,
         num_draft_tokens_per_req=None
         if num_draft_tokens_per_req is None

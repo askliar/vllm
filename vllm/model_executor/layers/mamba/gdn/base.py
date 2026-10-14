@@ -14,6 +14,7 @@ from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
+    gdn_replayssm_geometry,
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -45,6 +46,30 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             if self.speculative_config
             else 0
         )
+        self.use_replayssm = vllm_config.is_gdn_replayssm_enabled()
+        self.use_flashinfer_replayssm = self.use_replayssm
+        self.replayssm_buffer_len = (
+            self.cache_config.replayssm_buffer_len if self.use_replayssm else None
+        )
+        self.replayssm_executed_query_width: int | None = None
+        self.replayssm_ring_slots: int | None = None
+        if self.use_replayssm:
+            self.replayssm_executed_query_width, self.replayssm_ring_slots = (
+                gdn_replayssm_geometry(self.num_spec)
+            )
+        if self.replayssm_executed_query_width is not None:
+            # STP executes one token but still uses four staging rows.
+            packed_width = max(self.replayssm_executed_query_width, 4)
+            self.register_buffer(
+                "_replayssm_offsets",
+                torch.arange(packed_width, dtype=torch.int32),
+                persistent=False,
+            )
+        self.replayssm_cache = (
+            tuple(torch.tensor([]) for _ in range(3)) if self.use_replayssm else ()
+        )
+        self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
+        self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
@@ -55,4 +80,11 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    def get_replayssm_state_dtype(self) -> tuple[torch.dtype, ...]:
+        if not self.use_replayssm:
+            return ()
+        return MambaStateDtypeCalculator.gated_delta_net_replayssm_ring_dtypes(
+            self.model_config.dtype
         )
