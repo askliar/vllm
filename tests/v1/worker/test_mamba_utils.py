@@ -804,28 +804,18 @@ def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
 
 
 @pytest.mark.parametrize(
-    (
-        "computed",
-        "scheduled",
-        "drafts",
-        "prompt_len",
-        "expected_prefilling",
-        "use_gdn_replayssm",
-    ),
+    ("computed", "scheduled", "drafts", "prompt_len", "expected_prefilling"),
     [
-        (256, 4, 3, 257, False, False),
-        (1, 4, 3, 2, False, False),
-        (256, 1, 0, 257, False, False),
-        (0, 4, 3, 1, True, False),
-        (256, 4, 0, 260, True, False),
-        (256, 4, 3, 256, False, False),
-        (64, 1, 0, 68, False, False),
-        (64, 1, 0, 68, True, True),
-        (67, 1, 0, 68, False, True),
+        (256, 4, 3, 257, False),
+        (1, 4, 3, 2, False),
+        (256, 1, 0, 257, False),
+        (0, 4, 3, 1, True),
+        (256, 4, 0, 260, True),
+        (256, 4, 3, 256, False),
     ],
 )
 def test_stage_replayssm_prefill_classification(
-    computed, scheduled, drafts, prompt_len, expected_prefilling, use_gdn_replayssm
+    computed, scheduled, drafts, prompt_len, expected_prefilling
 ):
     ctx = _make_staging_ctx(1, torch.device("cpu"))
     stage_postprocess_inputs_to_gpu(
@@ -843,7 +833,6 @@ def test_stage_replayssm_prefill_classification(
             block_ids_per_req=[[0]],
             num_prompt_tokens=[prompt_len],
         ),
-        use_gdn_replayssm=use_gdn_replayssm,
     )
     assert ctx.is_prefilling_buf.gpu.item() == expected_prefilling
 

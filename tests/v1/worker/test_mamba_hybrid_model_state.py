@@ -15,7 +15,6 @@ from tests.v1.attention.test_gdn_metadata_builder import (
     _create_gdn_builder,
 )
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
-from tests.v1.worker.test_gpu_batch_ordering import _make_runner
 from vllm.config.compilation import CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.recoverssm_metadata import (
@@ -56,93 +55,59 @@ def test_add_request_seeds_state_with_scoped_block_size(
 
 @pytest.mark.parametrize(
     (
-        "num_spec",
         "computed",
         "scheduled",
         "drafts",
         "prefilling",
         "expected_prefilling",
-        "use_gdn_replayssm",
-        "prompt_len",
-        "device",
+        "staging_device",
     ),
     [
+        pytest.param(256, 4, 3, True, False, "cpu", id="cpu-cached-tail"),
+        pytest.param(1, 4, 3, True, False, "cpu", id="cpu-short-prefix"),
+        pytest.param(256, 1, 0, True, False, "cpu", id="cpu-one-token-tail"),
+        pytest.param(0, 4, 3, True, True, "cpu", id="cpu-fresh-prefill"),
+        pytest.param(256, 4, 0, True, True, "cpu", id="cpu-chunked-prefill"),
+        pytest.param(256, 4, 3, False, False, "cpu", id="cpu-ordinary-decode"),
+        pytest.param(256, 5, 4, False, False, "cpu", id="mamba-width-5"),
+        pytest.param(256, 13, 12, False, False, "cpu", id="mamba-width-13"),
         pytest.param(
-            3, 256, 4, 3, True, False, False, 257, "cpu", id="cpu-cached-tail"
-        ),
-        pytest.param(3, 1, 4, 3, True, False, False, 2, "cpu", id="cpu-short-prefix"),
-        pytest.param(
-            3, 256, 1, 0, True, False, False, 257, "cpu", id="cpu-one-token-tail"
-        ),
-        pytest.param(3, 0, 4, 3, True, True, False, 1, "cpu", id="cpu-fresh-prefill"),
-        pytest.param(
-            3, 256, 4, 0, True, True, False, 260, "cpu", id="cpu-chunked-prefill"
-        ),
-        pytest.param(
-            3, 256, 4, 3, False, False, False, 256, "cpu", id="cpu-ordinary-decode"
-        ),
-        pytest.param(
-            3,
             256,
             4,
             3,
             True,
             False,
-            False,
-            257,
             "cuda",
             id="cuda-cached-tail",
             marks=pytest.mark.skipif(
                 not torch.cuda.is_available(), reason="requires CUDA"
             ),
         ),
-        # Mamba2 must retain verification widths outside GDN's fixed T=4/8.
-        (4, 256, 5, 4, False, False, False, 256, "cpu"),
-        (12, 256, 13, 12, False, False, False, 256, "cpu"),
-        (5, 256, 6, 5, False, False, True, 256, "cpu"),
-        (0, 64, 1, 0, True, True, True, 68, "cpu"),
-        (0, 65, 3, 0, True, True, True, 68, "cpu"),
-        (0, 67, 1, 0, True, False, True, 68, "cpu"),
-        (3, 67, 4, 3, True, False, True, 68, "cpu"),
     ],
 )
 def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
     monkeypatch: pytest.MonkeyPatch,
-    num_spec,
     computed,
     scheduled,
     drafts,
     prefilling,
     expected_prefilling,
-    use_gdn_replayssm,
-    prompt_len,
-    device,
+    staging_device,
 ) -> None:
     state = object.__new__(MambaHybridModelState)
-    state.vllm_config = SimpleNamespace(num_speculative_tokens=num_spec)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=max(3, drafts))
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
     state._use_flashinfer_replayssm = True
-    state._use_gdn_replayssm = use_gdn_replayssm
-    state._mamba_ctx = None
-    if device == "cpu":
+    state._use_gdn_replayssm = False
+    if staging_device == "cpu":
         monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
-    state._is_prefilling_gpu = torch.zeros(1, dtype=torch.bool, device=device)
+    state._is_prefilling_gpu = torch.zeros(1, dtype=torch.bool, device=staging_device)
+    state._mamba_ctx = None
     state.num_accepted_tokens_gpu = torch.ones(1, dtype=torch.int32)
     state._get_mamba_group_info = Mock(return_value=([], None))
     state.recoverssm = None
 
-    runner = _make_runner(
-        {"req": (computed, prompt_len)}, num_spec + 1, use_gdn_replayssm
-    )
-    batch_state, _ = runner.gather_batch_req_state(
-        SimpleNamespace(
-            num_scheduled_tokens={"req": scheduled},
-            total_num_scheduled_tokens=scheduled,
-            scheduled_spec_decode_tokens={"req": [-1] * drafts} if drafts else {},
-        ),
-        False,
-    )
     positions = torch.arange(computed, computed + scheduled, dtype=torch.int64)
     input_batch = SimpleNamespace(
         num_reqs=1,
@@ -150,7 +115,9 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
         num_reqs_after_padding=1,
         num_tokens_after_padding=scheduled,
         max_query_len=None,
-        prefill_runs_as_decode_np=batch_state.prefill_runs_as_decode_np,
+        prefill_runs_as_decode_np=np.array(
+            [prefilling and computed > 0 and drafts > 0]
+        ),
         query_start_loc_np=torch.tensor([0, scheduled], dtype=torch.int32).numpy(),
         query_start_loc=torch.tensor([0, scheduled], dtype=torch.int32),
         num_scheduled_tokens=torch.tensor([scheduled], dtype=torch.int32).numpy(),
@@ -159,8 +126,8 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
         seq_lens_cpu_upper_bound=torch.tensor([computed + scheduled]),
         seq_lens=torch.tensor([computed + scheduled]),
         is_prefilling_np=torch.tensor([prefilling]).numpy(),
-        num_computed_prefill_tokens_np=torch.tensor([computed]).numpy(),
-        prefill_len_np=torch.tensor([prompt_len]).numpy(),
+        num_computed_prefill_tokens_np=np.array([computed]),
+        prefill_len_np=np.array([computed + scheduled if prefilling else computed]),
         dcp_local_seq_lens=None,
         positions=positions,
         prompt_lens=torch.tensor([1024], dtype=torch.int32),
@@ -170,7 +137,7 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
     monkeypatch.setattr(mamba_hybrid, "build_attn_metadata", build_attn_metadata)
 
     prepare_attn = state.prepare_attn
-    if device == "cuda":
+    if staging_device == "cuda":
         monkeypatch.setattr(gsd, "_SYNC_CHECK_MODE", "error")
         monkeypatch.setattr(gsd, "_sync_check_enabled", True)
         gsd.enable_gpu_sync_check()

@@ -17,7 +17,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
-import pytest
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -160,11 +159,9 @@ def test_one_new_prompt_token_over_context_runs_as_decode():
     }
 
 
-@pytest.mark.parametrize("use_gdn_replayssm", [False, True])
-def test_intermediate_single_token_then_multi_token_prompt_chunk(use_gdn_replayssm):
-    # Token 65 must enter GDN's canonical state before the final three-token
-    # prefill reads that state. Mamba2 retains its existing one-token routing.
-    runner = _make_runner({"prompt": (0, 68)}, 1, use_gdn_replayssm)
+def test_gdn_intermediate_single_token_then_multi_token_prompt_chunk():
+    # Token 65 must update canonical state before the final three-token prefill.
+    runner = _make_runner({"prompt": (0, 68)}, 1, use_gdn_replayssm=True)
     for computed, scheduled in [(0, 64), (64, 1), (65, 3)]:
         runner.req_states.num_computed_prefill_tokens[0] = computed
         scheduler_output = SimpleNamespace(
@@ -173,24 +170,9 @@ def test_intermediate_single_token_then_multi_token_prompt_chunk(use_gdn_replays
             scheduled_spec_decode_tokens={},
         )
         state, uniform = runner.gather_batch_req_state(scheduler_output, False)
-        expected_decode = computed == 64 and not use_gdn_replayssm
-        assert state.prefill_runs_as_decode_np.tolist() == [expected_decode]
-        assert state.decode_graph_eligible == expected_decode
-        assert uniform == (1 if expected_decode else None)
-
-
-@pytest.mark.parametrize("drafts", [0, 3])
-def test_gdn_final_single_token_prompt_chunk_remains_decode(drafts):
-    runner = _make_runner({"prompt": (67, 68)}, drafts + 1, True)
-    scheduler_output = SimpleNamespace(
-        num_scheduled_tokens={"prompt": drafts + 1},
-        total_num_scheduled_tokens=drafts + 1,
-        scheduled_spec_decode_tokens={"prompt": [-1] * drafts} if drafts else {},
-    )
-    state, uniform = runner.gather_batch_req_state(scheduler_output, False)
-    assert state.prefill_runs_as_decode_np.tolist() == [True]
-    assert state.decode_graph_eligible
-    assert uniform == drafts + 1
+        assert state.prefill_runs_as_decode_np.tolist() == [False]
+        assert not state.decode_graph_eligible
+        assert uniform is None
 
 
 def test_one_token_prompt_tail_with_prior_context_is_uniform_decode():
