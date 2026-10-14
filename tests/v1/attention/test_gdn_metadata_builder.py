@@ -5,7 +5,7 @@ reclassification of non-spec decodes as prefills when spec decodes exist.
 Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +22,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
+    plan_flashinfer_checkpoints,
 )
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -831,3 +832,77 @@ def test_update_block_table_regathers_checkpoint(num_spec):
     assert not torch.equal(
         actual.checkpoint.state_indices, source.checkpoint.state_indices
     )
+
+
+def test_plan_flashinfer_checkpoints_selects_the_state_at_each_offset():
+    """Each checkpoint row maps to the state FlashInfer emits at its offset.
+
+    The leading decode row is not in the prefill kernel and never checkpoints;
+    the 50-token prefill is shorter than the stride and emits no states.
+    """
+    every_n_tokens, cu_starts, rows = plan_flashinfer_checkpoints(
+        offsets=[0, 128, 0, 192], query_lens=[200, 50, 300]
+    )
+
+    assert every_n_tokens == 64
+    assert cu_starts == [0, 3, 3, 7]
+    # Row 1: state after 128 tokens of the first prefill. Row 3: after 192
+    # tokens of the third prefill, whose states start at index 3.
+    assert rows == [0, 1, 0, 5]
+
+
+def test_gdn_replayssm_preserves_internal_prefill_checkpoint_plan():
+    """Replay rows must not shift the prefill checkpoint or cache-group mapping."""
+    builder = _create_minimal_gdn_builder(num_spec=3)
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    builder.vllm_config.cache_config.hash_block_size = 64
+    builder.vllm_config.cache_config.cache_hit_alignment_tokens = 64
+    builder.plan_flashinfer_checkpoints = True
+    builder.kv_cache_spec = replace(
+        builder.kv_cache_spec,
+        block_size=64,
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=64,
+    )
+    builder.checkpoint_builder.kv_cache_spec = builder.kv_cache_spec
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[65, 100, 100], query_lens=[3, 100, 99]),
+        64,
+        DEVICE,
+        arange_block_indices=True,
+    )
+    common = common.replace(
+        block_table_tensor=common.block_table_tensor + 1,
+        is_prefilling=torch.tensor([False, True, True]),
+        is_last_prefill=torch.tensor([False, True, True]),
+    )
+    source = builder.build(
+        0,
+        common,
+        num_decode_draft_tokens_cpu=torch.tensor([2, -1, -1], dtype=torch.int32),
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32),
+    )
+
+    assert source.num_spec_decodes == 1
+    assert source.spec_state_indices_tensor.shape == (1, 1)
+    assert source.checkpoint is not None
+    assert source.checkpoint.request_rows.tolist() == [1, 2]
+    assert source.checkpoint.offsets == [64, 0]
+    plan = source.flashinfer_checkpoint_plan
+    assert plan is not None
+    assert plan.every_n_tokens == 64
+    assert plan.cu_starts.tolist() == [0, 1, 2]
+    assert plan.rows.tolist() == [0, 0]
+
+    other_table = common.block_table_tensor + 100
+    builder.mamba_aligned_state_indices = mamba_get_block_table_tensor(
+        other_table, common.seq_lens, builder.kv_cache_spec, "align"
+    )
+    actual = builder.update_block_table(source, other_table, common.slot_mapping)
+    assert actual.flashinfer_checkpoint_plan is plan
+    assert actual.checkpoint.state_indices.tolist() == [
+        other_table[1, 0].item(),
+        0,
+    ]
+    assert actual.spec_state_indices_tensor.shape == (1, 1)

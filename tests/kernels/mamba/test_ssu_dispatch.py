@@ -788,3 +788,18 @@ def test_gdn_stp_prefix_plan_resets_canonical_destination(
     assert committed[1].item() == 0
     assert plan_start.item() == 0
     assert plan_count.item() == expected_count
+
+
+def test_replayssm_ring_shape_extends_groups_for_head_shards():
+    """B_cache retains one replicated group on each head shard."""
+    shapes = MambaStateShapeCalculator.replayssm_ring_shapes(
+        num_heads=4,
+        head_dim=64,
+        state_size=128,
+        n_groups=1,
+        tp_world_size=2,
+        logical_window=16,
+        backend=MambaBackendEnum.TRITON,
+    )
+
+    assert shapes == ((2, 16, 64), (2, 16), (1, 16, 128))
