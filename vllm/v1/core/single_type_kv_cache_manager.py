@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashWithGroupId,
     KVCacheBlock,
     resolve_block_hashes,
+    trim_null_head,
 )
 from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
 from vllm.v1.kv_cache_interface import (
@@ -509,6 +510,13 @@ class SingleTypeKVCacheManager(ABC):
         reachable_boundaries = [*replay_boundaries]
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
+            if self.use_eagle:
+                # A sibling that diverges right after the junction cannot use
+                # the block past it as the EAGLE peek, so its hit lands one
+                # block lower.
+                reachable_boundaries.append(
+                    request.shared_prefix_boundary - self.block_size
+                )
 
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
@@ -569,14 +577,15 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
 
         Returns:
-            The request's blocks in allocation order.
+            The request's blocks in allocation order, without the leading
+            null blocks (e.g. a sliding-window table's skipped prefix).
 
         """
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
-        return req_blocks
+        return trim_null_head(req_blocks)
 
     def free(self, request_id: str) -> None:
         """Free the blocks for the request.
@@ -1430,19 +1439,6 @@ class MambaManager(SingleTypeKVCacheManager):
             "Mamba prefix caching requires mamba_cache_mode='align'"
         )
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
-        # FlashInfer ReplaySSM rings and trackers live outside the canonical
-        # cache page, so explicitly migrate them when the live block moves.
-        # Triton's packed five-state page follows the normal copy path.
-        self._copy_flashinfer_replayssm_live_state = bool(
-            kv_cache_spec.replayssm_shapes
-        )
-        if self._copy_flashinfer_replayssm_live_state:
-            # ReplaySSM stores speculative history inside its ring. It must not
-            # also reserve the baseline Mamba speculative scratch blocks.
-            assert self.num_speculative_blocks == 0, (
-                "ReplaySSM keeps speculative state in its replay rings, not "
-                "separate scheduler blocks"
-            )
         self.has_prefill_checkpoint_blocks = (
             self.mamba_cache_mode == "align"
             and kv_cache_spec.num_prefill_checkpoint_blocks > 0
@@ -1802,29 +1798,9 @@ class MambaManager(SingleTypeKVCacheManager):
             # speculative decoding (MTP/EAGLE) with linear attention.
             if self.num_speculative_blocks > 0:
                 num_tokens += self.block_size * self.num_speculative_blocks
-            if not self._copy_flashinfer_replayssm_live_state:
-                return super().allocate_new_blocks(
-                    request_id, num_tokens, num_tokens_main_model
-                )
-            # The base allocator may append a new final block. Remember the
-            # current live owner before it mutates req_blocks so the worker can
-            # copy the complete ReplaySSM state into that new write slot.
-            # For a partial cache hit, the hit block—not the request's old
-            # tail—is the state source.
-            req_blocks = self.req_to_blocks[request_id]
-            prev_block_len = len(req_blocks)
-            partial_hit = self._partial_hit_reqs.get(request_id)
-            live_source = (
-                partial_hit[1]
-                if partial_hit is not None
-                else (req_blocks[-1] if req_blocks else None)
-            )
-            new_blocks = super().allocate_new_blocks(
+            return super().allocate_new_blocks(
                 request_id, num_tokens, num_tokens_main_model
             )
-            if len(req_blocks) > prev_block_len and live_source is not None:
-                self._queue_replayssm_live_copy(live_source, req_blocks[-1])
-            return new_blocks
         else:
             # We don't allocate blocks for lookahead tokens in align mode, because if
             # x * block_size tokens are scheduled, num_tokens is
@@ -1832,8 +1808,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # We can ignore lookahead tokens because current draft models don't have
             # mamba layers.
             num_tokens = num_tokens_main_model
-            req_blocks = self.req_to_blocks[request_id]
-            prev_block_len = len(req_blocks)
+            req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = (
@@ -1842,15 +1817,6 @@ class MambaManager(SingleTypeKVCacheManager):
             checkpoint_block = int(request_id in self._checkpoints)
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
-            live_source = None
-            if self._copy_flashinfer_replayssm_live_state:
-                # Capture the live state owner before align-mode allocation
-                # relocates/nulls table entries. The eventual destination is
-                # the last new block, where the next forward writes state.
-                if partial_hit is not None:
-                    live_source = partial_hit[1]
-                elif prev_block_len > 0:
-                    live_source = req_blocks[prev_block_len - 1]
             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
             # over-allocated at last round.
             if (
@@ -1861,6 +1827,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 self._allocated_block_reqs.add(request_id)
                 return []
             else:
+                prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
                 # Record the last state block
                 if blocks_allocated:
@@ -1945,36 +1912,10 @@ class MambaManager(SingleTypeKVCacheManager):
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
                 req_blocks.extend(new_blocks)
-                if self._copy_flashinfer_replayssm_live_state and new_blocks:
-                    self._queue_replayssm_live_copy(live_source, req_blocks[-1])
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
                 returned_blocks.extend(new_blocks)
                 return returned_blocks
-
-    def _queue_replayssm_live_copy(
-        self,
-        source_block: KVCacheBlock | None,
-        destination_block: KVCacheBlock,
-    ) -> None:
-        """Queue and retain one complete live ReplaySSM slot migration.
-
-        Reuse the existing CoW copy channel because the worker already applies
-        each queued physical-block pair to every cache tensor registered for
-        this group, including ReplaySSM rings and trackers. The extra references
-        keep both slots alive until the coordinator drains and executes the
-        copy; the scheduler releases those retained references afterward.
-        """
-        if (
-            source_block is None
-            or source_block.is_null
-            or destination_block.is_null
-            or source_block is destination_block
-        ):
-            return
-        source_block.ref_cnt += 1
-        destination_block.ref_cnt += 1
-        self._pending_cow_copies.append((source_block, destination_block))
 
     def _relocate_speculative_block(
         self, req_blocks: list[KVCacheBlock], block_idx: int
@@ -2160,6 +2101,13 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         source_block = blocks[block_idx]
         if source_block.is_null:
+            return None
+        if (
+            num_tokens % self.block_size == 0
+            and source_block.block_hash_num_tokens == num_tokens
+        ):
+            # Full boundaries need no partial registration. Fresh full blocks
+            # retain their same-step protection in cache_blocks().
             return None
 
         partial_hash = self.block_pool.cache_partial_block(
@@ -2606,7 +2554,7 @@ class HiSparseResidentManager(_HiSparseAuxiliaryManager):
         blocks = self.get_residency_row(request_id)
         self.residency_changes.pop(request_id, None)
         super().pop_blocks_for_free(request_id)
-        return blocks
+        return trim_null_head(blocks)
 
     def adopt_resident_page(
         self, request_id: str, block_idx: int, block: KVCacheBlock

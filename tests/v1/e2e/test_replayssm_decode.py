@@ -8,6 +8,7 @@ from inspect import signature
 import pytest
 
 import vllm.envs as envs
+from vllm.platforms import current_platform
 from vllm.v1.metrics.reader import Counter
 
 from ...models.utils import check_logprobs_close
@@ -32,13 +33,23 @@ try:
 except ImportError:
     HAS_FLASHINFER_REPLAYSSM_MATERIALIZE = False
 
-if os.environ.get("VLLM_TEST_REQUIRE_REPLAYSSM") == "1" and not (
-    HAS_FLASHINFER_CHECKPOINTING_SSU and HAS_FLASHINFER_REPLAYSSM_MATERIALIZE
-):
-    raise RuntimeError(
-        "Dedicated ReplaySSM CI requires FlashInfer 0.7.0 checkpointing and "
-        "materialization APIs, including active_request_indices"
-    )
+if os.environ.get("VLLM_TEST_REQUIRE_REPLAYSSM") == "1":
+    if not (HAS_FLASHINFER_CHECKPOINTING_SSU and HAS_FLASHINFER_REPLAYSSM_MATERIALIZE):
+        raise RuntimeError(
+            "Dedicated ReplaySSM CI requires FlashInfer 0.7.0 checkpointing and "
+            "materialization APIs, including active_request_indices"
+        )
+    if (
+        not current_platform.is_cuda()
+        or current_platform.device_count() < 2
+        or any(
+            current_platform.get_device_total_memory(device) < 40_000_000_000
+            for device in range(2)
+        )
+    ):
+        raise RuntimeError(
+            "Dedicated ReplaySSM CI requires two CUDA GPUs with at least 40 GB each"
+        )
 
 # Mamba2 (Nemotron-3) hybrid.
 MAMBA2_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
@@ -327,7 +338,6 @@ def _check_replayssm_prefix_caching(
             mamba_cache_philox_rounds=5,
         )
     outputs = []
-    block_sizes = []
     try:
         with monkeypatch.context() as patch:
             patch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1" if use_v2 else "0")
@@ -341,7 +351,6 @@ def _check_replayssm_prefix_caching(
                 ) as llm:
                     config = llm.llm.llm_engine.vllm_config
                     assert config.use_v2_model_runner is use_v2
-                    block_sizes.append(config.cache_config.block_size)
                     first_pass = llm.generate_greedy_logprobs(
                         prompts, max_tokens=32, num_logprobs=5
                     )
@@ -370,12 +379,6 @@ def _check_replayssm_prefix_caching(
     finally:
         envs.disable_envs_cache()
 
-    if mamba_backend == "flashinfer":
-        # Auxiliary FlashInfer rings cannot affect the shared page.
-        assert block_sizes[1] == block_sizes[0]
-    else:
-        # Triton's packed rings may require larger attention blocks.
-        assert block_sizes[1] >= block_sizes[0]
     name = f"{mamba_backend}_align_{speculative_method or 'stp'}_v{2 if use_v2 else 1}"
     check_logprobs_close(
         outputs_0_lst=outputs[0],

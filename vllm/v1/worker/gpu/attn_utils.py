@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -17,7 +17,6 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -41,7 +40,7 @@ from vllm.v1.worker.utils import (
     AttentionGroup,
     add_kv_sharing_layers_to_kv_cache_groups,
     allocate_kv_cache,
-    allocate_replayssm_caches,
+    allocate_replayssm_ring_trackers,
     bind_kv_cache_to_layers,
     customize_attention_spec,
     map_kv_caches_to_kernel_blocks,
@@ -149,6 +148,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         if spec := attn_module.get_kv_cache_spec(vllm_config):
             if isinstance(spec, AttentionSpec):
                 spec = customize_attention_spec(attn_module.get_attn_backend(), spec)
+            if attn_module.is_draft_layer:
+                spec = replace(spec, is_draft=True)
             kv_cache_spec[layer_name] = spec
     if vllm_config.attention_config.hisparse_config is not None:
         kv_cache_spec = resolve_hisparse_specs(vllm_config, kv_cache_spec, attn_layers)
@@ -424,29 +425,22 @@ def init_kv_cache(
                 vllm_config.cache_config.get_resolved_kv_cache_layout(),
                 kernel_block_sizes,
             )
-        replayssm_caches = allocate_replayssm_caches(kv_cache_config, device)
         for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
             kv_caches[layer_name] = kv_caches[target]
-        # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per
-        # decoder layer, so a layer name carries two integers (layer + module index).
-        num_attn_module = (
-            2 if vllm_config.model_config.hf_config.model_type == "longcat_flash" else 1
-        )
-        bindable_caches = map_kv_caches_to_kernel_blocks(
-            {
-                name: cache
-                for name, cache in kv_caches.items()
-                if name in forward_context
-            },
-            attn_groups,
-        )
-        bind_kv_cache_to_layers(
-            bindable_caches,
+        replayssm_ring_trackers = allocate_replayssm_ring_trackers(
+            kv_caches,
             forward_context,
-            num_attn_module,
-            kv_cache_groups=kv_cache_config.kv_cache_groups,
-            replayssm_caches=replayssm_caches,
+            kv_cache_config.kv_cache_groups,
         )
+    bindable_caches = map_kv_caches_to_kernel_blocks(
+        {name: cache for name, cache in kv_caches.items() if name in forward_context},
+        attn_groups,
+    )
+    bind_kv_cache_to_layers(
+        bindable_caches,
+        forward_context,
+        replayssm_ring_trackers=replayssm_ring_trackers,
+    )
     return kv_caches
 
 
@@ -586,27 +580,3 @@ def build_attn_metadata(
                 attn_metadata[layer_name] = metadata
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
     return attn_metadata
-
-
-def compute_mm_prefix_ranges(
-    req_ids: list[str],
-    mm_features: dict[str, list[MultiModalFeatureSpec]],
-    sliding_window: int | None = None,
-) -> dict[int, list[tuple[int, int]]]:
-    """Compute PrefixLM bidirectional ranges for multimodal tokens.
-
-    Ranges exceeding sliding_window are skipped to prevent early tokens
-    from attending across the entire image span.
-    """
-    req_doc_ranges: dict[int, list[tuple[int, int]]] = {}
-    for req_idx, req_id in enumerate(req_ids):
-        image_doc_ranges = []
-        for mm_feature in mm_features.get(req_id, ()):
-            if mm_feature.modality not in ("image", "video"):
-                continue
-            for r in mm_feature.mm_position.extract_embeds_range():
-                if sliding_window is not None and (r[1] - r[0] + 1) > sliding_window:
-                    continue
-                image_doc_ranges.append(r)
-        req_doc_ranges[req_idx] = image_doc_ranges
-    return req_doc_ranges

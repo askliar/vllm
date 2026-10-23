@@ -210,10 +210,9 @@ def _make_mamba_spec(
     flashinfer = mamba_backend == MambaBackendEnum.FLASHINFER
     return MambaSpec(
         block_size=BLOCK_SIZE,
-        shapes=base_shapes if flashinfer else (*base_shapes, *replayssm_shapes),
-        dtypes=(torch.float32,) * (2 if flashinfer else 5),
-        replayssm_shapes=replayssm_shapes if flashinfer else (),
-        replayssm_dtypes=(torch.float32,) * 3 if flashinfer else (),
+        shapes=(*base_shapes, *replayssm_shapes),
+        dtypes=(torch.float32,) * 5,
+        use_flashinfer_replayssm=flashinfer,
         mamba_cache_mode=mamba_cache_mode,
     )
 
@@ -292,6 +291,8 @@ def test_resumed_request_differs_from_fresh():
     )
     meta = builder.build(0, common)
 
+    assert meta.write_pos_d is not None
+    assert meta.is_flush_d is not None
     assert meta.write_pos_d.tolist()[:2] == [5, 0]
     assert meta.is_flush_d.tolist()[:2] == [0, 0]
 

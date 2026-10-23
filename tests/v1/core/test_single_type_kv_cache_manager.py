@@ -241,37 +241,45 @@ def test_mamba_checkpoint_admission_matches_allocation(
     assert admission_estimate == allocation_estimate == allocated
 
 
-def test_replayssm_queues_live_copy_for_new_state_block():
+def test_replayssm_allocation_leaves_live_migration_to_worker():
     spec = MambaSpec(
-        block_size=4,
-        shapes=((2,), (3,)),
-        dtypes=(torch.float32, torch.float32),
-        replayssm_shapes=((4,), (5,), (6,)),
-        replayssm_dtypes=(torch.float32,) * 3,
+        block_size=16,
+        shapes=((2,), (3,), (4,), (5,), (6,)),
+        dtypes=(torch.float32,) * 5,
+        use_flashinfer_replayssm=True,
         mamba_cache_mode="align",
     )
-    block_pool = BlockPool(num_gpu_blocks=6, enable_caching=True, hash_block_size=4)
+    block_pool = BlockPool(num_gpu_blocks=6, enable_caching=True, hash_block_size=16)
     manager = MambaManager(
         spec,
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
-        scheduler_block_size=4,
+        scheduler_block_size=16,
     )
 
-    manager.allocate_new_blocks("request", num_tokens=3, num_tokens_main_model=3)
+    manager.allocate_new_blocks("request", num_tokens=14, num_tokens_main_model=14)
     assert manager.take_pending_cow_copies() == []
     source = manager.req_to_blocks["request"][-1]
 
-    manager.allocate_new_blocks("request", num_tokens=5, num_tokens_main_model=5)
+    # Optimistic async scheduling allocates column 1 while the worker can still
+    # use column 0 after rejected drafts. Allocation cannot decide state movement.
+    manager.allocate_new_blocks("request", num_tokens=18, num_tokens_main_model=18)
     destination = manager.req_to_blocks["request"][-1]
-    assert manager.take_pending_cow_copies() == [(source, destination)]
-    assert source.ref_cnt == 2
-    assert destination.ref_cnt == 2
-
-    block_pool.free_blocks([source, destination])
+    assert source is not destination
+    assert manager.take_pending_cow_copies() == []
     assert source.ref_cnt == 1
     assert destination.ref_cnt == 1
+    # The worker can move forward or backward without allocating another block.
+    for scheduled_end in (19, 15):
+        assert (
+            manager.allocate_new_blocks(
+                "request", num_tokens=scheduled_end, num_tokens_main_model=scheduled_end
+            )
+            == []
+        )
+        assert manager.take_pending_cow_copies() == []
+        assert manager.req_to_blocks["request"] == [source, destination]
 
 
 @pytest.mark.parametrize("num_speculative_blocks", [1, 2, 3])
@@ -1045,3 +1053,35 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+def test_pop_blocks_for_free_trims_null_head():
+    block_size = 2
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=10, enable_caching=True, hash_block_size=block_size
+    )
+    manager = get_sliding_window_manager(spec, block_pool)
+    null = block_pool.null_block
+    real = block_pool.get_new_blocks(2)
+    manager.req_to_blocks["swa"] = [null] * 3 + real
+    manager.req_to_blocks["dense"] = dense = block_pool.get_new_blocks(2)
+
+    assert manager.pop_blocks_for_free("swa") == real
+    assert manager.pop_blocks_for_free("dense") is dense  # no null head, no copy
+    assert "swa" not in manager.req_to_blocks
+    assert all(b.ref_cnt == 1 for b in real + dense)
+
+    # The null block is never pooled, so touch / free_blocks leave it alone.
+    null_ref_cnt = null.ref_cnt
+    num_free_blocks = block_pool.get_num_free_blocks()
+    block_pool.touch([null])
+    block_pool.free_blocks([null])
+    assert null.ref_cnt == null_ref_cnt
+    assert block_pool.get_num_free_blocks() == num_free_blocks

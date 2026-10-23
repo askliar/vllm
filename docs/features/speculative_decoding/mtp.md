@@ -67,6 +67,30 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 ```
 
+## Qwen3.5 GDN ReplaySSM
+
+GDN ReplaySSM stores recent recurrent inputs and reconstructs state from checkpoints.
+This optional FlashInfer backend is disabled by default. Enable it for Qwen3.5 with:
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 SGLANG_GDN_WY_STRIDED_QKV=1 \
+VLLM_GDN_DECODE_KERNEL=flashinfer_replayssm \
+vllm serve Qwen/Qwen3.5-0.8B \
+    --dtype bfloat16 --mamba-cache-dtype bfloat16 \
+    --mamba-ssm-cache-dtype bfloat16 --use-replayssm \
+    --replayssm-buffer-len 16 --no-enable-prefix-caching \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+```
+
+This backend supports one to seven speculative tokens. It requires BF16 state and
+128-element key and value heads. Pipeline parallelism, microbatching, and KV
+connectors are unsupported. Prefix caching requires `--mamba-cache-mode align`.
+
+FlashInfer must provide `gated_delta_rule_stp_ucache_flush` and
+`gated_delta_rule_mtp_ucache_flush`. Prefix caching also requires
+`gdn_prefix_materialize`. Check these APIs before use; a version number alone does
+not establish availability. This integration does not install missing kernels.
+
 ## Notes
 
 - MTP only works for model families that support MTP in vLLM.
@@ -74,3 +98,12 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
   is a good default to start with.
 - If your model does not support MTP, use another method such as EAGLE or draft
   model speculation.
+- When the MTP head shares the target's unquantized lm_head (most MTP models),
+  `"draft_lm_head_quantization": "fp8"` or `"nvfp4"` in `--speculative-config`
+  gives the drafter a quantized copy of that head (Model Runner V2). The target
+  still verifies with its own head, so outputs are unchanged; only the
+  acceptance length can move. It helps most on bandwidth-bound GPUs with a
+  large vocabulary. The copy costs about one byte (FP8) or 0.56 bytes (NVFP4)
+  per lm_head weight, e.g. 0.6 or 0.35 GiB for a 248k x 2560 head; it is
+  counted in the model weights, so with `--kv-cache-memory-bytes` leave room
+  for it.

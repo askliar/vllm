@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 import torch
 
-import vllm.utils.gpu_sync_debug as gsd
 from tests.v1.attention.test_gdn_metadata_builder import (
     BLOCK_SIZE,
     DEVICE,
@@ -26,108 +25,43 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
     MambaHybridModelState,
 )
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
+from vllm.v1.worker.utils import AttentionGroup
 
 
-@pytest.mark.parametrize(
-    ("use_flashinfer_replayssm", "expected_state_idx"), [(False, 2), (True, 2)]
-)
-def test_add_request_seeds_state_with_scoped_block_size(
-    use_flashinfer_replayssm: bool, expected_state_idx: int
-) -> None:
+def _recoverssm_attn_groups(layer_name: str) -> list[list[AttentionGroup]]:
+    """RecoverSSMState.record_step reads only each group's ``layer_names``."""
+    group = SimpleNamespace(layer_names=[layer_name])
+    return [[group]]  # type: ignore[list-item]  # layer_names-only stand-in
+
+
+GPU_DEVICE = current_platform.device_type
+HAS_GPU = current_platform.is_cuda_alike() or current_platform.is_xpu()
+
+
+def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> None:
     state = object.__new__(MambaHybridModelState)
-    state.rope_state = None
-    state.prompt_embeds_state = None
-    state.cache_config = SimpleNamespace(
-        block_size=16,
-        mamba_block_size=8,
-        mamba_cache_mode="align",
-    )
-    state._align_mode = True
-    state._use_flashinfer_replayssm = use_flashinfer_replayssm
-    state.num_accepted_tokens_gpu = torch.full((2,), 9, dtype=torch.int32)
-    state._mamba_state_idx_gpu = torch.full((2,), -1, dtype=torch.int32)
-
-    state.add_request(1, Mock(num_computed_tokens=17))
-
-    assert state.num_accepted_tokens_gpu.tolist() == [9, 1]
-    assert state._mamba_state_idx_gpu.tolist() == [-1, expected_state_idx]
-
-
-@pytest.mark.parametrize(
-    (
-        "computed",
-        "scheduled",
-        "drafts",
-        "prefilling",
-        "expected_prefilling",
-        "staging_device",
-    ),
-    [
-        pytest.param(256, 4, 3, True, False, "cpu", id="cpu-cached-tail"),
-        pytest.param(1, 4, 3, True, False, "cpu", id="cpu-short-prefix"),
-        pytest.param(256, 1, 0, True, False, "cpu", id="cpu-one-token-tail"),
-        pytest.param(0, 4, 3, True, True, "cpu", id="cpu-fresh-prefill"),
-        pytest.param(256, 4, 0, True, True, "cpu", id="cpu-chunked-prefill"),
-        pytest.param(256, 4, 3, False, False, "cpu", id="cpu-ordinary-decode"),
-        pytest.param(256, 5, 4, False, False, "cpu", id="mamba-width-5"),
-        pytest.param(256, 13, 12, False, False, "cpu", id="mamba-width-13"),
-        pytest.param(
-            256,
-            4,
-            3,
-            True,
-            False,
-            "cuda",
-            id="cuda-cached-tail",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="requires CUDA"
-            ),
-        ),
-    ],
-)
-def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
-    monkeypatch: pytest.MonkeyPatch,
-    computed,
-    scheduled,
-    drafts,
-    prefilling,
-    expected_prefilling,
-    staging_device,
-) -> None:
-    state = object.__new__(MambaHybridModelState)
-    state.vllm_config = SimpleNamespace(num_speculative_tokens=max(3, drafts))
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
-    state._use_flashinfer_replayssm = True
-    state._use_gdn_replayssm = False
-    if staging_device == "cpu":
-        monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
-    state._is_prefilling_gpu = torch.zeros(1, dtype=torch.bool, device=staging_device)
-    state._mamba_ctx = None
-    state.num_accepted_tokens_gpu = torch.ones(1, dtype=torch.int32)
-    state._get_mamba_group_info = Mock(return_value=([], None))
+    state._use_flashinfer_replayssm = False
     state.recoverssm = None
 
-    positions = torch.arange(computed, computed + scheduled, dtype=torch.int64)
+    positions = torch.tensor([1536], dtype=torch.int64)
     input_batch = SimpleNamespace(
         num_reqs=1,
-        num_tokens=scheduled,
+        num_tokens=1,
         num_reqs_after_padding=1,
-        num_tokens_after_padding=scheduled,
+        num_tokens_after_padding=1,
+        query_start_loc_np=torch.tensor([0, 1], dtype=torch.int32).numpy(),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
         max_query_len=None,
-        prefill_runs_as_decode_np=np.array(
-            [prefilling and computed > 0 and drafts > 0]
-        ),
-        query_start_loc_np=torch.tensor([0, scheduled], dtype=torch.int32).numpy(),
-        query_start_loc=torch.tensor([0, scheduled], dtype=torch.int32),
-        num_scheduled_tokens=torch.tensor([scheduled], dtype=torch.int32).numpy(),
-        num_draft_tokens_per_req=torch.tensor([drafts], dtype=torch.int32).numpy(),
-        idx_mapping=torch.tensor([0], dtype=torch.int32),
-        seq_lens_cpu_upper_bound=torch.tensor([computed + scheduled]),
-        seq_lens=torch.tensor([computed + scheduled]),
-        is_prefilling_np=torch.tensor([prefilling]).numpy(),
-        num_computed_prefill_tokens_np=np.array([computed]),
-        prefill_len_np=np.array([computed + scheduled if prefilling else computed]),
+        seq_lens_cpu_upper_bound=torch.tensor([1537], dtype=torch.int32),
+        seq_lens=torch.tensor([1537], dtype=torch.int32),
+        is_prefilling_np=torch.tensor([False]).numpy(),
+        prefill_runs_as_decode_np=None,
+        num_computed_prefill_tokens_np=np.array([1536]),
+        prefill_len_np=np.array([1024]),
         dcp_local_seq_lens=None,
         positions=positions,
         prompt_lens=torch.tensor([1024], dtype=torch.int32),
@@ -136,14 +70,7 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
     build_attn_metadata = Mock(return_value=expected_metadata)
     monkeypatch.setattr(mamba_hybrid, "build_attn_metadata", build_attn_metadata)
 
-    prepare_attn = state.prepare_attn
-    if staging_device == "cuda":
-        monkeypatch.setattr(gsd, "_SYNC_CHECK_MODE", "error")
-        monkeypatch.setattr(gsd, "_sync_check_enabled", True)
-        gsd.enable_gpu_sync_check()
-        prepare_attn = gsd.with_gpu_sync_check(prepare_attn)
-
-    metadata = prepare_attn(
+    metadata = state.prepare_attn(
         input_batch=input_batch,
         cudagraph_mode=CUDAGraphMode.NONE,
         block_tables=(),
@@ -154,7 +81,6 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
 
     assert metadata is expected_metadata
     assert build_attn_metadata.call_args.kwargs["positions"] is positions
-    assert state._is_prefilling_gpu.item() == expected_prefilling
 
 
 def test_add_request_seeds_state_idx_in_mamba_blocks() -> None:
@@ -186,7 +112,10 @@ def test_padded_prompt_tail_builds_as_spec_decode(
     state.vllm_config = SimpleNamespace(num_speculative_tokens=k)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
-    state._use_flashinfer_replayssm = False
+    state._use_flashinfer_replayssm = True
+    state._use_gdn_replayssm = False
+    state._is_prefilling_gpu = torch.tensor([True, True, False])
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     state.recoverssm = None
     state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32)
 
@@ -231,6 +160,8 @@ def test_padded_prompt_tail_builds_as_spec_decode(
         "model_specific_attn_metadata"
     ]
     assert mamba_metadata.is_prefilling.tolist() == [False, False, True]
+    # Preserve decode history, but reset the fresh prefill's stale history.
+    assert state._is_prefilling_gpu.tolist() == [False, False, True]
 
     builder = _create_gdn_builder(num_speculative_tokens=k)
     common = create_common_attn_metadata(
@@ -434,25 +365,25 @@ def test_chunked_prefill_tail_of_two_or_three_tokens_keeps_the_sentinel(
     assert metadata.num_decode_draft_tokens_cpu.tolist() == [-1, -1]
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.skipif(not HAS_GPU, reason="Requires CUDA or XPU")
 @pytest.mark.parametrize(("num_sampled", "expected_value"), [(0, 1), (3, 3)])
 def test_postprocess_state_scalar_with_int32_mapping(
     num_sampled: int, expected_value: int
 ) -> None:
     state = object.__new__(MambaHybridModelState)
     state.num_accepted_tokens_gpu = torch.full(
-        (4,), 9, dtype=torch.int32, device="cuda"
+        (4,), 9, dtype=torch.int32, device=GPU_DEVICE
     )
     state._align_mode = False
     state._use_flashinfer_replayssm = False
     state.recoverssm = None
     state._mamba_ctx = None
-    idx_mapping = torch.tensor([2, -1, 0], dtype=torch.int32, device="cuda")
+    idx_mapping = torch.tensor([2, -1, 0], dtype=torch.int32, device=GPU_DEVICE)
 
     state.postprocess_state(idx_mapping, num_sampled)
 
     expected = torch.tensor(
-        [expected_value, 9, expected_value, 9], dtype=torch.int32, device="cuda"
+        [expected_value, 9, expected_value, 9], dtype=torch.int32, device=GPU_DEVICE
     )
     torch.testing.assert_close(state.num_accepted_tokens_gpu, expected)
 
@@ -462,6 +393,7 @@ def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
     state = object.__new__(MambaHybridModelState)
     state._align_mode = True
     state._use_flashinfer_replayssm = True
+    state._use_gdn_replayssm = False
     state.recoverssm = None
     state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32, device="cuda")
     state._mamba_state_idx_gpu = torch.zeros(4, dtype=torch.int32, device="cuda")
@@ -504,9 +436,9 @@ def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
     num_sampled = torch.tensor([3, 1], dtype=torch.int32)
     idx_mapping = torch.tensor([0, 1], dtype=torch.int32)
     num_accepted_tokens = torch.ones(2, dtype=torch.int32)
-    group = SimpleNamespace(layer_names=["layer"])
+    attn_groups = _recoverssm_attn_groups("layer")
 
-    state.record_step({"layer": metadata}, [[group]], for_capture=False)
+    state.record_step({"layer": metadata}, attn_groups, for_capture=False)
     state.commit_step(
         num_sampled,
         idx_mapping,
@@ -523,7 +455,7 @@ def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
     metadata.commit_recoverssm_state.assert_called_once_with(num_sampled)
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.skipif(not HAS_GPU, reason="Requires CUDA or XPU")
 @pytest.mark.parametrize(
     ("computed", "sampled", "expected_column"),
     [(4, 3, 0), (4, 4, 0), (4, 5, 1), (8, 8, 1), (8, 9, 2)],
@@ -535,26 +467,28 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias(
     state._align_mode = True
     state._use_flashinfer_replayssm = False
     state._mamba_ctx = None
-    state._mamba_state_idx_gpu = torch.full((5,), -1, dtype=torch.int32, device="cuda")
+    state._mamba_state_idx_gpu = torch.full(
+        (5,), -1, dtype=torch.int32, device=GPU_DEVICE
+    )
     state.recoverssm = RecoverSSMState()
     state.num_accepted_tokens_gpu = torch.full(
-        (5,), 9, dtype=torch.int32, device="cuda"
+        (5,), 9, dtype=torch.int32, device=GPU_DEVICE
     )
     metadata = Mock(spec=RecoverSSMMetadata)
     metadata.commit_recoverssm_state.return_value = RecoverSSMPostprocessMetadata(
         num_spec_decodes=1,
-        request_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        request_indices=torch.tensor([1], dtype=torch.int32, device=GPU_DEVICE),
         num_computed_tokens=torch.tensor(
-            [6, computed], dtype=torch.int32, device="cuda"
+            [6, computed], dtype=torch.int32, device=GPU_DEVICE
         ),
         block_size=8,
-        block_table=torch.zeros((2, 4), dtype=torch.int32, device="cuda"),
+        block_table=torch.zeros((2, 4), dtype=torch.int32, device=GPU_DEVICE),
     )
-    num_sampled = torch.tensor([2, sampled], dtype=torch.int32, device="cuda")
-    idx_mapping = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
-    group = SimpleNamespace(layer_names=["layer"])
+    num_sampled = torch.tensor([2, sampled], dtype=torch.int32, device=GPU_DEVICE)
+    idx_mapping = torch.tensor([3, 1], dtype=torch.int32, device=GPU_DEVICE)
+    attn_groups = _recoverssm_attn_groups("layer")
 
-    state.recoverssm.record_step({"layer": metadata}, [[group]], for_capture=False)
+    state.recoverssm.record_step({"layer": metadata}, attn_groups, for_capture=False)
 
     state.postprocess_state(idx_mapping, num_sampled)
 

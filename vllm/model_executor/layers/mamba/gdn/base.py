@@ -65,9 +65,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 torch.arange(packed_width, dtype=torch.int32),
                 persistent=False,
             )
-        self.replayssm_cache = (
-            tuple(torch.tensor([]) for _ in range(3)) if self.use_replayssm else ()
-        )
         self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
         self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
 
@@ -76,15 +73,19 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         return MambaAttentionBackendEnum.GDN_ATTN
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            self.model_config.dtype,
-            self.cache_config.mamba_cache_dtype,
-            self.cache_config.mamba_ssm_cache_dtype,
+        dtypes: tuple[torch.dtype, ...] = (
+            MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                self.model_config.dtype,
+                self.cache_config.mamba_cache_dtype,
+                self.cache_config.mamba_ssm_cache_dtype,
+            )
         )
 
-    def get_replayssm_state_dtype(self) -> tuple[torch.dtype, ...]:
-        if not self.use_replayssm:
-            return ()
-        return MambaStateDtypeCalculator.gated_delta_net_replayssm_ring_dtypes(
-            self.model_config.dtype
-        )
+        if self.use_replayssm:
+            dtypes = (
+                *dtypes,
+                *MambaStateDtypeCalculator.gated_delta_net_replayssm_ring_dtypes(
+                    self.model_config.dtype
+                ),
+            )
+        return dtypes

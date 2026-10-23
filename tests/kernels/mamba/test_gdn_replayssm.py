@@ -112,10 +112,23 @@ def test_gdn_replayssm_output_and_accepted_state(
     def random_tensor(*shape):
         return torch.randn(*shape, generator=generator, device=device).to(dtype)
 
-    checkpoint = random_tensor(2, 2, 128, 128) * 0.03
-    u_cache = torch.zeros(2, 2, ring_slots, 128, dtype=dtype, device=device)
-    k_cache = torch.zeros(2, 1, ring_slots, 128, dtype=dtype, device=device)
-    g_cache = torch.zeros(2, 2, ring_slots, dtype=torch.float32, device=device)
+    # Use one page stride for every state, as MambaBase.bind_kv_cache does.
+    shapes = [
+        (2, 128, 128),
+        (2, ring_slots, 128),
+        (1, ring_slots, 128),
+        (2, ring_slots),
+    ]
+    dtypes = [dtype, dtype, dtype, torch.float32]
+    sizes = [math.prod(shape) * dt.itemsize for shape, dt in zip(shapes, dtypes)]
+    pages = torch.zeros(2, sum(sizes) + 16, dtype=torch.uint8, device=device)
+    states = []
+    offset = 0
+    for shape, dt, size in zip(shapes, dtypes, sizes):
+        states.append(pages[:, offset : offset + size].view(dt).view(2, *shape))
+        offset += size
+    checkpoint, u_cache, k_cache, g_cache = states
+    checkpoint.copy_(random_tensor(2, 2, 128, 128) * 0.03)
     ring_start = torch.zeros(2, dtype=torch.int32, device=device)
     committed = torch.zeros_like(ring_start)
     A_log = torch.full((2,), -3.0, device=device)
