@@ -216,6 +216,10 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.replayssm_utils import (
+    get_replayssm_block_copy_tensors,
+    initialize_replayssm_ring_trackers,
+)
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -233,12 +237,10 @@ from .utils import (
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
     allocate_kv_cache,
-    allocate_replayssm_ring_trackers,
     bind_kv_cache,
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     customize_attention_spec,
-    get_replayssm_block_copy_tensors,
     map_kv_caches_to_kernel_blocks,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
@@ -969,17 +971,13 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
-        self._replayssm_prev_req_indices: dict[str, int] = {}
+        self._replayssm_sync_req_indices: dict[str, int] = {}
         self._replayssm_paused_accepted_tokens: dict[str, torch.Tensor] = {}
         self._replayssm_accepted_tokens: torch.Tensor | None = None
-        self._replayssm_acceptance_indices: CpuGpuBuffer | None = None
         if self._use_flashinfer_replayssm and self.num_spec_tokens:
             # The last entry is the neutral count for new/padded requests.
             self._replayssm_accepted_tokens = torch.ones(
                 self.max_num_reqs + 1, dtype=torch.int32, device=self.device
-            )
-            self._replayssm_acceptance_indices = self._make_buffer(
-                self.max_num_reqs, dtype=torch.int64
             )
         self._needs_prefix_state_migration = (
             self.cache_config.mamba_cache_mode == "align"
@@ -1227,7 +1225,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
             if self._use_flashinfer_replayssm:
-                self._replayssm_prev_req_indices.pop(req_id, None)
+                self._replayssm_sync_req_indices.pop(req_id, None)
                 self._replayssm_paused_accepted_tokens.pop(req_id, None)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
@@ -1256,7 +1254,7 @@ class GPUModelRunner(
             # Preemption reconstructs state from a prefix; its old live offset
             # cannot be reused. A scheduling pause instead preserves that state.
             for req_id in resumed_req_ids:
-                self._replayssm_prev_req_indices.pop(req_id, None)
+                self._replayssm_sync_req_indices.pop(req_id, None)
                 self._replayssm_paused_accepted_tokens.pop(req_id, None)
         # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
         # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
@@ -1270,9 +1268,9 @@ class GPUModelRunner(
         # have low request overlap (e.g., alternating between two distinct
         # sets of requests), this optimization becomes very inefficient.
         for req_id in unscheduled_req_ids:
-            self.input_batch.remove_request(req_id)
-            if self._use_flashinfer_replayssm:
+            if self._use_flashinfer_replayssm and req_id not in resumed_req_ids:
                 self._pause_replayssm_accepted_tokens(req_id)
+            self.input_batch.remove_request(req_id)
 
         is_ngram_gpu = (
             self.speculative_config is not None
@@ -1637,9 +1635,11 @@ class GPUModelRunner(
                     self._replayssm_accepted_tokens[:num_reqs].copy_(
                         self.num_accepted_tokens.gpu[:num_reqs]
                     )
-                    self._replayssm_prev_req_indices = dict(
-                        self.input_batch.req_id_to_index
-                    )
+                    if not self.use_async_scheduling:
+                        # Keep the shared map unset for synchronous proposers.
+                        self._replayssm_sync_req_indices = dict(
+                            self.input_batch.req_id_to_index
+                        )
             else:
                 assert self.num_accepted_tokens_event is not None
                 self.num_accepted_tokens_event.record()
@@ -1651,7 +1651,16 @@ class GPUModelRunner(
             self.num_accepted_tokens_event.record()
 
     def _pause_replayssm_accepted_tokens(self, req_id: str) -> None:
-        prev_index = self._replayssm_prev_req_indices.pop(req_id, None)
+        if not self.num_spec_tokens:
+            return
+        prev_indices = (
+            self.input_batch.prev_req_id_to_index
+            if self.use_async_scheduling
+            else self._replayssm_sync_req_indices
+        )
+        prev_index = (
+            prev_indices.pop(req_id, None) if prev_indices is not None else None
+        )
         if prev_index is not None:
             assert self._replayssm_accepted_tokens is not None
             # Keep just this scalar before the next batch reuses its snapshot row.
@@ -1661,19 +1670,11 @@ class GPUModelRunner(
 
     def _restore_replayssm_accepted_tokens(self) -> None:
         """Gather normalized convolution offsets without staging counts on CPU."""
-        indices = self._replayssm_acceptance_indices
-        assert indices is not None
         assert self._replayssm_accepted_tokens is not None
-        indices.np.fill(self.max_num_reqs)
-        for i, req_id in enumerate(self.input_batch.req_ids):
-            indices.np[i] = self._replayssm_prev_req_indices.get(
-                req_id, self.max_num_reqs
-            )
-        indices.copy_to_gpu()
-        torch.index_select(
+        # take() maps -1 for new/padded rows to the neutral final entry.
+        torch.take(
             self._replayssm_accepted_tokens,
-            0,
-            indices.gpu,
+            self.prev_positions.gpu,
             out=self.num_accepted_tokens.gpu,
         )
         if self._replayssm_paused_accepted_tokens:
@@ -1819,6 +1820,10 @@ class GPUModelRunner(
         """
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
         prev_positions = self.prev_positions.np[:num_reqs]
+        if self._use_flashinfer_replayssm and self.num_spec_tokens:
+            self.prev_positions.np[num_reqs:].fill(-1)
+            if not self.use_async_scheduling:
+                prev_req_id_to_index = self._replayssm_sync_req_indices
 
         if not prev_req_id_to_index:
             prev_positions.fill(-1)
@@ -2196,12 +2201,15 @@ class GPUModelRunner(
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
+        if self._use_flashinfer_replayssm and self.num_spec_tokens:
+            self.prev_positions.copy_to_gpu()
         if (
             self.use_async_spec_decode
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
         ):
-            self.prev_positions.copy_to_gpu(num_reqs)
+            if not self._use_flashinfer_replayssm:
+                self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
                 device=self.device, non_blocking=True
@@ -6320,7 +6328,7 @@ class GPUModelRunner(
         torch.accelerator.synchronize()
         self._mamba_bufs = None
         self._mamba_state_copy_funcs = None
-        self._replayssm_prev_req_indices.clear()
+        self._replayssm_sync_req_indices.clear()
         self._replayssm_paused_accepted_tokens.clear()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
@@ -7059,11 +7067,6 @@ class GPUModelRunner(
                 logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
                 kv_caches[layer_name] = kv_caches[target_layer_name]
 
-            replayssm_ring_trackers = allocate_replayssm_ring_trackers(
-                kv_caches,
-                self.compilation_config.static_forward_context,
-                kv_cache_config.kv_cache_groups,
-            )
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
         )
@@ -7075,13 +7078,7 @@ class GPUModelRunner(
             self.compilation_config.static_forward_context,
             self.kv_caches,
             num_attn_module,
-            replayssm_ring_trackers=replayssm_ring_trackers,
             layer_kv_caches=map_kv_caches_to_kernel_blocks(kv_caches, attn_groups),
-        )
-        # Validate and cache optional ReplaySSM-owned state once cache binding
-        # has populated every layer. Block copies are a per-step hot path.
-        self.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
-            self.compilation_config.static_forward_context
         )
         return kv_caches
 
@@ -7164,6 +7161,12 @@ class GPUModelRunner(
                 kernel_block_sizes,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
+        initialize_replayssm_ring_trackers(
+            kv_cache_config, self.compilation_config.static_forward_context
+        )
+        self.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
+            self.compilation_config.static_forward_context
+        )
 
         if (
             self.speculative_config

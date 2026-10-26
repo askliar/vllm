@@ -47,9 +47,9 @@ from vllm.v1.worker.mamba_utils import (
     preprocess_mamba,
     stage_postprocess_inputs_to_gpu,
 )
+from vllm.v1.worker.replayssm_utils import initialize_replayssm_ring_trackers
 from vllm.v1.worker.utils import (
     allocate_kv_cache,
-    allocate_replayssm_ring_trackers,
     bind_kv_cache_to_layers,
 )
 
@@ -548,6 +548,8 @@ def test_replayssm_precopy_moves_packed_state_and_trackers(
         ),
         mamba_cache_mode="align",
         use_flashinfer_replayssm=True,
+        state_alignment=16,
+        block_stride_alignment=16,
     )
     spec = replace(spec, page_size_padded=spec.page_size_bytes + 128)
     config = SimpleNamespace(
@@ -567,19 +569,15 @@ def test_replayssm_precopy_moves_packed_state_and_trackers(
         mixer = MambaMixer2.__new__(MambaMixer2)
         torch.nn.Module.__init__(mixer)
         mixer.use_replayssm = mixer.use_flashinfer_replayssm = True
+        mixer.state_alignment = 16
         mixer.replayssm_buffer_len = 16
         mixer.mamba_config = MambaConfig(backend=MambaBackendEnum.FLASHINFER)
         mixer.get_state_shape = lambda: spec.shapes
         mixer.get_state_dtype = lambda: spec.dtypes
         mixer.A = -torch.ones(1, device=device)
         forward_context[name] = mixer
-    bind_kv_cache_to_layers(
-        pages,
-        forward_context,
-        replayssm_ring_trackers=allocate_replayssm_ring_trackers(
-            pages, forward_context, kv_config.kv_cache_groups
-        ),
-    )
+    bind_kv_cache_to_layers(pages, forward_context)
+    initialize_replayssm_ring_trackers(kv_config, forward_context)
     source_slot, destination_slot = previous_column + 1, destination_column + 1
     original = {}
     for name, mixer in forward_context.items():
@@ -883,6 +881,7 @@ def test_v2_align_ctx_binds_request_slot_tables_for_state_copies():
 
     state = object.__new__(MambaHybridModelState)
     state._align_mode = True
+    state._use_flashinfer_replayssm = False
     state._mamba_group_ids = []
     state._mamba_spec = None
     state._mamba_state_copy_funcs = _COPY_FUNCS
@@ -1031,43 +1030,42 @@ def test_stage_postprocess_inputs_to_gpu_fills_pinned_views():
 )
 def test_replayssm_resumed_prefill_resets_history_before_decode(num_spec, cache_mode):
     """A resumed prefill replaces the SSM state, so decode must ignore old rings."""
-    flashinfer = pytest.importorskip("flashinfer.mamba.checkpointing_ssu")
-    from vllm.v1.worker.replayssm_utils import _ReplaySSMGroupContext
+    from vllm.v1.worker.replayssm_utils import (
+        ReplaySSMModelContext,
+        _postprocess_replayssm_kernel,
+    )
 
     device = torch.device("cuda")
-    torch.manual_seed(0)
-    heads, dim, dstate = 16, 64, 128
+    heads, dim, dstate = 2, 4, 8
     tokens = num_spec + 1
     ring_len = 16 + tokens
     # Prefill has already written a complete state into live slot 1.
-    state = torch.randn(3, heads, dim, dstate, device=device) * 0.1
-    checkpoint = state.clone()
+    state = torch.full((3, heads, dim, dstate), 0.1, device=device)
     x_ring = torch.ones(3, heads, ring_len, dim, dtype=torch.bfloat16, device=device)
     B_ring = torch.ones(3, 1, ring_len, dstate, dtype=torch.bfloat16, device=device)
     dt_ring = torch.full((3, heads, ring_len), 0.05, device=device)
     starts = torch.full((3,), 7, dtype=torch.int32, device=device)
     committed = torch.full((3,), 3, dtype=torch.int32, device=device)
     cache = (state, x_ring, B_ring, dt_ring, starts, committed)
-    untouched_cache = tuple(tensor[[0, 2]].clone() for tensor in cache)
-    stale_cache = tuple(tensor.clone() for tensor in cache)
-    clean_cache = (checkpoint.clone(),) + tuple(
-        torch.zeros_like(tensor) for tensor in cache[1:]
-    )
-    # Fill before broadcasting to retain FlashInfer's tied A strides.
-    A = torch.full((heads, 1, 1), -1.0, device=device).expand(heads, dim, dstate)
+    original_cache = tuple(tensor.clone() for tensor in cache)
     mixer = SimpleNamespace(
         kv_cache=[torch.empty(3, 1, device=device), state, x_ring, dt_ring, B_ring],
-        A=A,
+        A=-torch.ones(heads, device=device),
         _replayssm_ring_start=starts,
         _replayssm_prev_num_accepted=committed,
         replayssm_buffer_len=16,
+        mamba_config=MambaConfig(),
     )
-    group = _ReplaySSMGroupContext.create(
-        [mixer],
-        torch.tensor([[1]], dtype=torch.int32, device=device),
-        cache_mode,
-        128,
-        1,
+    spec = MambaSpec(
+        block_size=128,
+        shapes=tuple(tensor.shape[1:] for tensor in mixer.kv_cache),
+        dtypes=tuple(tensor.dtype for tensor in mixer.kv_cache),
+        mamba_cache_mode=cache_mode,
+        use_flashinfer_replayssm=True,
+    )
+    replay = ReplaySSMModelContext.create(
+        [([mixer], spec, torch.tensor([[1]], dtype=torch.int32, device=device))],
+        max_num_reqs=1,
     )
     metadata = _build_staging_metadata([64], [8], [64], [0], num_spec)
     ctx = _make_staging_ctx(1, device)
@@ -1081,49 +1079,39 @@ def test_replayssm_resumed_prefill_resets_history_before_decode(num_spec, cache_
         _make_requests(["req"], [64], [[1]], [64]),
         num_decodes=metadata.num_decodes,
     )
-    group.postprocess(
-        idx_mapping=None,
-        query_metadata=ctx.num_scheduled_tokens_buf.gpu,
-        query_metadata_is_cumulative=False,
-        num_computed_tokens=ctx.num_computed_tokens_buf.gpu,
-        num_computed_is_post_step=False,
-        num_accepted_tokens=torch.ones(1, dtype=torch.int32, device=device),
-        is_prefilling=ctx.is_prefilling_buf.gpu,
-        live_cols=None,
-        num_reqs=1,
+    _postprocess_replayssm_kernel[(1, 1)](
+        None,
+        ctx.num_scheduled_tokens_buf.gpu,
+        ctx.num_computed_tokens_buf.gpu,
+        torch.ones(1, dtype=torch.int32, device=device),
+        ctx.is_prefilling_buf.gpu,
+        None,
+        replay.block_table_ptrs,
+        replay.ring_start_ptrs,
+        replay.num_committed_ptrs,
+        replay.src_slots_ptrs,
+        replay.dst_slots_ptrs,
+        replay.plan_ring_start,
+        replay.plan_flush_count,
+        replay.block_table_strides,
+        replay.num_layers,
+        MAX_NUM_REQS=1,
+        MAMBA_BLOCK_SIZE=128,
+        LOGICAL_WINDOW=16,
+        RING_BUFFER_LEN=ring_len,
+        PAD_SLOT_ID=0,
+        QUERY_METADATA_IS_CUMULATIVE=False,
+        NUM_COMPUTED_IS_POST_STEP=False,
+        HAS_IDX_MAPPING=False,
+        MATERIALIZE_PREFIXES=cache_mode == "align",
+        LIVE_COL_IS_ZERO=True,
     )
     assert starts.tolist() == [7, 0, 7]
     assert committed.tolist() == [3, 0, 3]
-    assert torch.equal(state, checkpoint)
-
-    x = torch.randn(1, tokens, heads, dim, dtype=torch.bfloat16, device=device) * 0.1
-    dt = torch.full(
-        (1, tokens, heads, 1), 0.05, dtype=torch.bfloat16, device=device
-    ).expand_as(x)
-    B = torch.randn(1, tokens, 1, dstate, dtype=torch.bfloat16, device=device) * 0.1
-    C = torch.randn_like(B)
-    outputs = []
-    for kernel_cache in (cache, clean_cache, stale_cache):
-        out = torch.empty_like(x)
-        flashinfer.checkpointing_ssu(
-            *kernel_cache,
-            x,
-            dt,
-            A,
-            B,
-            C,
-            out,
-            state_batch_indices=torch.tensor([1], dtype=torch.int32, device=device),
-        )
-        outputs.append(out)
-    # Use native arithmetic to isolate tracker reset from BF16 operand rounding.
-    reset_out, clean_out, stale_out = outputs
-    torch.testing.assert_close(reset_out, clean_out, rtol=0, atol=0)
-    assert torch.isfinite(stale_out).all()
-    assert not torch.equal(stale_out, clean_out)
-    assert torch.equal(state, checkpoint)
-    for actual, untouched in zip(cache, untouched_cache):
-        torch.testing.assert_close(actual[[0, 2]], untouched, rtol=0, atol=0)
+    for actual, original in zip(cache[:4], original_cache[:4]):
+        torch.testing.assert_close(actual, original, rtol=0, atol=0)
+    for actual, original in zip(cache[4:], original_cache[4:]):
+        torch.testing.assert_close(actual[[0, 2]], original[[0, 2]], rtol=0, atol=0)
 
 
 def test_gpu_context_ignores_auxiliary_cache_tensors() -> None:

@@ -48,6 +48,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         )
         self.use_replayssm = vllm_config.is_gdn_replayssm_enabled()
         self.use_flashinfer_replayssm = self.use_replayssm
+        self.state_alignment = 16 if self.use_flashinfer_replayssm else 1
         self.replayssm_buffer_len = (
             self.cache_config.replayssm_buffer_len if self.use_replayssm else None
         )

@@ -109,16 +109,25 @@ def test_dspark_adaptive_verification_separates_graph_cache():
 
 
 @pytest.mark.parametrize(
-    ("mode", "input_dtype", "use_ubatching", "error"),
+    ("mode", "input_dtype", "use_ubatching", "pp_size", "error"),
     [
-        ("align", torch.bfloat16, False, None),
-        ("align", torch.float16, False, "bfloat16 model inputs"),
-        ("none", torch.float16, False, None),
-        ("align", torch.bfloat16, True, "ReplaySSM does not support microbatching"),
+        ("align", torch.bfloat16, False, 1, None),
+        ("align", torch.float16, False, 1, "bfloat16 model inputs"),
+        ("none", torch.float16, False, 1, None),
+        ("align", torch.bfloat16, True, 1, "ReplaySSM does not support microbatching"),
+        ("align", torch.bfloat16, False, 2, "pipeline_parallel_size=1"),
     ],
-    ids=["align-bf16", "align-fp16-rejected", "none-fp16", "microbatch-rejected"],
+    ids=[
+        "align-bf16",
+        "align-fp16-rejected",
+        "none-fp16",
+        "microbatch-rejected",
+        "pp-rejected",
+    ],
 )
-def test_flashinfer_replayssm_validates_config(mode, input_dtype, use_ubatching, error):
+def test_flashinfer_replayssm_validates_config(
+    mode, input_dtype, use_ubatching, pp_size, error
+):
     config = SimpleNamespace(
         cache_config=SimpleNamespace(
             use_replayssm=True,
@@ -134,7 +143,7 @@ def test_flashinfer_replayssm_validates_config(mode, input_dtype, use_ubatching,
         ),
         mamba_config=SimpleNamespace(backend=MambaBackendEnum.FLASHINFER),
         parallel_config=SimpleNamespace(
-            pipeline_parallel_size=1, use_ubatching=use_ubatching
+            pipeline_parallel_size=pp_size, use_ubatching=use_ubatching
         ),
         kv_transfer_config=None,
         use_v2_model_runner=True,
@@ -342,6 +351,7 @@ def test_lora_rejected_at_config_time_for_unsupported_model(supported):
     """Models without SupportsLoRA must fail during config validation with a
     clear message, not with a bare assert inside the model constructor."""
     model_config = SimpleNamespace(
+        runner_type="generate",
         is_lora_supported=supported,
         architecture="Zamba2ForCausalLM",
         architectures=["Zamba2ForCausalLM"],
@@ -356,6 +366,22 @@ def test_lora_rejected_at_config_time_for_unsupported_model(supported):
             ValueError, match="LoRA is not supported for Zamba2ForCausalLM"
         ):
             lora_config.verify_with_model_config(model_config)
+
+
+def test_lora_allowed_for_drafter_without_lora_support():
+    """Speculative decoding re-validates the config with the draft model's
+    config, and drafters don't run LoRA adapters."""
+    draft_config = SimpleNamespace(
+        runner_type="draft",
+        is_lora_supported=False,
+        architecture="DeepSeekMTPModel",
+        architectures=["DeepSeekMTPModel"],
+        model="deepseek-ai/DeepSeek-V3",
+        dtype=torch.bfloat16,
+    )
+    lora_config = LoRAConfig()
+    lora_config.verify_with_model_config(draft_config)
+    assert lora_config.lora_dtype == torch.bfloat16
 
 
 def test_mamba_cache_mode_all_is_rejected():
@@ -4023,6 +4049,7 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     mock_draft.model = local_cache
     mock_draft.hf_config.model_type = "deepseek_mtp"
     mock_draft.hf_config.n_predict = None
+    mock_draft.hf_config.max_position_embeddings = 4096
     mock_draft.max_model_len = 4096
     mock_model_config_cls.return_value = mock_draft
 

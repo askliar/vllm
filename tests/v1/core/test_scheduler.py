@@ -63,6 +63,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import (
@@ -79,6 +80,95 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize(
+    ("async_scheduling", "outcome"),
+    [
+        (False, outcome)
+        for outcome in ("accepted", "rejected", "finished", "preempted", "stale")
+    ]
+    + [(True, "accepted")],
+)
+def test_mamba_decode_checkpoint_publication(async_scheduling: bool, outcome: str):
+    """Publish accepted checkpoints before retirement; never publish rejected work."""
+    block_size = 16
+    scheduler = create_scheduler(
+        model="Qwen/Qwen3-0.6B",
+        enable_prefix_caching=True,
+        async_scheduling=async_scheduling,
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+        block_size=block_size,
+        kv_cache_spec=MambaSpec(
+            block_size=block_size,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+            num_speculative_blocks=1,
+        ),
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=block_size - 2,
+        block_size=block_size,
+        max_tokens=5 if outcome == "finished" else 32,
+    )
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    scheduler.update_from_output(
+        prefill,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[0]],
+        ),
+    )
+    scheduler.update_draft_token_ids(DraftTokenIds([request.request_id], [[1, 2, 3]]))
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens[request.request_id] == 4
+    assert len(decode.scheduled_spec_decode_tokens[request.request_id]) == 3
+    if outcome in ("preempted", "stale"):
+        assert scheduler.reset_prefix_cache(reset_running_requests=True)
+        assert request.status == RequestStatus.PREEMPTED
+        assert request.num_stale_output_tokens == 4
+        if outcome == "stale":
+            # Resume before the old decode completes; its output must stay uncached.
+            assert scheduler.schedule().num_scheduled_tokens[request.request_id] > 0
+            assert request.status == RequestStatus.RUNNING
+    accepted = 1 if outcome == "rejected" else 4
+    scheduler.update_from_output(
+        decode,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[list(range(1, accepted + 1))],
+        ),
+    )
+    if outcome == "accepted":
+        # The next allocation retires the checkpoint from the request's table.
+        scheduler.update_draft_token_ids(
+            DraftTokenIds([request.request_id], [[5, 6, 7]])
+        )
+        assert scheduler.schedule().num_scheduled_tokens[request.request_id] == 4
+    elif outcome == "finished":
+        assert request.is_finished()
+    elif outcome in ("preempted", "stale"):
+        if outcome == "preempted":
+            assert request.num_computed_tokens == 0
+        assert request.num_output_tokens == 1
+        assert request.num_stale_output_tokens == 0
+    else:
+        assert request.num_computed_tokens == block_size - 1
+    probe = Request(
+        request_id="probe",
+        prompt_token_ids=list(request.all_token_ids),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(block_size, sha256),
+    )
+    _, cached_tokens, _ = scheduler.kv_cache_manager.get_computed_blocks(probe)
+    assert cached_tokens == (block_size if outcome in ("accepted", "finished") else 0)
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
@@ -157,7 +247,7 @@ def test_routed_experts_prompt_start_at_prompt_end(max_tokens):
     (request,) = create_requests(num_requests=1, max_tokens=max_tokens)
     request.sampling_params.routed_experts_prompt_start = request.num_prompt_tokens
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
-        scheduler.hash_block_size
+        scheduler.kv_cache_manager
     )
     scheduler.add_request(request)
     scheduler_output = scheduler.schedule()
@@ -191,7 +281,7 @@ def test_routed_experts_prompt_start_at_prompt_end(max_tokens):
 def test_routed_experts_hashes_follow_scheduled_tokens():
     scheduler = create_scheduler(enable_prefix_caching=True, max_num_batched_tokens=64)
     scheduler.aux_output_connector = AuxOutputSchedulerConnector(
-        scheduler.hash_block_size
+        scheduler.kv_cache_manager
     )
     (request,) = create_requests(
         num_requests=1, num_tokens=160, max_tokens=20, ignore_eos=True
@@ -229,6 +319,86 @@ def test_routed_experts_hashes_follow_scheduled_tokens():
 
     assert num_sent_per_step == [4, 8, 10] + [10] * 15 + [11] * 4
     assert sent == request.block_hashes[:11]
+
+
+@pytest.mark.parametrize(
+    "external_tokens,max_cache_hit,sliding_window,expected_hit",
+    [
+        (0, 79, None, 64),
+        (0, 40, None, 32),
+        (0, 40, 32, 32),
+        (32, 79, None, 32),
+        (32, 16, None, 0),
+        (31, 79, None, 0),
+        (32, 79, 32, 32),
+        (32, 16, 32, 0),
+        (32, 0, None, 0),
+    ],
+    ids=[
+        "local",
+        "local-truncated",
+        "local-sliding-window-truncated",
+        "external",
+        "external-dropped",
+        "external-mid-block",
+        "external-sliding-window",
+        "external-sliding-window-dropped",
+        "none",
+    ],
+)
+def test_prefix_hit_is_capped_at_retained_auxiliary_outputs(
+    external_tokens, max_cache_hit, sliding_window, expected_hit
+):
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        kv_cache_spec=(
+            SlidingWindowSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            )
+            if sliding_window
+            else None
+        ),
+        use_kv_connector=(
+            mock_kv(matched_tokens=external_tokens, is_async=False)
+            if external_tokens
+            else None
+        ),
+    )
+    first, second = create_requests(num_requests=2, num_tokens=80, same_prompt=True)
+    if not external_tokens:
+        scheduler.add_request(first)
+        scheduler.schedule()
+        scheduler.finish_requests(first.request_id, RequestStatus.FINISHED_ABORTED)
+    connector = AuxOutputSchedulerConnector(scheduler.kv_cache_manager, Mock())
+    connector.max_cache_hit = Mock(return_value=max_cache_hit)
+    scheduler.aux_output_connector = connector
+    scheduler.add_request(second)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[second.request_id] == 80 - expected_hit
+
+
+def test_evicted_blocks_release_their_auxiliary_outputs_past_capacity():
+    scheduler = create_scheduler(enable_prefix_caching=True, num_blocks=5)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector(
+        scheduler.kv_cache_manager
+    )
+    first, second, third = create_requests(num_requests=3, num_tokens=64)
+    for request in (first, second):
+        scheduler.add_request(request)
+        scheduler.schedule()
+        scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    scheduler.add_request(third)
+    metadata = scheduler.schedule().aux_output_connector_metadata
+
+    assert list(metadata.retained_block_hashes) == second.block_hashes
+    assert list(metadata.released_block_hashes) == first.block_hashes[:3]
 
 
 def test_finish_request():
@@ -2112,7 +2282,9 @@ def test_prefix_cache_stats_counted_once_for_retried_then_scheduled_request():
 
 def test_scheduler_reset_prefix_cache():
     scheduler = create_scheduler(enable_prefix_caching=True)
-    scheduler.aux_output_connector = Mock()
+    scheduler.aux_output_connector = Mock(
+        wraps=AuxOutputSchedulerConnector(scheduler.kv_cache_manager)
+    )
     requests = create_requests(num_requests=10)
     for request in requests:
         scheduler.add_request(request)
@@ -7743,6 +7915,35 @@ def test_hybrid_per_group_hit_divergence_with_connector(
     scheduler.add_request(replay)
     output = scheduler.schedule()
     [new_req] = output.scheduled_new_reqs
+    assert new_req.num_computed_tokens == expected_num_computed
+
+
+@pytest.mark.parametrize(
+    "max_cache_hit,expected_num_computed", [(95, 80), (0, 0)], ids=["kept", "capped"]
+)
+def test_hybrid_divergent_hit_fallback_is_capped_at_retained_auxiliary_outputs(
+    max_cache_hit, expected_num_computed
+):
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(16)
+    manager = scheduler.kv_cache_manager
+    _, mamba_ids = _seed_hybrid_prefix(manager, 4, block_size)
+    manager.block_pool.evict_blocks({mamba_ids[1], mamba_ids[2], mamba_ids[3]})
+    connector = AuxOutputSchedulerConnector(manager, scheduler.connector)
+    connector.max_cache_hit = Mock(return_value=max_cache_hit)
+    scheduler.aux_output_connector = connector
+    [replay] = create_requests(
+        num_requests=1,
+        num_tokens=6 * block_size,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["replay"],
+    )
+    scheduler.add_request(replay)
+
+    [new_req] = scheduler.schedule().scheduled_new_reqs
+
     assert new_req.num_computed_tokens == expected_num_computed
 
 

@@ -32,8 +32,9 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 from vllm.v1.worker.replayssm_utils import (
+    ReplaySSMModelContext,
+    _compact_replayssm_requests_kernel,
     _postprocess_replayssm_kernel,
-    _ReplaySSMGroupContext,
 )
 from vllm.v1.worker.utils import allocate_kv_cache
 
@@ -76,6 +77,18 @@ def _cuda_ints(values):
     return torch.tensor(values, dtype=torch.int32, device="cuda")
 
 
+def _replayssm_mixer(kv_cache, ring_start, committed, A):
+    return SimpleNamespace(
+        kv_cache=kv_cache,
+        _replayssm_ring_start=ring_start,
+        _replayssm_prev_num_accepted=committed,
+        replayssm_buffer_len=16,
+        A=A,
+        mamba_config=MambaConfig(backend=MambaBackendEnum.FLASHINFER),
+    )
+
+
+@pytest.mark.parametrize("checkpointed", [False, True], ids=["replay", "checkpoint"])
 @pytest.mark.parametrize(
     ("post_step", "layout", "ssm_dtype"),
     [
@@ -84,7 +97,7 @@ def _cuda_ints(values):
     ],
 )
 def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
-    post_step, layout, ssm_dtype
+    post_step, layout, ssm_dtype, checkpointed
 ):
     """Publish a boundary without modifying its live or cached-prefix sources."""
     try:
@@ -102,7 +115,7 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
         pytest.skip(reason)
 
     set_random_seed(42)
-    slots, heads, dim, dstate, ring_len = 6, 8, 64, 128, 20
+    slots, heads, dim, dstate, ring_len = 19, 8, 64, 128, 20
     spec = MambaSpec(
         block_size=16,
         shapes=(
@@ -120,6 +133,9 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
             torch.bfloat16,
         ),
         use_flashinfer_replayssm=True,
+        mamba_cache_mode="align",
+        state_alignment=16,
+        block_stride_alignment=16,
     )
     spec = replace(spec, page_size_padded=spec.page_size_bytes + 128)
     vllm_config = SimpleNamespace(
@@ -127,13 +143,15 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
         attention_config=SimpleNamespace(hisparse_config=None),
     )
     vllm_config.cache_config.kv_cache_layout = layout.name
+    layer_names = [
+        ["mixer", "neighbor"],
+        ["other_group", "other_neighbor"],
+        ["last_group"],
+    ]
     config = get_kv_cache_config_from_groups(
         vllm_config,
-        [
-            KVCacheGroupSpec(["mixer", "neighbor"], spec),
-            KVCacheGroupSpec(["other_group"], spec),
-        ],
-        slots * (2 * spec.page_size_bytes + 16),
+        [KVCacheGroupSpec(names, spec) for names in layer_names],
+        slots * (2 * spec.page_size_bytes + 24),
     )
     pages = allocate_kv_cache(config, torch.device("cuda"), layout)
     caches = {}
@@ -141,105 +159,160 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
         layer = SimpleNamespace(
             get_state_shape=lambda: spec.shapes,
             get_state_dtype=lambda: spec.dtypes,
+            state_alignment=16,
         )
         MambaBase.bind_kv_cache(layer, page)
         caches[name] = layer.kv_cache
-    state = caches["mixer"][1]
-    state.normal_(std=0.1)
-    # Slot 1 is an immutable cached prefix, copied to private live slot 3.
-    state[3].copy_(state[1])
-    original = state.clone()
     rings = {name: states[2:] for name, states in caches.items()}
-    x, dt, B = rings["mixer"]
-    x.normal_()
-    dt.fill_(0.01)
-    B.normal_()
-    assert not x.is_contiguous() and not dt.is_contiguous() and not B.is_contiguous()
-    assert x.data_ptr() == rings["other_group"][0].data_ptr()
-    # The other layer is disjoint within this group. Group B owns physical4,
-    # while materialization only uses group A's live3 and destination2.
-    for tensor in rings["neighbor"]:
-        tensor.fill_(7)
-    neighbor_before = [tensor.clone() for tensor in rings["neighbor"]]
-    for tensor in rings["other_group"]:
-        tensor[4].fill_(9)
-    other_owned_before = [tensor[4].clone() for tensor in rings["other_group"]]
-    ring_before = [tensor.clone() for tensor in rings["mixer"]]
-    A = -torch.ones(heads, device="cuda")
-    mixer = SimpleNamespace(
-        kv_cache=caches["mixer"],
-        _replayssm_ring_start=_cuda_ints([0, 0, 0, 7, 0, 2]),
-        _replayssm_prev_num_accepted=_cuda_ints([0, 0, 0, 2, 0, 1]),
-        replayssm_buffer_len=16,
-        A=A,
-        mamba_config=MambaConfig(backend=MambaBackendEnum.FLASHINFER),
-    )
-    group = _ReplaySSMGroupContext.create(
-        [mixer],
-        _cuda_ints(
-            [
-                [2, 3],
-                [NULL_BLOCK_ID, 5],
-                [NULL_BLOCK_ID, NULL_BLOCK_ID],
-                [NULL_BLOCK_ID, NULL_BLOCK_ID],
-            ]
-        ),
-        MambaAttentionBackendEnum.MAMBA2,
-        "align",
-        16,
-        4,
-    )
-    # Batch row 0 crosses token 16; row 1 rejects all drafts and stops at 15.
-    # Rows 2 and 3 exercise padded physical slots and padded request indices.
-    mapping = _cuda_ints([2, 0, 1, -1])
-    group.postprocess(
-        idx_mapping=mapping,
-        query_metadata=_cuda_ints([0, 4, 8, 12, 16])
-        if post_step
-        else _cuda_ints([4] * 4),
-        query_metadata_is_cumulative=post_step,
-        num_computed_tokens=_cuda_ints([15, 17, 17])
-        if post_step
-        else _cuda_ints([14] * 3),
-        num_computed_is_post_step=post_step,
-        num_accepted_tokens=_cuda_ints([1, 3, 3]),
-        is_prefilling=torch.zeros(4, dtype=torch.bool, device="cuda"),
-        live_cols=_cuda_ints([1, 1, 1]),
-        num_reqs=4,
-    )
-    assert group.active_request_indices.tolist() == [0, -1, -1, -1]
-    assert group.plan_flush_count.tolist() == [4, -1, -1, -1]
-    group.materialize_mamba()
-
-    expected = original[3].float().clone()
-    for offset in range(4):
-        pos = (7 + offset) % ring_len
-        delta = dt[3, :, pos]
-        expected *= torch.exp(delta * A)[:, None, None]
-        expected += (
-            delta[:, None, None]
-            * x[3, :, pos].float()[:, :, None]
-            * B[3, 0, pos].float()[None, None, :]
+    for name, states in caches.items():
+        states[1].normal_(std=0.1)
+        x, dt, B = rings[name]
+        x.normal_()
+        dt.fill_(0.01)
+        B.normal_()
+        assert (
+            not x.is_contiguous() and not dt.is_contiguous() and not B.is_contiguous()
         )
-    torch.testing.assert_close(state[2].float(), expected, atol=2e-3, rtol=2e-3)
-    # The snapshot excludes the accepted tail past 16 and all rejected drafts.
-    for slot in (0, 1, 3, 4, 5):
-        torch.testing.assert_close(state[slot], original[slot], atol=0, rtol=0)
-    assert mixer._replayssm_prev_num_accepted[3].item() == 5
-    assert mixer._replayssm_prev_num_accepted[2].item() == 0
-    for tensor, before in zip(rings["mixer"], ring_before, strict=True):
-        torch.testing.assert_close(tensor, before, atol=0, rtol=0)
-    for tensor, before in zip(rings["neighbor"], neighbor_before, strict=True):
-        torch.testing.assert_close(tensor, before, atol=0, rtol=0)
-    for tensor, before in zip(rings["other_group"], other_owned_before, strict=True):
-        torch.testing.assert_close(tensor[4], before, atol=0, rtol=0)
+    assert rings["mixer"][0].data_ptr() == rings["other_group"][0].data_ptr()
+    assert rings["mixer"][0].data_ptr() == rings["last_group"][0].data_ptr()
+
+    # Groups share backing pools, but own disjoint physical slots.
+    # Each group's cached prefix remains immutable after copying to its live slot.
+    for names, prefix, live in zip(layer_names, [1, 7, 13], [3, 9, 15], strict=True):
+        for name in names:
+            caches[name][1][live].copy_(caches[name][1][prefix])
+    original = {name: states[1].clone() for name, states in caches.items()}
+    ring_before = {
+        name: [tensor.clone() for tensor in tensors] for name, tensors in rings.items()
+    }
+    A = -torch.ones(heads, device="cuda")
+    null = NULL_BLOCK_ID
+    block_tables = [
+        [[2, 3], [null, 5], [4, 4], [null, null], [null, null]],
+        [[8, 9], [null, 11], [10, 10], [null, null], [null, null]],
+        [[14, 15], [null, 17], [16, 16], [null, null], [null, null]],
+    ]
+    histories = [
+        {
+            null: (11, 9),
+            offset + 3: (7, 14 if checkpointed else 2),
+            offset + 5: (2, 1),
+            offset + 4: (6, 2),
+        }
+        for offset in (0, 6, 12)
+    ]
+    grouped = []
+    for names, table, history in zip(layer_names, block_tables, histories, strict=True):
+        starts, committed = [0] * slots, [0] * slots
+        for slot, (start, count) in history.items():
+            starts[slot], committed[slot] = start, count
+        starts, committed = _cuda_ints(starts), _cuda_ints(committed)
+        mixers = [
+            _replayssm_mixer(caches[name], starts, committed, A) for name in names
+        ]
+        grouped.append((mixers, spec, _cuda_ints(table)))
+    context = ReplaySSMModelContext.create(grouped, max_num_reqs=6)
+    # Batch row 0 crosses token 16; row 1 rejects all drafts and stops at 15.
+    # Row 2 uses in-place replay; row 3 has null slots in every group.
+    # Row 4 is a padded request, and row 5 is unused buffer capacity.
+    mapping = _cuda_ints([2, 0, 1, 3, -1])
+    # Groups use different slots but preserve equal logical replay histories.
+    context.reset_new_slots(
+        idx_mapping=mapping,
+        src_cols=_cuda_ints([0, 1, 1, 1]),
+        dst_cols=_cuda_ints([1, 0, 0, 0]),
+        num_reqs=5,
+    )
+    reset_histories = [
+        {**history, offset + 2: history[offset + 3], offset + 5: (0, 0)}
+        for offset, history in zip((0, 6, 12), histories, strict=True)
+    ]
+    for (mixers, _, _), expected in zip(grouped, reset_histories, strict=True):
+        assert mixers[0]._replayssm_ring_start.tolist() == [
+            expected.get(slot, (0, 0))[0] for slot in range(slots)
+        ]
+        assert mixers[0]._replayssm_prev_num_accepted.tolist() == [
+            expected.get(slot, (0, 0))[1] for slot in range(slots)
+        ]
+    metadata = dict(
+        idx_mapping=mapping,
+        query_metadata=_cuda_ints([0, 4, 8, 12, 16, 20])
+        if post_step
+        else _cuda_ints([4] * 5),
+        query_metadata_is_cumulative=post_step,
+        num_computed_tokens=_cuda_ints([15, 17, 17, 17])
+        if post_step
+        else _cuda_ints([14] * 4),
+        num_computed_is_post_step=post_step,
+        num_accepted_tokens=_cuda_ints([1, 3, 3, 3]),
+        is_prefilling=torch.zeros(5, dtype=torch.bool, device="cuda"),
+        live_cols=_cuda_ints([1] * 4),
+        num_reqs=5,
+    )
+    context.postprocess(**metadata)
+    # After a checkpoint, the source state is canonical at the old ring end.
+    # Only the two accepted tokens through the boundary remain to replay.
+    plans = {0: (1, 2) if checkpointed else (7, 4), 2: (6, 4)}
+    assert context.active_request_indices.tolist() == [0, 2, -1, -1, -1, -1]
+    assert context.plan_ring_start.tolist() == [
+        plans.get(row, (0, -1))[0] for row in range(6)
+    ]
+    assert context.plan_flush_count.tolist() == [
+        plans.get(row, (0, -1))[1] for row in range(6)
+    ]
+    destinations: dict[int, set[int]] = {}
+    for names, (mixers, _, _), table in zip(
+        layer_names, grouped, block_tables, strict=True
+    ):
+        starts = mixers[0]._replayssm_ring_start
+        committed = mixers[0]._replayssm_prev_num_accepted
+        for row, (start, flush) in plans.items():
+            dst, src = table[row]
+            for name in names:
+                destinations.setdefault(caches[name][1].data_ptr(), set()).add(dst)
+                x, dt, B = rings[name]
+                expected = original[name][src].float().clone()
+                for offset in range(flush):
+                    pos = (start + offset) % ring_len
+                    delta = dt[src, :, pos]
+                    expected *= torch.exp(delta * A)[:, None, None]
+                    expected += (
+                        delta[:, None, None]
+                        * x[src, :, pos].float()[:, :, None]
+                        * B[src, 0, pos].float()[None, None, :]
+                    )
+                torch.testing.assert_close(
+                    caches[name][1][dst].float(), expected, atol=2e-3, rtol=2e-3
+                )
+            assert starts[dst].item() == 0
+            assert committed[dst].item() == 0
+            if src != dst:
+                assert starts[src].item() == start
+                assert committed[src].item() == flush + 1
+    # Check all other slots, including immutable prefixes and each live tail.
+    for name, states in caches.items():
+        for slot in set(range(slots)) - destinations[states[1].data_ptr()]:
+            torch.testing.assert_close(
+                states[1][slot], original[name][slot], atol=0, rtol=0
+            )
+        for tensor, before in zip(rings[name], ring_before[name], strict=True):
+            torch.testing.assert_close(tensor, before, atol=0, rtol=0)
+
+    # Old plans beyond the new batch must not replay a second time.
+    before_shrink = {name: states[1].clone() for name, states in caches.items()}
+    mapping[:2].fill_(-1)
+    metadata["num_reqs"] = 2
+    context.postprocess(**metadata)
+    assert context.active_request_indices.tolist() == [-1] * 6
+    for name, states in caches.items():
+        torch.testing.assert_close(states[1], before_shrink[name], atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("post_step", [False, True], ids=["v1", "v2"])
 def test_replayssm_skips_canonical_self_copy_but_resets_prefill_trackers(post_step):
     """Skip prefill self-copies, reset trackers, and preserve in-place MTP replay."""
-    mixer = SimpleNamespace(
+    mixer = _replayssm_mixer(
         kv_cache=(
             torch.empty(0, device="cuda"),
             torch.empty(6, 1, 1, 1, device="cuda"),
@@ -247,48 +320,70 @@ def test_replayssm_skips_canonical_self_copy_but_resets_prefill_trackers(post_st
             torch.empty(6, 1, 20, device="cuda"),
             torch.empty(6, 1, 20, 1, device="cuda"),
         ),
-        _replayssm_ring_start=_cuda_ints([3] * 6),
-        _replayssm_prev_num_accepted=_cuda_ints([2] * 6),
-        replayssm_buffer_len=16,
+        ring_start=_cuda_ints([3] * 6),
+        committed=_cuda_ints([2] * 6),
         A=torch.empty(1, device="cuda"),
     )
-    group = _ReplaySSMGroupContext.create(
-        [mixer],
-        _cuda_ints(
-            [
-                [0, 1, 2],
-                [3, 4, 5],
-                [NULL_BLOCK_ID] * 3,
-                [NULL_BLOCK_ID] * 3,
-            ]
-        ),
-        MambaAttentionBackendEnum.MAMBA2,
-        "align",
-        16,
-        4,
+    spec = MambaSpec(
+        block_size=16,
+        shapes=tuple(tensor.shape[1:] for tensor in mixer.kv_cache),
+        dtypes=tuple(tensor.dtype for tensor in mixer.kv_cache),
+        mamba_cache_mode="align",
+        use_flashinfer_replayssm=True,
     )
+    table = _cuda_ints(
+        [
+            [0, 1, 2],
+            [3, 4, 5],
+            [NULL_BLOCK_ID] * 3,
+            [NULL_BLOCK_ID] * 3,
+        ]
+    )
+    context = ReplaySSMModelContext.create([([mixer], spec, table)], max_num_reqs=4)
     # Reordered rows: canonical prefill in slot 2; in-place MTP replay in slot 4;
     # padded slot; padded request.
-    group.postprocess(
-        idx_mapping=_cuda_ints([1, 2, 0, -1]),
-        query_metadata=(
-            _cuda_ints([0, 48, 52, 68, 68]) if post_step else _cuda_ints([48, 4, 16, 0])
-        ),
-        query_metadata_is_cumulative=post_step,
-        num_computed_tokens=_cuda_ints([16, 48, 32])
-        if post_step
-        else _cuda_ints([0, 0, 28]),
-        num_computed_is_post_step=post_step,
-        num_accepted_tokens=_cuda_ints([1, 1, 4]),
-        is_prefilling=torch.tensor([True, False, True, True], device="cuda"),
-        live_cols=_cuda_ints([0, 2, 1]),
-        num_reqs=4,
+    _postprocess_replayssm_kernel[(4, 1)](
+        _cuda_ints([1, 2, 0, -1]),
+        _cuda_ints([0, 48, 52, 68, 68]) if post_step else _cuda_ints([48, 4, 16, 0]),
+        _cuda_ints([16, 48, 32]) if post_step else _cuda_ints([0, 0, 28]),
+        _cuda_ints([1, 1, 4]),
+        torch.tensor([True, False, True, True], device="cuda"),
+        _cuda_ints([0, 2, 1]),
+        context.block_table_ptrs,
+        context.ring_start_ptrs,
+        context.num_committed_ptrs,
+        context.src_slots_ptrs,
+        context.dst_slots_ptrs,
+        context.plan_ring_start,
+        context.plan_flush_count,
+        context.block_table_strides,
+        context.num_layers,
+        MAX_NUM_REQS=4,
+        MAMBA_BLOCK_SIZE=16,
+        LOGICAL_WINDOW=16,
+        RING_BUFFER_LEN=20,
+        PAD_SLOT_ID=NULL_BLOCK_ID,
+        QUERY_METADATA_IS_CUMULATIVE=post_step,
+        NUM_COMPUTED_IS_POST_STEP=post_step,
+        HAS_IDX_MAPPING=True,
+        MATERIALIZE_PREFIXES=True,
+        LIVE_COL_IS_ZERO=False,
+        EXECUTED_QUERY_WIDTH=0,
+        GDN_STP=False,
+    )
+    _compact_replayssm_requests_kernel[(1,)](
+        context.plan_flush_count,
+        context.active_request_indices,
+        context.num_active,
+        4,
+        MAX_NUM_REQS=4,
+        BLOCK_SIZE=4,
     )
 
-    assert group.plan_flush_count.tolist() == [-1, 6, -1, -1]
-    assert group.active_request_indices.tolist() == [1, -1, -1, -1]
-    assert group.src_slots[0, 1].item() == 4
-    assert group.dst_slots[0, 1].item() == 4
+    assert context.plan_flush_count.tolist() == [-1, 6, -1, -1]
+    assert context.active_request_indices.tolist() == [1, -1, -1, -1]
+    assert context.src_slots[0, 1].item() == 4
+    assert context.dst_slots[0, 1].item() == 4
     assert mixer._replayssm_ring_start.tolist() == [3, 0, 0, 3, 0, 3]
     assert mixer._replayssm_prev_num_accepted.tolist() == [2, 0, 0, 2, 0, 2]
 
@@ -446,10 +541,9 @@ def test_triton_basic_call():
 def test_replayssm_physical_ring_shape(
     backend, num_speculative_tokens, expected_ring_len
 ):
-    shapes = MambaStateShapeCalculator.replayssm_ring_shapes(
-        num_heads=16,
-        head_dim=4,
-        state_size=16,
+    base_shapes = ((8, 4), (8, 4, 16))
+    shapes = MambaStateShapeCalculator.append_replayssm_ring(
+        base_shapes,
         n_groups=4,
         tp_world_size=2,
         logical_window=16,
@@ -458,6 +552,7 @@ def test_replayssm_physical_ring_shape(
     )
 
     assert shapes == (
+        *base_shapes,
         (8, expected_ring_len, 4),
         (8, expected_ring_len),
         (2, expected_ring_len, 16),
@@ -466,76 +561,80 @@ def test_replayssm_physical_ring_shape(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("post_step", [False, True])
-@pytest.mark.parametrize(
-    (
-        "computed_before",
-        "query_len",
-        "prefilling",
-        "accepted",
-        "old_committed",
-        "old_start",
-        "expected_committed",
-        "expected_start",
-    ),
-    [
-        (50_000, 4, True, 1, 2, 3, 0, 0),  # Later prefill chunk.
-        (256, 4, False, 1, 15, 7, 1, 2),  # Checkpoint wraps the physical ring.
-    ],
-)
-def test_replayssm_postprocess_commits_staged_transition(
-    post_step,
-    computed_before,
-    query_len,
-    prefilling,
-    accepted,
-    old_committed,
-    old_start,
-    expected_committed,
-    expected_start,
-):
-    """Mode none updates only its live slot, including for long prompt chunks."""
-    computed = computed_before
-    if post_step:
-        computed += query_len if prefilling else accepted
-    ring_start = _cuda_ints([old_start, 7])
-    committed = _cuda_ints([old_committed, 9])
+def test_replayssm_postprocess_commits_staged_transition(post_step):
+    """Keep group histories equal across checkpoints without touching other slots."""
+    ring_start = [_cuda_ints([11, 3, 7, 13]), _cuda_ints([11, 7, 3, 13])]
+    committed = [_cuda_ints([9, 2, 9, 17]), _cuda_ints([9, 9, 2, 17])]
+    cache = (
+        torch.empty(4, 1, device="cuda"),
+        torch.empty(4, 1, 1, 1, device="cuda"),
+        torch.empty(4, 1, 20, 1, device="cuda"),
+        torch.empty(4, 1, 20, device="cuda"),
+        torch.empty(4, 1, 20, 1, device="cuda"),
+    )
+    spec = MambaSpec(
+        block_size=256,
+        shapes=tuple(tensor.shape[1:] for tensor in cache),
+        dtypes=tuple(tensor.dtype for tensor in cache),
+        mamba_cache_mode="none",
+        use_flashinfer_replayssm=True,
+    )
     # Neighboring request rows provide valid canary IDs, making erroneous
     # column reads deterministically corrupt another slot rather than crash.
-    block_table = torch.ones((256, 1), dtype=torch.int32, device="cuda")
-    block_table[0, 0] = 0
-    plan_start, plan_flush = _cuda_ints([0]), _cuda_ints([-1])
-    slots = _cuda_ints([[0]])
-    _postprocess_replayssm_kernel[(1,)](
-        _cuda_ints([0]),
-        _cuda_ints([0, query_len]) if post_step else _cuda_ints([query_len]),
-        _cuda_ints([computed]),
-        _cuda_ints([accepted]),
-        torch.tensor([prefilling], device="cuda"),
-        None,
-        block_table[:1],
-        ring_start,
-        committed,
-        slots,
-        slots,
-        plan_start,
-        plan_flush,
-        block_table.stride(0),
-        1,
-        MAMBA_BLOCK_SIZE=256,
-        LOGICAL_WINDOW=16,
-        RING_BUFFER_LEN=20,
-        NUM_LAYERS=1,
-        PAD_SLOT_ID=-1,
-        QUERY_METADATA_IS_CUMULATIVE=post_step,
-        NUM_COMPUTED_IS_POST_STEP=post_step,
-        HAS_IDX_MAPPING=post_step,
-        MATERIALIZE_PREFIXES=False,
-        LIVE_COL_IS_ZERO=True,
-        EXECUTED_QUERY_WIDTH=0,
-        GDN_STP=False,
-    )
-    assert committed.tolist() == [expected_committed, 9]
-    assert ring_start.tolist() == [expected_start, 7]
+    block_tables = [
+        torch.full((256, 1), 3, dtype=torch.int32, device="cuda") for _ in range(2)
+    ]
+    grouped = []
+    for group_idx, table in enumerate(block_tables):
+        table[0, 0] = group_idx + 1
+        mixer = _replayssm_mixer(
+            cache,
+            ring_start[group_idx],
+            committed[group_idx],
+            torch.empty(1, device="cuda"),
+        )
+        grouped.append(([mixer], spec, table))
+    context = ReplaySSMModelContext.create(grouped, max_num_reqs=1)
+    computed = 50_000
+    history_tokens = checkpoint_tokens = 0
+    # Reset a later prefill chunk, then reject, partially accept, and fully accept.
+    for step, accepted in enumerate([1] + [4, 1, 3, 2] * 5):
+        prefilling = step == 0
+        query_len = 4
+        if not prefilling:
+            if history_tokens - checkpoint_tokens + query_len > 16:
+                checkpoint_tokens = history_tokens
+            history_tokens += accepted
+        computed_after = computed + (query_len if prefilling else accepted)
+        context.postprocess(
+            idx_mapping=_cuda_ints([0]) if post_step else None,
+            query_metadata=_cuda_ints([0, query_len])
+            if post_step
+            else _cuda_ints([query_len]),
+            query_metadata_is_cumulative=post_step,
+            num_computed_tokens=_cuda_ints([computed_after if post_step else computed]),
+            num_computed_is_post_step=post_step,
+            num_accepted_tokens=_cuda_ints([accepted]),
+            is_prefilling=torch.tensor([prefilling], device="cuda"),
+            live_cols=None,
+            num_reqs=1,
+        )
+        expected_committed = history_tokens - checkpoint_tokens
+        expected_start = checkpoint_tokens % 20
+        for group_idx in range(2):
+            expected_starts, expected_counts = [11, 7, 7, 13], [9, 9, 9, 17]
+            expected_starts[group_idx + 1] = expected_start
+            expected_counts[group_idx + 1] = expected_committed
+            assert ring_start[group_idx].tolist() == expected_starts, step
+            assert committed[group_idx].tolist() == expected_counts, step
+        assert ring_start[0][1].item() == ring_start[1][2].item()
+        assert committed[0][1].item() == committed[1][2].item()
+        assert 0 <= expected_committed <= 16
+        assert expected_committed + query_len <= 20
+        assert context.plan_ring_start.item() == 0
+        assert context.plan_flush_count.item() == -1
+        computed = computed_after
+    assert checkpoint_tokens >= 40  # Exercise more than one physical ring wrap.
 
 
 @pytest.mark.parametrize(
@@ -645,14 +744,13 @@ def test_replayssm_mixer_selects_mtp_layout(
 
 def test_replayssm_ring_shape_extends_groups_for_head_shards():
     """B_cache retains one replicated group on each head shard."""
-    shapes = MambaStateShapeCalculator.replayssm_ring_shapes(
-        num_heads=4,
-        head_dim=64,
-        state_size=128,
+    base_shapes = ((2, 64), (2, 64, 128))
+    shapes = MambaStateShapeCalculator.append_replayssm_ring(
+        base_shapes,
         n_groups=1,
         tp_world_size=2,
         logical_window=16,
         backend=MambaBackendEnum.TRITON,
     )
 
-    assert shapes == ((2, 16, 64), (2, 16), (1, 16, 128))
+    assert shapes == (*base_shapes, (2, 16, 64), (2, 16), (1, 16, 128))
