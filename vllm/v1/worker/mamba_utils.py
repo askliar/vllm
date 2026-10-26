@@ -882,14 +882,18 @@ class MambaSpecDecodeGPUContext:
         for spec in mamba_groups:
             if spec.use_flashinfer_replayssm:
                 if (
-                    spec.mamba_type != MambaAttentionBackendEnum.MAMBA2
+                    spec.mamba_type
+                    not in (
+                        MambaAttentionBackendEnum.MAMBA2,
+                        MambaAttentionBackendEnum.GDN_ATTN,
+                    )
                     or len(spec.shapes) != 5
                     or len(spec.dtypes) != 5
                     or copy_funcs_by_spec[spec]
                     != (get_conv_copy_spec, get_temporal_copy_spec)
                 ):
                     raise ValueError(
-                        "FlashInfer ReplaySSM requires two canonical Mamba2 "
+                        "FlashInfer ReplaySSM requires two canonical Mamba2 or GDN "
                         "states and three ring states"
                     )
                 copy_funcs_by_spec[spec] += (get_temporal_copy_spec,) * 3
@@ -1055,7 +1059,7 @@ class MambaSpecDecodeGPUContext:
                 if is_flashinfer_replayssm:
                     if not mamba_spec.use_flashinfer_replayssm or len(kv_caches) != 5:
                         raise ValueError(
-                            "FlashInfer ReplaySSM requires five bound Mamba2 states"
+                            "FlashInfer ReplaySSM requires five bound recurrent states"
                         )
                     mixers.append(attention)
                     state_copy_funcs += (get_temporal_copy_spec,) * 3
@@ -1763,6 +1767,7 @@ def stage_postprocess_inputs_to_gpu(
     requests: dict[str, CachedRequestState],
     *,
     num_decodes: int | None = None,
+    is_prefilling: torch.Tensor | None = None,
 ) -> None:
     """Stage the per-request decisions consumed after token acceptance.
 
@@ -1791,7 +1796,10 @@ def stage_postprocess_inputs_to_gpu(
     ctx.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_computed_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_draft_tokens_buf.copy_to_gpu(num_reqs)
-    if num_decodes is not None:
+    if is_prefilling is not None:
+        ctx.is_prefilling_buf.np[:num_reqs] = is_prefilling.numpy()
+        ctx.is_prefilling_buf.copy_to_gpu(num_reqs)
+    elif num_decodes is not None:
         # Full decode graphs can include padded rows after the real requests.
         num_decodes = min(num_decodes, num_reqs)
         ctx.is_prefilling_buf.np[:num_decodes] = False

@@ -55,12 +55,14 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
         num_tokens_after_padding=1,
         query_start_loc_np=torch.tensor([0, 1], dtype=torch.int32).numpy(),
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-        num_scheduled_tokens=torch.tensor([1], dtype=torch.int32),
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
         max_query_len=None,
         seq_lens_cpu_upper_bound=torch.tensor([1537], dtype=torch.int32),
         seq_lens=torch.tensor([1537], dtype=torch.int32),
         is_prefilling_np=torch.tensor([False]).numpy(),
         prefill_runs_as_decode_np=None,
+        num_computed_prefill_tokens_np=np.array([1536]),
+        prefill_len_np=np.array([1024]),
         dcp_local_seq_lens=None,
         positions=positions,
         prompt_lens=torch.tensor([1024], dtype=torch.int32),
@@ -112,6 +114,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
     state._use_flashinfer_replayssm = True
+    state._use_gdn_replayssm = False
     state._is_prefilling_gpu = torch.tensor([True, True, False])
     monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     state.recoverssm = None
@@ -137,6 +140,8 @@ def test_padded_prompt_tail_builds_as_spec_decode(
         seq_lens_cpu_upper_bound=torch.tensor(seq_lens, dtype=torch.int32),
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
         is_prefilling_np=np.array(is_prefilling),
+        num_computed_prefill_tokens_np=np.array([46, 128, 0]),
+        prefill_len_np=np.array([40, 129, 8]),
         prefill_runs_as_decode_np=np.array([False, True, False]),
         dcp_local_seq_lens=None,
         positions=torch.zeros(12, dtype=torch.int64),
@@ -212,6 +217,8 @@ def _input_batch(
         max_query_len=None,
         seq_lens_cpu_upper_bound=seq_lens,
         is_prefilling_np=np.array(is_prefilling),
+        num_computed_prefill_tokens_np=np.where(is_prefilling, 0, 10),
+        prefill_len_np=np.where(is_prefilling, 16, 10),
         prefill_runs_as_decode_np=None,
         num_draft_tokens_per_req=None
         if num_draft_tokens_per_req is None
@@ -229,6 +236,7 @@ def test_replayssm_resumed_chunk_past_prompt_resets_history(monkeypatch):
     """A resumed multi-token chunk uses prefill even after the prompt ends."""
     state = _mamba_hybrid_state(num_speculative_tokens=3)
     state._use_flashinfer_replayssm = True
+    state._use_gdn_replayssm = False
     state._is_prefilling_gpu = torch.zeros(2, dtype=torch.bool)
     monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     batch = _input_batch([4, 8], [3, 0], [False, False])
@@ -407,6 +415,7 @@ def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
     state = object.__new__(MambaHybridModelState)
     state._align_mode = True
     state._use_flashinfer_replayssm = True
+    state._use_gdn_replayssm = False
     state.recoverssm = None
     state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32, device="cuda")
     state._mamba_state_idx_gpu = torch.zeros(4, dtype=torch.int32, device="cuda")
