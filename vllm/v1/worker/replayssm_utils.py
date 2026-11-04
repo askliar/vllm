@@ -13,6 +13,7 @@ from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     _load_gdn_replayssm_materialize,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -25,21 +26,40 @@ def initialize_replayssm_ring_trackers(
 ) -> None:
     """Allocate and bind one tracker pair per ReplaySSM cache group."""
     for group in kv_cache_config.kv_cache_groups:
-        layers = [
-            layer
+        names = [
+            name
             for name in group.layer_names
             if isinstance(layer := forward_context.get(name), MambaBase)
-            and layer.use_flashinfer_replayssm
+            and layer.use_replayssm
         ]
-        if not layers:
+        if not names:
             continue
+        layers = [forward_context[name] for name in names]
         state = layers[0].kv_cache[0]
         num_blocks, device = state.shape[0], state.device
-        ring_start = torch.zeros(num_blocks, dtype=torch.int32, device=device)
-        num_committed = torch.zeros_like(ring_start)
+        trackers = (
+            layers[0]._replayssm_ring_start,
+            layers[0]._replayssm_prev_num_accepted,
+        )
+        # Extensible caches rebind after capture. Keep the captured addresses.
+        if all(
+            t.numel() >= num_blocks and t.device == device for t in trackers
+        ) and all(
+            layer._replayssm_ring_start is trackers[0]
+            and layer._replayssm_prev_num_accepted is trackers[1]
+            for layer in layers
+        ):
+            ring_start, num_committed = (t[:num_blocks] for t in trackers)
+        else:
+            ring_start = torch.zeros(num_blocks, dtype=torch.int32, device=device)
+            num_committed = torch.zeros_like(ring_start)
         for layer in layers:
             layer._replayssm_ring_start = ring_start
             layer._replayssm_prev_num_accepted = num_committed
+            layer._plans_replayssm_decode = False
+        # Triton plans each decode step in the group's first executed layer.
+        planner = min(names, key=extract_layer_index)
+        forward_context[planner]._plans_replayssm_decode = True
 
 
 def get_replayssm_block_copy_tensors(
@@ -267,7 +287,7 @@ def _postprocess_replayssm_kernel(
             # Mode none has one live column, regardless of the prompt length.
             tl.store(tracker_start + live_slot, 0, mask=valid_live)
             tl.store(tracker_committed + live_slot, 0, mask=valid_live)
-        if materialize & (live_slot != dst_slot):
+        if wants_materialize & (live_col != dst_col):
             # Prefill already wrote canonical state; only another slot needs a copy.
             tl.store(plan_flush_count + batch_idx, 0, mask=writes_plan)
     elif valid_live & valid_query:
@@ -295,7 +315,7 @@ def _postprocess_replayssm_kernel(
         tl.store(tracker_start + live_slot, next_start)
         tl.store(tracker_committed + live_slot, next_committed)
 
-        if materialize:
+        if wants_materialize:
             tl.store(plan_ring_start + batch_idx, next_start, mask=writes_plan)
             if GDN_STP:
                 # On a fold, state already contains the current token and an
@@ -560,6 +580,7 @@ class ReplaySSMModelContext:
             heads_per_group=(first.kv_cache[1].size(1) // first.kv_cache[4].size(1)),
             max_window=self.logical_window,
             ring_buffer_len=self.ring_buffer_len,
+            pad_slot_id=NULL_BLOCK_ID,
             rand_seed=rand_seed,
             philox_rounds=philox_rounds,
         )

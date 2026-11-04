@@ -34,16 +34,19 @@ def _replayssm_autotune_kwargs(
             "is unavailable."
         )
         return None
+    from vllm.v1.worker.extensible_kv_cache import num_committable_kv_blocks
+
     v2_runner: Any = runner
     query_len = (
         v2_runner.decode_query_len
         if config.use_v2_model_runner
         else runner.uniform_decode_query_len
     )
+    # Block 0 is the null block; the dummy slots must be committed memory.
     max_num_reqs = min(
         runner.scheduler_config.max_num_seqs,
         runner.max_num_tokens // query_len,
-        runner.kv_cache_config.num_blocks - 1,
+        num_committable_kv_blocks(v2_runner) - 1,
     )
     if max_num_reqs <= 0:
         logger.warning_once(
@@ -127,23 +130,34 @@ def replayssm_lifecycle_warmup(runner: "GPUModelRunner") -> None:
     config = runner.vllm_config
     if not config.use_flashinfer_replayssm:
         return
-    num_slots = min(runner.kv_cache_config.num_blocks - 1, 2)
+    from vllm.v1.worker.extensible_kv_cache import (
+        ensure_kv_cache_blocks,
+        num_committable_kv_blocks,
+    )
+
+    v2_runner: Any = runner
+    num_slots = min(num_committable_kv_blocks(v2_runner) - 1, 2)
     if num_slots <= 0:
         return
 
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
     from vllm.v1.kv_cache_interface import MambaSpec
     from vllm.v1.worker.replayssm_utils import ReplaySSMModelContext
 
     use_v2 = config.use_v2_model_runner
-    v2_runner: Any = runner
     grouped = []
     for group_id, group in enumerate(runner.kv_cache_config.kv_cache_groups):
         spec = group.kv_cache_spec
-        if not isinstance(spec, MambaSpec) or not spec.use_flashinfer_replayssm:
+        if not isinstance(spec, MambaSpec):
             continue
         mixers = [
-            config.compilation_config.static_forward_context[name]
+            layer
             for name in group.layer_names
+            if isinstance(
+                layer := config.compilation_config.static_forward_context[name],
+                MambaBase,
+            )
+            and layer.use_flashinfer_replayssm
         ]
         if not mixers:
             continue
@@ -165,6 +179,7 @@ def replayssm_lifecycle_warmup(runner: "GPUModelRunner") -> None:
     if not grouped:
         return
 
+    ensure_kv_cache_blocks(v2_runner, 1 + num_slots)
     with _temporary_replayssm_autotune_state(
         runner, num_slots, prepare_dummy_block_tables=False
     ):
@@ -216,6 +231,8 @@ def replayssm_lifecycle_warmup(runner: "GPUModelRunner") -> None:
 
 
 def replayssm_autotune_warmup(runner: "GPUModelRunner") -> None:
+    from vllm.v1.worker.extensible_kv_cache import ensure_kv_cache_blocks
+
     max_token_prefill_kwargs = {
         "num_tokens": runner.scheduler_config.max_num_batched_tokens,
         "skip_eplb": True,
@@ -226,6 +243,8 @@ def replayssm_autotune_warmup(runner: "GPUModelRunner") -> None:
     if autotune is None:
         return
     max_num_reqs, decode_kwargs = autotune
+    v2_runner: Any = runner
+    ensure_kv_cache_blocks(v2_runner, 1 + max_num_reqs)
     with _temporary_replayssm_autotune_state(runner, max_num_reqs):
         runner._dummy_run(**decode_kwargs)
 
@@ -284,20 +303,25 @@ def gdn_replayssm_warmup(runner: "GPUModelRunner") -> None:
     config = runner.vllm_config
     if not config.is_gdn_replayssm_enabled():
         return
+    from vllm.v1.worker.extensible_kv_cache import (
+        ensure_kv_cache_blocks,
+        num_committable_kv_blocks,
+    )
+
+    v2_runner: Any = runner
     executed_query_width, _ = gdn_replayssm_geometry(config.num_speculative_tokens)
     query_len = config.num_speculative_tokens + 1
     assert query_len <= executed_query_width
     max_num_reqs = min(
         runner.scheduler_config.max_num_seqs,
         runner.max_num_tokens // query_len,
-        runner.kv_cache_config.num_blocks - 1,
+        num_committable_kv_blocks(v2_runner) - 1,
     )
     if max_num_reqs <= 0:
         raise ValueError(
             "FlashInfer GDN ReplaySSM warmup requires a non-padding state slot"
         )
     if config.use_v2_model_runner:
-        v2_runner: Any = runner
         manager = v2_runner.cudagraph_manager
         capture_reqs = {
             desc.num_reqs
@@ -330,6 +354,7 @@ def gdn_replayssm_warmup(runner: "GPUModelRunner") -> None:
             force_attention=True,
             profile_seq_lens=query_len + 1,
         )
+    ensure_kv_cache_blocks(v2_runner, 1 + max_num_reqs)
     with _temporary_replayssm_autotune_state(runner, max_num_reqs):
         for num_reqs in sorted(capture_reqs):
             runner._dummy_run(num_tokens=num_reqs * query_len, **decode_kwargs)

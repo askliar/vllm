@@ -9,14 +9,17 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateCopyFuncsByType,
-    gdn_replayssm_geometry,
-)
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
-from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
+    GDNAttentionMetadataBuilder,
+)
+from vllm.v1.attention.backends.mamba2_attn import (
+    Mamba2AttentionMetadata,
+    Mamba2AttentionMetadataBuilder,
+)
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadataBuilder,
     ShortConvAttentionMetadataBuilder,
@@ -160,7 +163,7 @@ class MambaHybridModelState(DefaultModelState):
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig, block_tables: BlockTables
     ) -> None:
-        if self._use_flashinfer_replayssm:
+        if self.cache_config.use_replayssm:
             initialize_replayssm_ring_trackers(
                 kv_cache_config,
                 self.vllm_config.compilation_config.static_forward_context,
@@ -183,6 +186,7 @@ class MambaHybridModelState(DefaultModelState):
             max_num_reqs=self.max_num_reqs,
             kv_cache_config=kv_cache_config,
             copy_funcs=self._mamba_state_copy_funcs,
+            forward_context=self.vllm_config.compilation_config.static_forward_context,
             device=self.device,
             make_buffer=lambda n, dtype: CpuGpuBuffer(
                 n, dtype=dtype, device=self.device
@@ -337,37 +341,6 @@ class MambaHybridModelState(DefaultModelState):
             )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
-        if self._use_flashinfer_replayssm:
-            self._replayssm_query_start_loc = input_batch.query_start_loc
-            # Match Mamba attention using pre-step metadata: after acceptance,
-            # subtracting the scheduled length also subtracts rejected drafts.
-            query_lens = torch.diff(query_start_loc_cpu)
-            decode_rows = query_lens == 1
-            if num_decode_draft_tokens_cpu is not None:
-                decode_rows |= (num_decode_draft_tokens_cpu >= 0) & (
-                    query_lens == num_decode_draft_tokens_cpu + 1
-                )
-            stateful_decode_rows = (
-                seq_lens_cpu_upper_bound[:num_reqs] > query_lens
-            ) & decode_rows
-            if self._use_gdn_replayssm:
-                stateful_decode_rows &= is_last_prefill
-            replayssm_prefilling = is_prefilling & ~stateful_decode_rows
-            # Resumed chunks can exceed the decode window after the prompt ends.
-            decode_threshold = (
-                self.vllm_config.num_speculative_tokens + 1
-                if num_accepted_tokens is not None
-                else 1
-            )
-            if self._use_gdn_replayssm:
-                decode_threshold, _ = gdn_replayssm_geometry(
-                    self.vllm_config.num_speculative_tokens
-                )
-            replayssm_prefilling |= query_lens > decode_threshold
-            async_tensor_h2d(
-                replayssm_prefilling, out=self._is_prefilling_gpu[:num_reqs]
-            )
-
         if self._align_mode:
             mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
             aligned_index_builders = []
@@ -409,6 +382,39 @@ class MambaHybridModelState(DefaultModelState):
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
         )
+        if self._use_flashinfer_replayssm:
+            self._replayssm_query_start_loc = None
+            metadata_type = (
+                GDNAttentionMetadata
+                if self._use_gdn_replayssm
+                else Mamba2AttentionMetadata
+            )
+            mamba_metadata = next(
+                (
+                    metadata
+                    for metadata in attn_metadata.values()
+                    if isinstance(metadata, metadata_type)
+                ),
+                None,
+            )
+            # Autotune dummy runs and draft capture can omit Mamba metadata.
+            if mamba_metadata is not None:
+                self._replayssm_query_start_loc = input_batch.query_start_loc
+                if (
+                    isinstance(mamba_metadata, GDNAttentionMetadata)
+                    and mamba_metadata.spec_sequence_masks_cpu is not None
+                ):
+                    replayssm_prefilling = ~mamba_metadata.spec_sequence_masks_cpu[
+                        :num_reqs
+                    ]
+                else:
+                    replayssm_prefilling = (
+                        torch.arange(num_reqs, device="cpu")
+                        >= mamba_metadata.num_decodes
+                    )
+                async_tensor_h2d(
+                    replayssm_prefilling, out=self._is_prefilling_gpu[:num_reqs]
+                )
         if self.recoverssm is not None:
             self.recoverssm.record_step(
                 attn_metadata, attn_groups, for_capture=for_capture

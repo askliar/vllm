@@ -25,6 +25,7 @@ class MambaBase(AttentionLayerBase):
     # in the shape specified by `self.get_state_shape`.
     kv_cache: tuple[torch.Tensor, ...]
     supports_dcp: bool = False
+    use_replayssm: bool = False
     use_flashinfer_replayssm: bool = False
     state_alignment: int = 1
     _replayssm_ring_start: torch.Tensor
@@ -81,7 +82,6 @@ class MambaBase(AttentionLayerBase):
         return MambaSpec(
             shapes=tuple(self.get_state_shape()),
             dtypes=self.get_state_dtype(),
-            use_flashinfer_replayssm=self.use_flashinfer_replayssm,
             state_alignment=self.state_alignment,
             block_stride_alignment=self.state_alignment,
             block_size=mamba_block_size,

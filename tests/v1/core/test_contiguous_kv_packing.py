@@ -164,12 +164,14 @@ def test_replayssm_low_head_packed_alignment(layout):
             torch.float32,
             torch.bfloat16,
         ),
-        use_flashinfer_replayssm=True,
         state_alignment=16,
         block_stride_alignment=16,
     )
-    spec = replace(spec, page_size_padded=spec.state_content_size_bytes + 1)
-    assert spec.page_size_bytes % 16 == 0
+    with pytest.raises(AssertionError, match="page_size_padded must be aligned"):
+        replace(spec, page_size_padded=spec.state_content_size_bytes + 1)
+    padded_page_size = spec.state_content_size_bytes + 16
+    spec = replace(spec, page_size_padded=padded_page_size)
+    assert spec.page_size_bytes == padded_page_size
     # Block-outer packing must also align an overlay with a larger, odd page.
     other_bytes = (
         2 * spec.page_size_bytes + 4
@@ -229,17 +231,15 @@ def test_generic_mamba_keeps_unaligned_packed_layout():
         offset += size
 
 
-def test_replayssm_grouping_checks_ring_layout_not_only_page_size():
+def test_mamba_grouping_allows_different_state_shapes_with_equal_page_size():
     spec = MambaSpec(
         block_size=2,
         shapes=((8,), (12,), (4,), (4,), (4,)),
         dtypes=(torch.float32,) * 5,
-        use_flashinfer_replayssm=True,
     )
     other = replace(spec, shapes=(*spec.shapes[:2], (1, 4), *spec.shapes[3:]))
     assert other.page_size_bytes == spec.page_size_bytes
-    assert spec.is_uniform_with_collection({"first": spec, "second": spec})
-    assert not spec.is_uniform_with_collection({"first": spec, "second": other})
+    assert spec.is_uniform_with_collection({"first": spec, "second": other})
 
 
 MAIN_KV_PAGE_BYTES = 2_048

@@ -84,7 +84,10 @@ vllm serve Qwen/Qwen3.5-0.8B \
 
 This backend supports one to seven speculative tokens. It requires BF16 state and
 128-element key and value heads. Pipeline parallelism, microbatching, and KV
-connectors are unsupported. Prefix caching requires `--mamba-cache-mode align`.
+connectors are unsupported. Adaptive verification is unsupported because GDN
+output indices require fixed verification lengths.
+Set `enable_adaptive_verification` to `false` in the speculative configuration.
+Prefix caching requires `--mamba-cache-mode align`.
 
 FlashInfer must provide `gated_delta_rule_stp_ucache_flush` and
 `gated_delta_rule_mtp_ucache_flush`. Prefix caching also requires

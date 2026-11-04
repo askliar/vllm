@@ -4,7 +4,7 @@
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import torch
 
@@ -19,6 +19,9 @@ from vllm.utils.torch_utils import (
     get_kv_cache_torch_dtype,
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
 
@@ -38,6 +41,11 @@ def gdn_replayssm_geometry(num_speculative_tokens: int) -> tuple[int, int]:
         "tokens by padding MTP launches to width 4 or 8; got "
         f"{num_speculative_tokens}"
     )
+
+
+def mamba_state_alignment(vllm_config: "VllmConfig") -> int:
+    # FlashInfer loads state and ring caches with 16-byte cp.async instructions.
+    return 16 if vllm_config.use_flashinfer_replayssm else 1
 
 
 @functools.lru_cache

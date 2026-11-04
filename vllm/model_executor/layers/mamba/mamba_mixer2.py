@@ -27,10 +27,12 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.checkpoint import MambaPrefillCheckpointExporter
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
+    mamba_state_alignment,
 )
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -40,11 +42,11 @@ from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
 from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_output_only import (  # noqa: E501
     selective_state_update_replayssm_output_only,
 )
-from vllm.model_executor.layers.mamba.ops.ssd_checkpoint import store_prefill_checkpoint
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+    plan_replayssm_decode,
     selective_state_update,
     selective_state_update_replayssm_flashinfer,
 )
@@ -320,6 +322,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         self.ssm_state_size = ssm_state_size
         self.conv_kernel_size = conv_kernel_size
+        self._checkpoint_exporter = MambaPrefillCheckpointExporter(
+            state_len=conv_kernel_size - 1
+        )
         self.activation = activation
 
         self.intermediate_size = intermediate_size
@@ -536,8 +541,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
         self.mamba_config = vllm_config.mamba_config
         self.use_flashinfer_replayssm = vllm_config.use_flashinfer_replayssm
-        # FlashInfer loads state and ring caches with 16-byte cp.async instructions.
-        self.state_alignment = 16 if self.use_flashinfer_replayssm else 1
+        self.state_alignment = mamba_state_alignment(vllm_config)
         if self.use_replayssm and self.num_heads % self.tp_size != 0:
             raise ValueError(
                 "--use-replayssm requires tensor-parallel heads to divide evenly"
@@ -547,6 +551,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.kv_cache = tuple(torch.tensor([]) for _ in range(_n_state))
         self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
         self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
+        # Triton plans each decode step in one layer per cache group.
+        self._plans_replayssm_decode = True
 
         self.num_spec = vllm_config.num_speculative_tokens
 
@@ -757,8 +763,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
             ssm_state = self.kv_cache[1]
             if self.use_replayssm:
                 x_cache, dt_cache, B_cache = self.kv_cache[2:5]
+                ring_start = self._replayssm_ring_start
                 if self.use_flashinfer_replayssm:
-                    ring_start = self._replayssm_ring_start
                     prev_num_accepted = self._replayssm_prev_num_accepted
             else:
                 x_cache = dt_cache = B_cache = None
@@ -889,17 +895,23 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 final_states = varlen_states[last_chunk_indices_p]
                 assert checkpoint_meta is not None
                 assert query_start_loc_p is not None
-                store_prefill_checkpoint(
+                self._checkpoint_exporter.export(
                     checkpoint_meta,
-                    checkpoint_chunk_idx,
-                    x,
-                    conv_state,
-                    varlen_states,
-                    ssm_state,
-                    query_start_loc_p,
-                    state_len=self.conv_kernel_size - 1,
+                    raw_qkv=x.transpose(0, 1),
+                    conv_state=conv_state,
+                    recurrent_checkpoint=varlen_states,
+                    recurrent_state=ssm_state,
+                    cu_seqlens=query_start_loc_p,
+                    recurrent_rows=checkpoint_chunk_idx,
                 )
                 ssm_state[state_indices_tensor_p] = final_states
+            if (
+                ring_start is not None
+                and not self.use_flashinfer_replayssm
+                and self._plans_replayssm_decode
+            ):
+                # Triton decode appends to the ring that prefill leaves empty.
+                ring_start.index_fill_(0, state_indices_tensor_p.long(), 0)
 
         # Process decode requests
         if has_decode:
@@ -1014,6 +1026,21 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         enable_pdl=False,
                     )
                 else:
+                    assert ring_start is not None
+                    assert attn_metadata.write_pos_d is not None
+                    assert attn_metadata.is_flush_d is not None
+                    if self._plans_replayssm_decode:
+                        # Plan this step once per cache group: every layer of
+                        # the group reads the same write_pos/is_flush rows.
+                        plan_replayssm_decode(
+                            ring_start,
+                            state_indices_tensor_d,
+                            attn_metadata.write_pos_d,
+                            attn_metadata.is_flush_d,
+                            buffer_len=self.replayssm_buffer_len,
+                            seq_lens=attn_metadata.replayssm_seq_lens_d,
+                            align_block_size=attn_metadata.replayssm_align_block_size,
+                        )
                     selective_state_update_replayssm_output_only(
                         ssm_state,
                         hidden_states_d,
