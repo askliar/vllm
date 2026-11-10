@@ -53,7 +53,7 @@ class MambaConfig:
 
     stochastic_rounding_rng: MambaSRRNG = "philox"
     """Stochastic-rounding random source (Philox by default).
-    ``shared_seed`` uses one uniform seed
+    `shared_seed` uses one uniform seed
     per invocation instead of per-element Philox with FlashInfer ReplaySSM.
     It correlates rounding decisions across elements; model-quality equivalence
     has not been validated."""
