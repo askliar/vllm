@@ -90,7 +90,12 @@ from vllm.config.kernel import (
 from vllm.config.load import SafetensorsLoadStrategy
 from vllm.config.logging import LogLevel
 from vllm.config.lora import MaxLoRARanks
-from vllm.config.mamba import MambaBackendEnum, MambaSRRNG, MambaSSUAlgorithm
+from vllm.config.mamba import (
+    MambaBackendEnum,
+    MambaProjectionBackend,
+    MambaSRRNG,
+    MambaSSUAlgorithm,
+)
 from vllm.config.model import (
     ConvertOption,
     HfOverrides,
@@ -840,6 +845,7 @@ class EngineArgs:
     )
     mamba_cache_philox_rounds: int = MambaConfig.stochastic_rounding_philox_rounds
     mamba_cache_sr_rng: MambaSRRNG | None = None
+    mamba_projection_backend: MambaProjectionBackend | None = None
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
@@ -1154,6 +1160,10 @@ class EngineArgs:
         mamba_group.add_argument(
             "--mamba-cache-sr-rng",
             **{**mamba_kwargs["stochastic_rounding_rng"], "default": None},
+        )
+        mamba_group.add_argument(
+            "--mamba-projection-backend",
+            **{**mamba_kwargs["projection_backend"], "default": None},
         )
 
         # Structured outputs arguments
@@ -2834,6 +2844,8 @@ class EngineArgs:
             )
         if self.mamba_cache_sr_rng is not None:
             mamba_config.stochastic_rounding_rng = self.mamba_cache_sr_rng
+        if self.mamba_projection_backend is not None:
+            mamba_config.projection_backend = self.mamba_projection_backend
         mamba_config.__post_init__()
 
         # Kernel config overrides

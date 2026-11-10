@@ -143,6 +143,7 @@ def owned_mamba(tmp_path, dist_init, request, monkeypatch):
             enable_stochastic_rounding=sr_rng is not None,
             stochastic_rounding_philox_rounds=5 if sr_rng is not None else 0,
             stochastic_rounding_rng=sr_rng or "philox",
+            projection_backend=options.get("projection_backend", "auto"),
         ),
         compilation_config=CompilationConfig(
             mode=(
@@ -195,9 +196,13 @@ def owned_mamba(tmp_path, dist_init, request, monkeypatch):
                 for projection in (layer.in_proj, layer.out_proj):
                     if options.get("nonzero_weights", False):
                         projection.weight.fill_(0x11)
+                    keeps_b12x = options.get("disable_marlin", False) or (
+                        options.get("linear_backend") == "b12x"
+                        and options.get("projection_backend", "auto") != "marlin"
+                    )
                     expected_kernel = (
                         B12xNvFp4W4A16LinearKernel
-                        if options.get("disable_marlin", False)
+                        if keeps_b12x
                         else MarlinNvFp4LinearKernel
                     )
                     kernel = projection.quant_method.kernel  # type: ignore[attr-defined]
@@ -243,7 +248,14 @@ def owned_mamba(tmp_path, dist_init, request, monkeypatch):
 
 @pytest.mark.parametrize(
     "owned_mamba",
-    [dict(linear_backend="b12x", moe_backend="b12x", nonzero_weights=True)],
+    [
+        dict(
+            linear_backend="b12x",
+            moe_backend="b12x",
+            projection_backend="marlin",
+            nonzero_weights=True,
+        )
+    ],
     indirect=True,
 )
 def test_gb10_mamba_ownership_does_not_change_attention_or_global_backend(owned_mamba):
@@ -271,7 +283,14 @@ def test_gb10_mamba_ownership_does_not_change_attention_or_global_backend(owned_
 
 @pytest.mark.parametrize(
     "owned_mamba",
-    [dict(linear_backend="b12x", disable_marlin=True, expected_admission=False)],
+    [
+        dict(
+            linear_backend="b12x",
+            projection_backend="marlin",
+            disable_marlin=True,
+            expected_admission=False,
+        )
+    ],
     indirect=True,
 )
 def test_gb10_mamba_respects_disabled_marlin_kernel(owned_mamba):
@@ -281,6 +300,19 @@ def test_gb10_mamba_respects_disabled_marlin_kernel(owned_mamba):
     assert type(layer.out_proj.quant_method.kernel) is B12xNvFp4W4A16LinearKernel
     assert config.kernel_config.linear_backend == "b12x"
     assert config.kernel_config.linear_backend_per_quant is None
+
+
+@pytest.mark.parametrize(
+    "owned_mamba",
+    [dict(linear_backend="b12x", expected_admission=False)],
+    indirect=True,
+)
+def test_gb10_mamba_projections_follow_linear_backend_by_default(owned_mamba):
+    """Without `--mamba-projection-backend marlin` the projections stay on B12x."""
+    config, layer, *_ = owned_mamba
+    assert config.mamba_config.projection_backend == "auto"
+    assert type(layer.in_proj.quant_method.kernel) is B12xNvFp4W4A16LinearKernel
+    assert type(layer.out_proj.quant_method.kernel) is B12xNvFp4W4A16LinearKernel
 
 
 @pytest.mark.parametrize(

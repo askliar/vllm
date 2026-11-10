@@ -6,6 +6,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import is_supported_and_can_implement_kernel
 from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
 from vllm.model_executor.kernels.linear.nvfp4.marlin import MarlinNvFp4LinearKernel
@@ -30,23 +31,32 @@ from vllm.scalar_type import scalar_types
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
+logger = init_logger(__name__)
+
 
 def select_mamba_marlin_ownership(layer, config) -> None:
-    """Choose only Mamba2's projection kernels before normal weight packing.
+    """Apply `--mamba-projection-backend marlin` before normal weight packing.
 
-    The current quantization API stores the per-layer kernel on its method.
-    Canonical checkpoint parameters already exist here; post-load packing has
-    not run. Other linears, MoE kernels and the shared configuration are untouched.
+    The current quantization API stores the per-layer kernel on its method, so
+    this replaces it on Mamba2's two projections only. Canonical checkpoint
+    parameters already exist here; post-load packing has not run. Other
+    linears, MoE kernels and the shared configuration are untouched. A
+    projection Marlin cannot take keeps the kernel `--linear-backend` selected.
     """
-    if (
-        not current_platform.is_cuda()
-        or envs.VLLM_BATCH_INVARIANT
-        or config.lora_config is not None
-        or is_weights_pre_processed()
-    ):
+    if config.mamba_config.projection_backend != "marlin":
         return
-    capability = current_platform.get_device_capability()
-    if capability is None or capability.to_int() != 121:
+    ignored = "--mamba-projection-backend=marlin is ignored: %s"
+    reason = None
+    if not current_platform.is_cuda():
+        reason = "it requires CUDA"
+    elif envs.VLLM_BATCH_INVARIANT:
+        reason = "VLLM_BATCH_INVARIANT selects the deterministic kernel"
+    elif config.lora_config is not None:
+        reason = "LoRA is enabled"
+    elif is_weights_pre_processed():
+        reason = "the weights are already packed"
+    if reason is not None:
+        logger.warning_once(ignored, reason)
         return
     for projection in (layer.in_proj, layer.out_proj):
         method = projection.quant_method
@@ -62,16 +72,24 @@ def select_mamba_marlin_ownership(layer, config) -> None:
                 getattr(method.kernel, "config", None), NvFp4LinearLayerConfig
             )
         ):
+            logger.warning_once(
+                ignored, "the Mamba2 projections are not NVFP4 W4A16 layers"
+            )
             continue
-        supported, _ = is_supported_and_can_implement_kernel(  # type: ignore[type-var]
-            MarlinNvFp4LinearKernel, method.kernel.config, 121
+        supported, reason = is_supported_and_can_implement_kernel(  # type: ignore[type-var]
+            MarlinNvFp4LinearKernel, method.kernel.config, None
         )
         if not supported:
+            logger.warning_once(ignored, reason.strip())
             continue
         method.kernel = MarlinNvFp4LinearKernel(method.kernel.config)
         if hasattr(projection, "_input_quant_key"):
             del projection._input_quant_key
         expose_input_quant_key(projection, method.kernel)
+        logger.info_once(
+            "Using MarlinNvFp4LinearKernel for the Mamba2 projections "
+            "(--mamba-projection-backend=marlin)"
+        )
 
 
 # Qualified GB10 component measurements cover all B1–4/T1–8 shapes with M<=16.

@@ -32,6 +32,7 @@ class MambaBackendEnum(Enum, metaclass=_MambaBackendEnumMeta):
 
 MambaSSUAlgorithm = Literal["auto", "simple", "vertical", "horizontal"]
 MambaSRRNG = Literal["philox", "shared_seed"]
+MambaProjectionBackend = Literal["auto", "marlin"]
 
 
 @config
@@ -64,6 +65,15 @@ class MambaConfig:
     be supported by FlashInfer for the active GPU, state dtype, and decoding
     mode."""
 
+    projection_backend: MambaProjectionBackend = "auto"
+    """Linear kernel for the Mamba2 input and output projections. Available
+    options:
+
+    - "auto": Use the kernel that `--linear-backend` selects
+    - "marlin": Use Marlin for these two projections where it supports the
+      layer, whatever `--linear-backend` selects for the other linear layers
+    """
+
     @field_validator("backend", mode="before")
     @classmethod
     def validate_backend_before(cls, value: Any) -> Any:
@@ -93,6 +103,12 @@ class MambaConfig:
         self.validate_ssu_algorithm()
         if self.stochastic_rounding_rng not in get_args(MambaSRRNG):
             raise ValueError("Unknown Mamba stochastic-rounding random source")
+        if self.projection_backend not in get_args(MambaProjectionBackend):
+            valid = ", ".join(get_args(MambaProjectionBackend))
+            raise ValueError(
+                f"Unknown Mamba projection backend: '{self.projection_backend}'. "
+                f"Valid options are: {valid}"
+            )
         if self.stochastic_rounding_rng == "shared_seed" and (
             not self.enable_stochastic_rounding
             or self.backend != MambaBackendEnum.FLASHINFER

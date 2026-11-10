@@ -109,6 +109,43 @@ def test_mamba_cache_shared_seed_cli(tmp_path):
         parser.parse_args(["--mamba-cache-sr-rng", "unknown"])
 
 
+def test_mamba_projection_backend_cli(tmp_path):
+    from transformers import NemotronHConfig
+
+    from vllm.config.mamba import MambaConfig
+
+    NemotronHConfig(
+        architectures=["NemotronHForCausalLM"],
+        layers_block_type=["linear_attention"],
+        vocab_size=128,
+        max_position_embeddings=1024,
+    ).save_pretrained(tmp_path)
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    options = [
+        "--model",
+        str(tmp_path),
+        "--skip-tokenizer-init",
+        "--max-model-len",
+        "1024",
+    ]
+
+    def make_config(extra, mamba_config=None):
+        args = EngineArgs.from_cli_args(parser.parse_args(options + extra))
+        if mamba_config is not None:
+            args.mamba_config = mamba_config
+        return args.create_engine_config()
+
+    assert make_config([]).mamba_config.projection_backend == "auto"
+    config = make_config(["--mamba-projection-backend", "marlin"])
+    assert config.mamba_config.projection_backend == "marlin"
+    nested = MambaConfig(projection_backend="marlin")
+    assert make_config([], nested).mamba_config.projection_backend == "marlin"
+    config = make_config(["--mamba-projection-backend", "auto"], nested)
+    assert config.mamba_config.projection_backend == "auto"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--mamba-projection-backend", "b12x"])
+
+
 def test_watermark_config_cli():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args(

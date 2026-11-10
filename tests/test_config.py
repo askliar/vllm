@@ -4409,6 +4409,15 @@ def test_shared_seed_mamba_rejects_bfloat16_checkpoint():
         )
 
 
+def test_mamba_projection_backend_follows_linear_backend_by_default():
+    from vllm.config.mamba import MambaConfig
+
+    assert MambaConfig().projection_backend == "auto"
+    assert MambaConfig(projection_backend="marlin").projection_backend == "marlin"
+    with pytest.raises(ValueError):
+        MambaConfig(projection_backend="b12x")
+
+
 @pytest.mark.parametrize(
     ("prefix_caching", "cache_mode"), [(True, "none"), (False, "align")]
 )
