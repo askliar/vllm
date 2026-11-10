@@ -63,7 +63,7 @@ def select_mamba_marlin_ownership(layer, config) -> None:
             )
         ):
             continue
-        supported, _ = is_supported_and_can_implement_kernel(
+        supported, _ = is_supported_and_can_implement_kernel(  # type: ignore[type-var]
             MarlinNvFp4LinearKernel, method.kernel.config, 121
         )
         if not supported:

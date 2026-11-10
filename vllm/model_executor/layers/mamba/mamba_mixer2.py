@@ -539,8 +539,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
             or "vllm::mamba_mixer2_with_input_projection" in splitting_ops
         )
         # Adaptive/token-keyed FULL graphs can replay shorter logical queries
-        # without rerunning this opaque Python dispatch. The legacy18arg kernel
-        # has no device query-length pointer: preserve original conv/SSU there.
+        # without rerunning this opaque Python dispatch. The fused kernels take
+        # no device query-length pointer: preserve original conv/SSU there.
         speculative = vllm_config.speculative_config
         uniform_capture_contract = (
             not (speculative is not None and speculative.enable_adaptive_verification)
@@ -569,7 +569,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
             self._marlin_input_conv_batch_supported = hasattr(
                 torch.ops._C.marlin_mamba_input_conv, "batched"
             )
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            props = torch.cuda.get_device_properties(
+                torch.accelerator.current_device_index()
+            )
             self._marlin_input_conv_allowed = (
                 props.major == 12
                 and props.minor == 1
@@ -1339,7 +1341,10 @@ def mamba_mixer2_with_input_projection(
     layer_name = _resolve_layer_name(layer_name)
     context = get_forward_context()
     layer = context.no_compile_layers[layer_name]
-    metadata = (context.attn_metadata or {}).get(layer_name)
+    attn_metadata = context.attn_metadata
+    metadata = (
+        attn_metadata.get(layer_name) if isinstance(attn_metadata, dict) else None
+    )
     project_and_run(layer, hidden_states, projected, output, metadata)
 
 

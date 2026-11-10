@@ -10,7 +10,7 @@ the backend defaults to 'cpu'.
 
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import cache
 
 import torch
@@ -619,7 +619,7 @@ def initialize_mamba_ssu_backend(
         from inspect import signature
 
         try:
-            parameters = signature(checkpointing_ssu).parameters
+            parameters: Mapping[str, object] = signature(checkpointing_ssu).parameters
         except (TypeError, ValueError):
             parameters = {}
         _flashinfer_replayssm_main_controls_supported = all(
