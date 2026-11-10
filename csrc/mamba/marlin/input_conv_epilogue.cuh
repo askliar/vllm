@@ -276,7 +276,6 @@ __device__ __forceinline__ void epilogue_short(void* shared_b, int slice_col,
 
 #include <limits>
 
-
 namespace vllm_mamba_input_conv {
 
 // Only the new .batched overload interprets reserved this way. Keep the

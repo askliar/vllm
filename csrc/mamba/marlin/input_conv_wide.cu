@@ -4,7 +4,7 @@
 // Original Marlin/Neural Magic/IST-DASLab attribution remains in the template.
 #include "../../quantization/marlin/kernel.h"
 
- #include "input_conv_epilogue.cuh"
+#include "input_conv_epilogue.cuh"
 #include "input_conv_kernel.cuh"
 #undef VLLM_MAMBA_INPUT_CONV_WIDE
 
@@ -19,21 +19,20 @@ cudaError_t launch(const int4* input, const int4* weight, int4* projected,
                 (TileRows == 32 && Tokens >= 5 && Tokens <= 8));
   constexpr auto kernel =
       marlin::MarlinMambaInputConv<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
-                                       vllm::kBFloat16.id(),
-                                       vllm::kFE4M3fn.id(), 128, TileRows / 16,
-                                       8, 4, false, 3, 1, false, Tokens, ConvFamily::Wide>;
+                                   vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
+                                   128, TileRows / 16, 8, 4, false, 3, 1, false,
+                                   Tokens, ConvFamily::Wide>;
   constexpr int shared = 12288 + 1536 + 3 * TileRows * 64 * 2;
   static_assert(shared == (TileRows == 16 ? 19968 : 26112));
   auto status = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
   if (status != cudaSuccess) return status;
-  marlin::MarlinMambaInputConv<
-      vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
-      vllm::kFE4M3fn.id(), 128, TileRows / 16, 8, 4, false, 3, 1, false, Tokens, ConvFamily::Wide>
-      <<<145, 128, shared, stream>>>(input, weight, projected, scratch, nullptr,
-                                     scales, global_scale, nullptr, rows, 18560,
-                                     4096, 4096, locks, false, false, true,
-                                     shared, conv);
+  marlin::MarlinMambaInputConv<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                               vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), 128,
+                               TileRows / 16, 8, 4, false, 3, 1, false, Tokens,
+                               ConvFamily::Wide><<<145, 128, shared, stream>>>(
+      input, weight, projected, scratch, nullptr, scales, global_scale, nullptr,
+      rows, 18560, 4096, 4096, locks, false, false, true, shared, conv);
   return cudaGetLastError();
 }
 }  // namespace

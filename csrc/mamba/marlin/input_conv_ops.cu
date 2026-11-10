@@ -4,7 +4,7 @@
 // preserves its original Neural Magic / Elias Frantar / IST-DASLab notices.
 
 #include "../../quantization/marlin/kernel.h"
- #include "input_conv_epilogue.cuh"
+#include "input_conv_epilogue.cuh"
 #include "input_conv_kernel.cuh"
 
 #include "torch_utils.h"
@@ -25,11 +25,10 @@
 namespace marlin {
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 MarlinFuncPtr get_marlin_kernel(
-    vllm::ScalarType a_type, vllm::ScalarType b_type,
-    vllm::ScalarType c_type, vllm::ScalarType s_type,
-    int thread_m_blocks, int thread_n_blocks, int thread_k_blocks,
-    bool m_block_size_8, bool has_zp, int group_blocks, int threads,
-    bool is_zp_float, int stages);
+    vllm::ScalarType a_type, vllm::ScalarType b_type, vllm::ScalarType c_type,
+    vllm::ScalarType s_type, int thread_m_blocks, int thread_n_blocks,
+    int thread_k_blocks, bool m_block_size_8, bool has_zp, int group_blocks,
+    int threads, bool is_zp_float, int stages);
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS);
 }  // namespace marlin
 
@@ -379,7 +378,7 @@ void marlin_mamba_input_conv_batched(
 }
 
 Tensor mamba_marlin_output(Tensor& input, Tensor& weight, Tensor& scales,
-                          Tensor& global_scale, Tensor& workspace) {
+                           Tensor& global_scale, Tensor& workspace) {
   STD_TORCH_CHECK(input.device().is_cuda(), "Mamba Marlin input must be CUDA");
   torch::stable::accelerator::DeviceGuard guard(input.get_device_index());
   const auto* props = get_device_prop();
@@ -395,39 +394,40 @@ Tensor mamba_marlin_output(Tensor& input, Tensor& weight, Tensor& scales,
                       workspace.is_contiguous() && workspace.numel() >= 48 &&
                       workspace.numel() <= std::numeric_limits<int32_t>::max(),
                   "Mamba Marlin output scale/workspace shape mismatch");
-  STD_TORCH_CHECK(
-      (reinterpret_cast<uintptr_t>(input.const_data_ptr()) |
-       reinterpret_cast<uintptr_t>(weight.const_data_ptr()) |
-       reinterpret_cast<uintptr_t>(scales.const_data_ptr())) % 16 == 0,
-      "Mamba Marlin output vector alignment mismatch");
-  auto kernel = marlin::get_marlin_kernel(
-      vllm::kBFloat16, vllm::kFE2M1f, vllm::kBFloat16, vllm::kFE4M3fn,
-      1, 8, 8, true, false, 1, 256, false, 4);
+  STD_TORCH_CHECK((reinterpret_cast<uintptr_t>(input.const_data_ptr()) |
+                   reinterpret_cast<uintptr_t>(weight.const_data_ptr()) |
+                   reinterpret_cast<uintptr_t>(scales.const_data_ptr())) %
+                          16 ==
+                      0,
+                  "Mamba Marlin output vector alignment mismatch");
+  auto kernel = marlin::get_marlin_kernel(vllm::kBFloat16, vllm::kFE2M1f,
+                                          vllm::kBFloat16, vllm::kFE4M3fn, 1, 8,
+                                          8, true, false, 1, 256, false, 4);
   STD_TORCH_CHECK(kernel != nullptr && kernel != marlin::MarlinDefault,
                   "Mamba Marlin output kernel is unavailable");
   constexpr int shared = 45056;
   STD_TORCH_CHECK(props->sharedMemPerBlockOptin >= shared,
                   "Mamba Marlin output requires 45056 bytes of shared memory");
-  auto status = cudaFuncSetAttribute(
-      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      props->sharedMemPerBlockOptin);
+  auto status =
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           props->sharedMemPerBlockOptin);
   STD_TORCH_CHECK(status == cudaSuccess, cudaGetErrorString(status));
   auto output = torch::stable::empty({8, 4096}, ScalarType::BFloat16,
-                                    std::nullopt, input.device());
+                                     std::nullopt, input.device());
   // Preserve ordinary Marlin scratch allocation; full-K ownership does not
   // execute its partial-reduction or lock path.
   auto scratch = torch::stable::empty({48 * 16 * 256}, ScalarType::Float,
-                                     std::nullopt, input.device());
-  kernel<<<32, 256, shared, get_current_cuda_stream(input.get_device_index())>>>(
+                                      std::nullopt, input.device());
+  kernel<<<32, 256, shared,
+           get_current_cuda_stream(input.get_device_index())>>>(
       reinterpret_cast<const int4*>(input.const_data_ptr()),
       reinterpret_cast<const int4*>(weight.const_data_ptr()),
       reinterpret_cast<int4*>(output.mutable_data_ptr()),
       reinterpret_cast<int4*>(scratch.mutable_data_ptr()), nullptr,
       reinterpret_cast<const int4*>(scales.const_data_ptr()),
-      reinterpret_cast<const float*>(global_scale.const_data_ptr()), nullptr,
-      8, 4096, 8192, 8192,
-      reinterpret_cast<int*>(workspace.mutable_data_ptr()), false, false, true,
-      shared);
+      reinterpret_cast<const float*>(global_scale.const_data_ptr()), nullptr, 8,
+      4096, 8192, 8192, reinterpret_cast<int*>(workspace.mutable_data_ptr()),
+      false, false, true, shared);
   status = cudaGetLastError();
   STD_TORCH_CHECK(status == cudaSuccess, cudaGetErrorString(status));
   return output;
@@ -435,6 +435,7 @@ Tensor mamba_marlin_output(Tensor& input, Tensor& weight, Tensor& scales,
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, m) {
   m.impl("marlin_mamba_input_conv", TORCH_BOX(&marlin_mamba_input_conv));
-  m.impl("marlin_mamba_input_conv.batched", TORCH_BOX(&marlin_mamba_input_conv_batched));
+  m.impl("marlin_mamba_input_conv.batched",
+         TORCH_BOX(&marlin_mamba_input_conv_batched));
   m.impl("mamba_marlin_output", TORCH_BOX(&mamba_marlin_output));
 }

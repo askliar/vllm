@@ -61,20 +61,21 @@ static_assert(kConvOffset == kHistoryOffset + kHistoryBytes);
 static_assert(kSharedReuseBytes == kConvOffset + kConvBytes);
 static_assert(kSharedReuseBytes <= kDepth3DeadBBytes);
 
-
 enum class ConvFamily { Single, Batched, Wide };
 
 cudaError_t launch_short(int tokens, const int4* input, const int4* weight,
-                        int4* projected, int4* scratch, const int4* scales,
-                        const float* global_scale, int* locks, ConvParams conv,
-                        cudaStream_t stream);
+                         int4* projected, int4* scratch, const int4* scales,
+                         const float* global_scale, int* locks, ConvParams conv,
+                         cudaStream_t stream);
 cudaError_t launch_batch_small(int tokens, int rows, const int4* input,
-                              const int4* weight, int4* projected, int4* scratch,
-                              const int4* scales, const float* global_scale,
-                              int* locks, ConvParams conv, cudaStream_t stream);
+                               const int4* weight, int4* projected,
+                               int4* scratch, const int4* scales,
+                               const float* global_scale, int* locks,
+                               ConvParams conv, cudaStream_t stream);
 cudaError_t launch_batch_wide(int tokens, int rows, const int4* input,
-                             const int4* weight, int4* projected, int4* scratch,
-                             const int4* scales, const float* global_scale,
-                             int* locks, ConvParams conv, cudaStream_t stream);
+                              const int4* weight, int4* projected,
+                              int4* scratch, const int4* scales,
+                              const float* global_scale, int* locks,
+                              ConvParams conv, cudaStream_t stream);
 
 }  // namespace vllm_mamba_input_conv

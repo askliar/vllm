@@ -217,7 +217,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
           const bool is_zp_float   // is zero point of float16 type?
-, const int conv_tokens = 8,
+          ,
+          const int conv_tokens = 8,
           const vllm_mamba_input_conv::ConvFamily conv_family =
               vllm_mamba_input_conv::ConvFamily::Single>
 __global__ void MarlinMambaInputConv(
@@ -327,22 +328,26 @@ __global__ void MarlinMambaInputConv(
                 "runtime activation ordering is not supported");
   constexpr int m_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
   if constexpr (conv_family == vllm_mamba_input_conv::ConvFamily::Wide) {
-  // One whole M tile, one N tile per CTA, full K. Never enter generic parallel-M
-  // partitioning or start a second pipeline while epilogue scratch is live.
-  static_assert(!m_block_size_8 && (thread_m_blocks == 1 || thread_m_blocks == 2));
-  static_assert(threads == 128 && thread_n_blocks == 8 && thread_k_blocks == 4 &&
-                stages == 3 && group_blocks == 1 && !is_zp_float);
-  static_assert(18560 / (16 * thread_n_blocks) == 145 &&
-                18560 % (16 * thread_n_blocks) == 0 &&
-                4096 / (16 * thread_k_blocks) == 64);
-  constexpr int full_pipeline_bytes = 12288 + 1536 + 3 * m_block_size * 64 * 2;
-  if (prob_m <= (m_block_size == 16 ? 8 : 16) || prob_m > m_block_size ||
-      prob_n != 18560 || prob_k != 4096 || lda != 4096 || gridDim.x != 145 ||
-      gridDim.y != 1 || gridDim.z != 1 || blockDim.x != 128 || blockDim.y != 1 ||
-      blockDim.z != 1 || has_bias || use_atomic_add || !use_fp32_reduce ||
-      max_shared_mem != full_pipeline_bytes) {
-    asm volatile("trap;");
-  }
+    // One whole M tile, one N tile per CTA, full K. Never enter generic
+    // parallel-M partitioning or start a second pipeline while epilogue scratch
+    // is live.
+    static_assert(!m_block_size_8 &&
+                  (thread_m_blocks == 1 || thread_m_blocks == 2));
+    static_assert(threads == 128 && thread_n_blocks == 8 &&
+                  thread_k_blocks == 4 && stages == 3 && group_blocks == 1 &&
+                  !is_zp_float);
+    static_assert(18560 / (16 * thread_n_blocks) == 145 &&
+                  18560 % (16 * thread_n_blocks) == 0 &&
+                  4096 / (16 * thread_k_blocks) == 64);
+    constexpr int full_pipeline_bytes =
+        12288 + 1536 + 3 * m_block_size * 64 * 2;
+    if (prob_m <= (m_block_size == 16 ? 8 : 16) || prob_m > m_block_size ||
+        prob_n != 18560 || prob_k != 4096 || lda != 4096 || gridDim.x != 145 ||
+        gridDim.y != 1 || gridDim.z != 1 || blockDim.x != 128 ||
+        blockDim.y != 1 || blockDim.z != 1 || has_bias || use_atomic_add ||
+        !use_fp32_reduce || max_shared_mem != full_pipeline_bytes) {
+      asm volatile("trap;");
+    }
   }
 
   extern __shared__ int4 sh[];
@@ -1367,32 +1372,36 @@ __global__ void MarlinMambaInputConv(
     }
     __syncthreads();
     if constexpr (conv_family == vllm_mamba_input_conv::ConvFamily::Wide) {
-    static_assert(
-        a_type_id == vllm::kBFloat16.id() && b_type_id == vllm::kFE2M1f.id() &&
-        c_type_id == vllm::kBFloat16.id() && s_type_id == vllm::kFE4M3fn.id() &&
-        threads == 128 && !m_block_size_8 &&
-        (thread_m_blocks == 1 || thread_m_blocks == 2) && thread_n_blocks == 8 &&
-        thread_k_blocks == 4 && stages == 3 && group_blocks == 1 && !is_zp_float);
+      static_assert(a_type_id == vllm::kBFloat16.id() &&
+                    b_type_id == vllm::kFE2M1f.id() &&
+                    c_type_id == vllm::kBFloat16.id() &&
+                    s_type_id == vllm::kFE4M3fn.id() && threads == 128 &&
+                    !m_block_size_8 &&
+                    (thread_m_blocks == 1 || thread_m_blocks == 2) &&
+                    thread_n_blocks == 8 && thread_k_blocks == 4 &&
+                    stages == 3 && group_blocks == 1 && !is_zp_float);
     } else {
-    static_assert(
-        a_type_id == vllm::kBFloat16.id() && b_type_id == vllm::kFE2M1f.id() &&
-        c_type_id == vllm::kBFloat16.id() && s_type_id == vllm::kFE4M3fn.id() &&
-        threads == 128 && thread_m_blocks == 1 && thread_n_blocks == 8 &&
-        thread_k_blocks == 4 && m_block_size_8 && stages == 3 &&
-        group_blocks == 1 && !is_zp_float);
+      static_assert(a_type_id == vllm::kBFloat16.id() &&
+                    b_type_id == vllm::kFE2M1f.id() &&
+                    c_type_id == vllm::kBFloat16.id() &&
+                    s_type_id == vllm::kFE4M3fn.id() && threads == 128 &&
+                    thread_m_blocks == 1 && thread_n_blocks == 8 &&
+                    thread_k_blocks == 4 && m_block_size_8 && stages == 3 &&
+                    group_blocks == 1 && !is_zp_float);
     }
     if constexpr (conv_family == vllm_mamba_input_conv::ConvFamily::Wide) {
-    vllm_mamba_input_conv::epilogue_wide<16 * thread_m_blocks, conv_tokens>(
-        sh_red, slice_col, conv, reinterpret_cast<uint16_t*>(C0), prob_m);
-    } else if constexpr (conv_family == vllm_mamba_input_conv::ConvFamily::Batched) {
-    vllm_mamba_input_conv::epilogue_batch<conv_tokens>(
-        sh_red, slice_col, conv, reinterpret_cast<uint16_t*>(C0), prob_m);
+      vllm_mamba_input_conv::epilogue_wide<16 * thread_m_blocks, conv_tokens>(
+          sh_red, slice_col, conv, reinterpret_cast<uint16_t*>(C0), prob_m);
+    } else if constexpr (conv_family ==
+                         vllm_mamba_input_conv::ConvFamily::Batched) {
+      vllm_mamba_input_conv::epilogue_batch<conv_tokens>(
+          sh_red, slice_col, conv, reinterpret_cast<uint16_t*>(C0), prob_m);
     } else if constexpr (conv_tokens < 8) {
-    vllm_mamba_input_conv::epilogue_short<conv_tokens>(
-        sh_red, slice_col, conv, reinterpret_cast<uint16_t*>(C0));
+      vllm_mamba_input_conv::epilogue_short<conv_tokens>(
+          sh_red, slice_col, conv, reinterpret_cast<uint16_t*>(C0));
     } else {
-    vllm_mamba_input_conv::epilogue(sh_red, slice_col, conv,
-                                    reinterpret_cast<uint16_t*>(C0));
+      vllm_mamba_input_conv::epilogue(sh_red, slice_col, conv,
+                                      reinterpret_cast<uint16_t*>(C0));
     }
   };
 
