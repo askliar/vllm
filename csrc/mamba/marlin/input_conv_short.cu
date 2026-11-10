@@ -5,7 +5,6 @@
 #include "input_conv_epilogue.cuh"
 
 #include "input_conv_kernel.cuh"
-#undef VLLM_MAMBA_INPUT_CONV_SHORT
 
 namespace vllm_mamba_input_conv {
 namespace {
@@ -18,7 +17,7 @@ cudaError_t launch(const int4* input, const int4* weight, int4* projected,
                                    vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
                                    128, 1, 8, 4, true, 3, 1, false, Tokens>;
   constexpr int shared = 16896;
-  // Same fixed shared requirement as the legacy full-K S3 kernel.
+  // Same fixed shared requirement as the T8 kernel in input_conv_ops.cu.
   auto status = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
   if (status != cudaSuccess) return status;

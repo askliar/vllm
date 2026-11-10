@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Conv semantics adapted from vLLM causal_conv1d.py;
 // Copyright (c) 2024, Tri Dao.
 // Modified: CTA-local BF16 conv, single projected output ownership,
@@ -7,6 +8,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <limits>
 
 #include "input_conv_params.h"
 
@@ -155,10 +157,7 @@ __device__ __forceinline__ void epilogue(void* shared_b, int slice_col,
 
 }  // namespace vllm_mamba_input_conv
 
-// SPDX-License-Identifier: Apache-2.0
-// Conv semantics adapted from vLLM causal_conv1d.py;
-// Copyright (c) 2024, Tri Dao.
-// Adapted from mamba_input_conv_epilogue.cuh: actual T1..7 masks, odd tail,
+// Adapted from epilogue() above: actual T1..7 masks, odd tail,
 // physical-history acceptance bounds and untouched history suffix.
 namespace vllm_mamba_input_conv {
 // Called only after the original raw BF16 scatter, original global stores and
@@ -269,12 +268,7 @@ __device__ __forceinline__ void epilogue_short(void* shared_b, int slice_col,
 
 }  // namespace vllm_mamba_input_conv
 
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// Batched request selection reuses the original short-convolution arithmetic.
-// Its causal-conv attribution remains in mamba_input_conv_short_epilogue.cuh.
-
-#include <limits>
+// Batched request selection reuses the short-convolution arithmetic above.
 
 namespace vllm_mamba_input_conv {
 
@@ -321,12 +315,8 @@ static_assert(kSharedReuseBytes + 7 * kRawPitch * sizeof(uint16_t) <=
 
 }  // namespace vllm_mamba_input_conv
 
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// Conv semantics adapted from vLLM causal_conv1d.py;
-// Copyright (c) 2024, Tri Dao.
 // Wider Marlin raw M16/M32 scatter, unchanged BF16 conv math.
-// Adapted from the validated mamba_input_conv_short_epilogue.cuh above.
+// Adapted from epilogue_short() above.
 
 namespace vllm_mamba_input_conv {
 // Raw matrix remains immutable; one request's history/conv scratch is reused.
@@ -439,7 +429,7 @@ __device__ __forceinline__ void epilogue_wide_sequence(void* shared_b,
   __syncthreads();
 }
 
-// Same explicit new-family descriptor as C's M<=8 prototype:
+// Same descriptor as the batched M<=8 family above:
 // reserved low4bits=physicalH, positive upperbits=cache-index stride.
 // Runtime rows=B*ActualT; all rows must fit ONE selected MMA tile.
 template <int TileRows, int ActualT>

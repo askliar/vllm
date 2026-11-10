@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Batched M<=8 Marlin input projection + BF16 convolution. The device template
-// preserves its original Neural Magic / Elias Frantar / IST-DASLab notices.
+// preserves its original Neural Magic / Elias Frantar notices
+// (https://github.com/IST-DASLab/marlin).
 
 #include "../../quantization/marlin/kernel.h"
 #include "input_conv_epilogue.cuh"
 
 #include "input_conv_kernel.cuh"
-#undef VLLM_MAMBA_INPUT_CONV_BATCH
 namespace vllm_mamba_input_conv {
 namespace {
 template <int Tokens>

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Fixed M8 Marlin input projection + BF16 convolution. The device template
-// preserves its original Neural Magic / Elias Frantar / IST-DASLab notices.
+// preserves its original Neural Magic / Elias Frantar notices
+// (https://github.com/IST-DASLab/marlin).
 
 #include "../../quantization/marlin/kernel.h"
 #include "input_conv_epilogue.cuh"
@@ -201,7 +202,7 @@ void marlin_mamba_input_conv(Tensor& input, Tensor& projected, Tensor& weight,
     STD_TORCH_CHECK(status == cudaSuccess, cudaGetErrorString(status));
     return;
   }
-  // Legacy T8/H10 retains reserved=0, arithmetic and native argument layout.
+  // The T8 kernel (history length 10) passes reserved=0.
   constexpr auto kernel =
       marlin::MarlinMambaInputConv<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
                                    vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),

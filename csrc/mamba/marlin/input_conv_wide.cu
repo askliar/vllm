@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Wider uniform batches retain one complete-M, full-K Marlin weight stream.
-// Original Marlin/Neural Magic/IST-DASLab attribution remains in the template.
+// Original Marlin/Neural Magic attribution
+// (https://github.com/IST-DASLab/marlin) remains in the template.
 #include "../../quantization/marlin/kernel.h"
 
 #include "input_conv_epilogue.cuh"
 #include "input_conv_kernel.cuh"
-#undef VLLM_MAMBA_INPUT_CONV_WIDE
 
 namespace vllm_mamba_input_conv {
 namespace {

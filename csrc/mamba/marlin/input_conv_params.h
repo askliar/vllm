@@ -8,7 +8,8 @@
 
 namespace vllm_mamba_input_conv {
 
-// Explicit by-value native argument18. Projected output derives from C0.
+// Passed by value as the kernel's last argument. Projected output derives
+// from C0.
 struct alignas(8) ConvParams {
   const uint16_t* taps;
   const uint16_t* bias;
@@ -21,8 +22,9 @@ struct alignas(8) ConvParams {
   int32_t num_cache_pages;
   int32_t pad_slot_id;
   int32_t null_block_id;
-  int32_t reserved;  // Legacy T8:0. Short family: actual physical history
-                     // length3..10.
+  int32_t reserved;  // T8 kernel: 0. Short family: actual physical history
+                     // length 3..10. Batched and wide families: see
+                     // kBatchHistoryBits in input_conv_epilogue.cuh.
 };
 
 static_assert(std::is_standard_layout_v<ConvParams>);
