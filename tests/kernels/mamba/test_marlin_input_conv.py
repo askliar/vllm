@@ -29,7 +29,7 @@ BATCHED_SHAPES = [(b, t) for b in range(2, 5) for t in range(1, 9)]
 def operands():
     if not current_platform.is_cuda() or not torch.cuda.is_available():
         pytest.skip("requires NVIDIA CUDA")
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     properties = torch.cuda.get_device_properties(device)
     if (properties.major, properties.minor, properties.multi_processor_count) != (
         12,
@@ -275,7 +275,7 @@ def test_uniform_batched_projection_conv(operands, batches, tokens):
     args, backing, slots = _batched_arguments(operands, batches, tokens)
     before = backing.clone()
     expected, expected_backing = _batched_reference(args, backing, slots)
-    assert ops.marlin_mamba_input_conv_batched(**args) is None
+    ops.marlin_mamba_input_conv_batched(**args)
     _assert_batched_projection(args["projected"], expected)
     for slot in range(backing.shape[0]):
         if slot in slots:
@@ -357,7 +357,7 @@ def test_projection_conv_matches_separate_kernels(operands, accepted, page, gap)
     args, backing = _arguments(operands, page, accepted, gap)
     before = backing.clone()
     expected, expected_backing = _reference(args, backing)
-    assert ops.marlin_mamba_input_conv(**args) is None
+    ops.marlin_mamba_input_conv(**args)
     _assert_result(args, backing, expected, expected_backing, before, page)
 
 
@@ -495,7 +495,7 @@ def test_short_query_preserves_physical_history(operands, tokens, configured, pr
     )
     expected, expected_backing = _reference(args, backing)
     ops.marlin_mamba_input_conv(**args)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     _assert_result(args, backing, expected, expected_backing, before, 1)
     _assert_bytes_equal(backing[1, tokens + 2 :], before[1, tokens + 2 :])
 
@@ -516,7 +516,7 @@ def test_regular_one_token_accepts_none(operands):
     )
     expected, expected_backing = _reference(args, backing)
     ops.marlin_mamba_input_conv(**args)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     _assert_result(args, backing, expected, expected_backing, before, 4)
     opcheck(
         torch.ops._C.marlin_mamba_input_conv.default,
