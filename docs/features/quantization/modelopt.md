@@ -179,12 +179,16 @@ metadata and padded-layout checks to pass. Inactive cache slots remain
 protected. Unsupported or unproven geometry, metadata, wrappers and backends
 retain the original projection and convolution path.
 
-On SM121, supported ModelOpt NVFP4 weight-only Mamba2 input/output projections
-select Marlin locally before normal post-load weight packing, including shapes
-that have not been tuned and may be slower. Attention,
+The Mamba2 input/output projections use the kernel that `--linear-backend`
+selects. To run them on Marlin while the other linear layers keep another
+backend (for example `--linear-backend b12x`), pass
+`--mamba-projection-backend marlin`. Supported ModelOpt NVFP4 weight-only
+projections then select Marlin before normal post-load weight packing,
+including shapes that have not been tuned and may be slower. Attention,
 other linears, MoE and the shared backend configuration are unchanged; only one
-weight pack is created. Unsupported codecs/dtypes, LoRA, batch-invariant mode
-and explicitly disabled Marlin kernels retain their configured owners.
+weight pack is created. With unsupported codecs/dtypes, LoRA, batch-invariant
+mode or an explicitly disabled Marlin kernel, the projections keep the kernel
+`--linear-backend` selected and vLLM logs a warning with the reason.
 The fused operators require those existing Marlin packs and never convert
 another backend's packed weights at runtime. Unmatched token/batch shapes use
 ordinary Marlin for the same Mamba-owned weights. The fusion preserves ReplaySSM
