@@ -1179,7 +1179,7 @@ def marlin_mamba_input_conv(
     pad_slot_id: int,
     null_block_id: int,
 ) -> None:
-    torch.ops._C.marlin_mamba_input_conv(
+    torch.ops._C.marlin_mamba_input_conv.default(
         input,
         projected,
         weight,
