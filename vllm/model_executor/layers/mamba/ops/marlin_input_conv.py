@@ -280,7 +280,6 @@ def _runtime_metadata(layer, metadata):
     # A smaller aggregate M cannot prove uniformity without reading GPU lengths.
     batch_geometry = (
         2 <= batches <= 4
-        and layer._marlin_input_conv_batch_supported
         and metadata.num_decode_tokens == batches * (1 + layer.num_spec)
         and metadata.num_decode_tokens <= 32
     )
@@ -291,13 +290,7 @@ def _runtime_metadata(layer, metadata):
         and (
             batch_geometry
             if batched
-            else (
-                1 <= metadata.num_decode_tokens <= 1 + layer.num_spec
-                and (
-                    metadata.num_decode_tokens == 8
-                    or layer._marlin_input_conv_short_supported
-                )
-            )
+            else (1 <= metadata.num_decode_tokens <= 1 + layer.num_spec)
         )
         and layer.tp_size == 1
         and layer.num_heads == 128
@@ -371,7 +364,6 @@ def project_and_run(layer, hidden_states, projected, output, metadata):
     ):
         raise ValueError("Mamba projected and SSM outputs must be disjoint")
     linear = layer.in_proj
-    workspace = get_marlin_workspace(hidden_states.device)
     admitted = _runtime_metadata(layer, metadata)
     if admitted is not None and (
         metadata.num_decode_tokens != tokens
@@ -395,7 +387,7 @@ def project_and_run(layer, hidden_states, projected, output, metadata):
             b_scales=linear.weight_scale,
             global_scale=linear.weight_global_scale,
             b_zeros=None,
-            workspace=workspace,
+            workspace=get_marlin_workspace(hidden_states.device),
             b_q_type=scalar_types.float4_e2m1f,
             size_m=tokens,
             size_n=18560,
@@ -412,18 +404,12 @@ def project_and_run(layer, hidden_states, projected, output, metadata):
         layer.conv_ssm_forward(projected, output)
         return
     history, indices, accepted = admitted
-    operation = (
-        ops.marlin_mamba_input_conv_batched
-        if metadata.num_decodes > 1
-        else ops.marlin_mamba_input_conv
-    )
-    operation(
+    ops.mamba_marlin_input_conv(
         hidden_states,
         projected,
         linear.weight,
         linear.weight_scale,
         linear.weight_global_scale,
-        workspace,
         layer.conv_weights,
         layer.conv1d.bias,
         history,

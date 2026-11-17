@@ -105,14 +105,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "mamba_marlin_output(Tensor input, Tensor weight, Tensor scales, "
       "Tensor global_scale, Tensor workspace) -> Tensor");
   ops.def(
-      "marlin_mamba_input_conv(Tensor input, Tensor(a!) projected, "
-      "Tensor weight, Tensor scales, Tensor global_scale, Tensor workspace, "
-      "Tensor taps, Tensor bias, Tensor(b!) history, Tensor cache_indices, "
-      "Tensor? accepted_tokens, int pad_slot_id, int null_block_id) -> ()");
-  // Separate overload is the capability check for uniform batched ownership.
-  ops.def(
-      "marlin_mamba_input_conv.batched(Tensor input, Tensor(a!) projected, "
-      "Tensor weight, Tensor scales, Tensor global_scale, Tensor workspace, "
+      "mamba_marlin_input_conv(Tensor input, Tensor(a!) projected, "
+      "Tensor weight, Tensor scales, Tensor global_scale, "
       "Tensor taps, Tensor bias, Tensor(b!) history, Tensor cache_indices, "
       "Tensor? accepted_tokens, int pad_slot_id, int null_block_id) -> ()");
   #endif
@@ -535,8 +529,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor positions, Tensor slot_mapping, Tensor! k_cache, "
       "Tensor! v_cache, int head_dim, int num_q_heads, int num_kv_heads, "
       "int rotary_pairs, float epsilon, float norm_weight_bias, "
-      "str kv_cache_dtype=\"auto\", Tensor? k_scale=None, Tensor? "
-      "v_scale=None) -> ()");
+      "str kv_cache_dtype=\"auto\", float q_scale=1.0, "
+      "Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
 #endif
 
   ops.def(

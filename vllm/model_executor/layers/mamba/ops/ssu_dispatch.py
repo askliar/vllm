@@ -10,7 +10,7 @@ the backend defaults to 'cpu'.
 
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from functools import cache
 
 import torch
@@ -374,11 +374,11 @@ def flashinfer_replayssm_autotune_supported() -> bool:
 def _gb10_replayssm_profile_tactic(
     batch: int, tokens: int, sr_rng: str
 ) -> dict[str, object]:
-    """FP16 choices measured over complete accepted-token Markov courses.
+    """Select FP16 launch presets for small-batch GB10 replay.
 
-    Rounding policy is supplied by the caller. The common T6 cutoff avoids
-    four mode-specific exceptions worth at most 0.64 us per complete layer.
-    Unmeasured/nonpositive shapes retain FlashInfer's ordinary selection.
+    Presets cover measured batch/verification-length/RNG combinations.
+    Unmatched cases keep FlashInfer's normal selection. This function
+    never changes the caller's rounding policy.
     """
     if not (1 <= batch <= 4 and 1 <= tokens <= 8 and batch * tokens <= 16):
         return {}
@@ -420,6 +420,7 @@ def selective_state_update_replayssm_flashinfer(
     scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     enable_stochastic_rounding: bool = False,
     stochastic_rounding_philox_rounds: int = 0,
+    rand_seed: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: int | None = None,
     enable_pdl: bool = False,
@@ -427,7 +428,11 @@ def selective_state_update_replayssm_flashinfer(
     use_gb10_profile: bool = False,
     stochastic_rounding_rng: str = "philox",
 ) -> torch.Tensor:
-    """Run FlashInfer checkpointing SSU with model-owned tracker metadata."""
+    """Run FlashInfer checkpointing SSU with model-owned tracker metadata.
+
+    With stochastic rounding, `rand_seed` is a one-element int64 CUDA tensor
+    refreshed by the caller each step; without one, a seed is drawn here.
+    """
     if _flashinfer_replayssm_kernel is None:
         raise RuntimeError(
             "FlashInfer ReplaySSM has not been initialized. "
@@ -462,7 +467,10 @@ def selective_state_update_replayssm_flashinfer(
         and max_seqlen is None
         and not enable_pdl
         and enable_stochastic_rounding
-        and stochastic_rounding_philox_rounds == 5
+        and (
+            stochastic_rounding_rng == "shared_seed"
+            or stochastic_rounding_philox_rounds == 5
+        )
         and stochastic_rounding_rng in ("philox", "shared_seed")
         and scratch is not None
         and state.dtype == torch.float16
@@ -526,11 +534,12 @@ def selective_state_update_replayssm_flashinfer(
     if stochastic_rounding_rng != "philox":
         launch_kwargs["sr_rng"] = stochastic_rounding_rng
 
-    rand_seed = (
-        torch.randint(0, 2**32, (1,), device=state.device, dtype=torch.int64)
-        if enable_stochastic_rounding
-        else None
-    )
+    if not enable_stochastic_rounding:
+        rand_seed = None
+    elif rand_seed is None:
+        rand_seed = torch.randint(
+            0, 2**32, (1,), device=state.device, dtype=torch.int64
+        )
     return _flashinfer_replayssm_kernel(
         state,
         x_cache,
@@ -570,10 +579,11 @@ def initialize_mamba_ssu_backend(
 ) -> None:
     """Initialize the Mamba SSU backend and optional FlashInfer ReplaySSM."""
     if not any(
-        isinstance(g.kv_cache_spec, MambaSpec)
-        and g.kv_cache_spec.mamba_type
+        isinstance(spec, MambaSpec)
+        and spec.mamba_type
         in (MambaAttentionBackendEnum.MAMBA1, MambaAttentionBackendEnum.MAMBA2)
         for g in kv_cache_config.kv_cache_groups
+        for spec in g.kv_cache_specs.values()
     ):
         return
 
@@ -619,9 +629,9 @@ def initialize_mamba_ssu_backend(
         from inspect import signature
 
         try:
-            parameters: Mapping[str, object] = signature(checkpointing_ssu).parameters
+            parameters = set(signature(checkpointing_ssu).parameters)
         except (TypeError, ValueError):
-            parameters = {}
+            parameters = set()
         _flashinfer_replayssm_main_controls_supported = all(
             name in parameters for name in ("main_pipeline_stages", "main_ctas_per_sm")
         )

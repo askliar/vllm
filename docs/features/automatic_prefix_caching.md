@@ -48,7 +48,6 @@ vllm serve nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 \
     --mamba-backend flashinfer \
     --mamba-ssm-cache-dtype float16 \
     --enable-mamba-cache-stochastic-rounding \
-    --mamba-cache-philox-rounds 5 \
     --use-replayssm \
     --replayssm-buffer-len 16 \
     --enable-prefix-caching \
@@ -62,6 +61,8 @@ FlashInfer ReplaySSM has these limits:
 - `align` requires BF16 model inputs for its replay rings. The SSM state dtype is independent. The example uses FP16 state with stochastic rounding.
 - The logical replay buffer cannot exceed 16 tokens. For speculative decoding, it must contain at least `1 + num_speculative_tokens` tokens.
 - Pipeline parallelism, microbatching, and KV connectors are not supported.
+
+With `--mamba-backend triton` (for example on ROCm), ReplaySSM also supports speculative decoding with or without prefix caching. It has the same speculative-decoding buffer requirement and parallelism limits, has no 16-token buffer cap, and does not support stochastic rounding.
 
 Prefix reuse still requires a shared prefix with a saved Mamba checkpoint. The matching rules for hybrid Mamba models above also apply.
 

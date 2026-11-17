@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <cuda_runtime_api.h>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <cuda_runtime_api.h>
 #include <type_traits>
 
 namespace vllm_mamba_input_conv {
 
-// Passed by value as the kernel's last argument. Projected output derives
-// from C0.
+// Fixed full-K kernel argument; projected output derives from C0.
 struct alignas(8) ConvParams {
   const uint16_t* taps;
   const uint16_t* bias;
@@ -22,9 +22,7 @@ struct alignas(8) ConvParams {
   int32_t num_cache_pages;
   int32_t pad_slot_id;
   int32_t null_block_id;
-  int32_t reserved;  // T8 kernel: 0. Short family: actual physical history
-                     // length 3..10. Batched and wide families: see
-                     // kBatchHistoryBits in input_conv_epilogue.cuh.
+  int32_t reserved;  // Single: T8=0, otherwise H. Batched: (index_stride<<4)|H.
 };
 
 static_assert(std::is_standard_layout_v<ConvParams>);
@@ -63,21 +61,26 @@ static_assert(kConvOffset == kHistoryOffset + kHistoryBytes);
 static_assert(kSharedReuseBytes == kConvOffset + kConvBytes);
 static_assert(kSharedReuseBytes <= kDepth3DeadBBytes);
 
+// Batched metadata packs physical history length into the low four bits.
+constexpr int kBatchHistoryBits = 4;
+constexpr int kBatchIndexStrideMax =
+    std::numeric_limits<int32_t>::max() >> kBatchHistoryBits;
+static_assert(kBatchIndexStrideMax * 16 + 10 <=
+              std::numeric_limits<int32_t>::max());
+
 enum class ConvFamily { Single, Batched, Wide };
 
-cudaError_t launch_short(int tokens, const int4* input, const int4* weight,
-                         int4* projected, int4* scratch, const int4* scales,
-                         const float* global_scale, int* locks, ConvParams conv,
-                         cudaStream_t stream);
+cudaError_t launch_single(int tokens, int rows, const int4* input,
+                          const int4* weight, int4* projected,
+                          const int4* scales, const float* global_scale,
+                          ConvParams conv, cudaStream_t stream);
 cudaError_t launch_batch_small(int tokens, int rows, const int4* input,
                                const int4* weight, int4* projected,
-                               int4* scratch, const int4* scales,
-                               const float* global_scale, int* locks,
+                               const int4* scales, const float* global_scale,
                                ConvParams conv, cudaStream_t stream);
 cudaError_t launch_batch_wide(int tokens, int rows, const int4* input,
                               const int4* weight, int4* projected,
-                              int4* scratch, const int4* scales,
-                              const float* global_scale, int* locks,
+                              const int4* scales, const float* global_scale,
                               ConvParams conv, cudaStream_t stream);
 
 }  // namespace vllm_mamba_input_conv

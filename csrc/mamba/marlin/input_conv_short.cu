@@ -1,55 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// Short-T instantiations reuse the same attributed Marlin template core.
-#include "../../quantization/marlin/kernel.h"
-#include "input_conv_epilogue.cuh"
-
-#include "input_conv_kernel.cuh"
+#include "input_conv_launch.cuh"
 
 namespace vllm_mamba_input_conv {
-namespace {
-template <int Tokens>
-cudaError_t launch(const int4* input, const int4* weight, int4* projected,
-                   int4* scratch, const int4* scales, const float* global_scale,
-                   int* locks, ConvParams conv, cudaStream_t stream) {
-  constexpr auto kernel =
-      marlin::MarlinMambaInputConv<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
-                                   vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
-                                   128, 1, 8, 4, true, 3, 1, false, Tokens>;
-  constexpr int shared = 16896;
-  // Same fixed shared requirement as the T8 kernel in input_conv_ops.cu.
-  auto status = cudaFuncSetAttribute(
-      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
-  if (status != cudaSuccess) return status;
-  marlin::MarlinMambaInputConv<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
-                               vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), 128,
-                               1, 8, 4, true, 3, 1, false, Tokens>
-      <<<145, 128, shared, stream>>>(input, weight, projected, scratch, nullptr,
-                                     scales, global_scale, nullptr, Tokens,
-                                     18560, 4096, 4096, locks, false, false,
-                                     true, shared, conv);
-  return cudaGetLastError();
-}
-}  // namespace
-cudaError_t launch_short(int tokens, const int4* input, const int4* weight,
-                         int4* projected, int4* scratch, const int4* scales,
-                         const float* global_scale, int* locks, ConvParams conv,
-                         cudaStream_t stream) {
-#define VLLM_LAUNCH_SHORT(T)                                                  \
-  case T:                                                                     \
-    return launch<T>(input, weight, projected, scratch, scales, global_scale, \
-                     locks, conv, stream);
-  switch (tokens) {
-    VLLM_LAUNCH_SHORT(1);
-    VLLM_LAUNCH_SHORT(2);
-    VLLM_LAUNCH_SHORT(3);
-    VLLM_LAUNCH_SHORT(4);
-    VLLM_LAUNCH_SHORT(5);
-    VLLM_LAUNCH_SHORT(6);
-    VLLM_LAUNCH_SHORT(7);
-    default:
-      return cudaErrorInvalidValue;
-  }
-#undef VLLM_LAUNCH_SHORT
+cudaError_t launch_single(int tokens, int rows, const int4* input,
+                          const int4* weight, int4* projected,
+                          const int4* scales, const float* global_scale,
+                          ConvParams conv, cudaStream_t stream) {
+  return detail::launch_tokens<ConvFamily::Single, true>(
+      tokens, rows, input, weight, projected, scales, global_scale, conv,
+      stream, std::integer_sequence<int, 1, 2, 3, 4, 5, 6, 7, 8>{});
 }
 }  // namespace vllm_mamba_input_conv

@@ -1164,13 +1164,12 @@ def awq_marlin_moe_repack(
     return output
 
 
-def marlin_mamba_input_conv(
+def mamba_marlin_input_conv(
     input: torch.Tensor,
     projected: torch.Tensor,
     weight: torch.Tensor,
     scales: torch.Tensor,
     global_scale: torch.Tensor,
-    workspace: torch.Tensor,
     taps: torch.Tensor,
     bias: torch.Tensor,
     history: torch.Tensor,
@@ -1179,13 +1178,12 @@ def marlin_mamba_input_conv(
     pad_slot_id: int,
     null_block_id: int,
 ) -> None:
-    torch.ops._C.marlin_mamba_input_conv.default(
+    torch.ops._C.mamba_marlin_input_conv(
         input,
         projected,
         weight,
         scales,
         global_scale,
-        workspace,
         taps,
         bias,
         history,
@@ -1196,71 +1194,15 @@ def marlin_mamba_input_conv(
     )
 
 
-if hasattr(torch.ops._C, "marlin_mamba_input_conv"):
+if hasattr(torch.ops._C, "mamba_marlin_input_conv"):
 
-    @register_fake("_C::marlin_mamba_input_conv")
-    def _marlin_mamba_input_conv_fake(
+    @register_fake("_C::mamba_marlin_input_conv")
+    def _mamba_marlin_input_conv_fake(
         input,
         projected,
         weight,
         scales,
         global_scale,
-        workspace,
-        taps,
-        bias,
-        history,
-        cache_indices,
-        accepted_tokens,
-        pad_slot_id,
-        null_block_id,
-    ) -> None:
-        return None
-
-
-def marlin_mamba_input_conv_batched(
-    input: torch.Tensor,
-    projected: torch.Tensor,
-    weight: torch.Tensor,
-    scales: torch.Tensor,
-    global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    taps: torch.Tensor,
-    bias: torch.Tensor,
-    history: torch.Tensor,
-    cache_indices: torch.Tensor,
-    accepted_tokens: torch.Tensor | None,
-    pad_slot_id: int,
-    null_block_id: int,
-) -> None:
-    torch.ops._C.marlin_mamba_input_conv.batched(
-        input,
-        projected,
-        weight,
-        scales,
-        global_scale,
-        workspace,
-        taps,
-        bias,
-        history,
-        cache_indices,
-        accepted_tokens,
-        pad_slot_id,
-        null_block_id,
-    )
-
-
-if hasattr(torch.ops._C, "marlin_mamba_input_conv") and hasattr(
-    torch.ops._C.marlin_mamba_input_conv, "batched"
-):
-
-    @register_fake("_C::marlin_mamba_input_conv.batched")
-    def _marlin_mamba_input_conv_batched_fake(
-        input,
-        projected,
-        weight,
-        scales,
-        global_scale,
-        workspace,
         taps,
         bias,
         history,
@@ -2191,6 +2133,16 @@ def wvSplitKQ(
     return out
 
 
+def swmmac_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    logical_m: int,
+    cu_count: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.swmmacGEMM(a, b, bias, logical_m, cu_count)
+
+
 # moe
 def moe_sum(
     input: torch.Tensor,
@@ -2725,7 +2677,10 @@ def fused_qknorm_rope_cache(
     rotary_dim: int,
     eps: float,
     norm_weight_bias: float = 0.0,
+    *,
+    q_dtype: torch.dtype | None = None,
     kv_cache_dtype: str = "auto",
+    q_scale: float = 1.0,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2736,7 +2691,11 @@ def fused_qknorm_rope_cache(
     """
     if rotary_dim < 0 or rotary_dim > head_dim or rotary_dim % 8:
         raise ValueError("rotary_dim must be a multiple of 8 in [0, head_dim]")
-    q = qkv.new_empty((qkv.shape[0], num_q_heads * head_dim))
+    q = torch.empty(
+        (qkv.shape[0], num_q_heads * head_dim),
+        device=qkv.device,
+        dtype=qkv.dtype if q_dtype is None else q_dtype,
+    )
     k = qkv.new_empty((qkv.shape[0], num_kv_heads * head_dim))
     v = torch.empty_like(k)
     cos, sin = cos_sin_cache.chunk(2, dim=-1)
@@ -2760,6 +2719,7 @@ def fused_qknorm_rope_cache(
         eps,
         norm_weight_bias,
         kv_cache_dtype,
+        q_scale,
         k_scale,
         v_scale,
     )
